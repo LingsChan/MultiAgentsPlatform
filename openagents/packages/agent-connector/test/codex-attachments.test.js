@@ -496,6 +496,9 @@ describe('Codex CLI mode — resuming a thread', () => {
     assert.strictEqual(cmd[cmd.indexOf('-C') + 1], WORK_DIR);
     assert.ok(cmd.indexOf('-m') < cmd.indexOf('resume'), '-m must come before resume');
     assert.ok(cmd.indexOf('--json') < cmd.indexOf('resume'));
+    assert.ok(cmd.includes('sandbox_mode="read-only"'));
+    assert.ok(cmd.includes('approval_policy="never"'));
+    assert.ok(!cmd.includes('--dangerously-bypass-approvals-and-sandbox'));
   });
 
   it('sends no resume for a channel that has no thread yet', async () => {

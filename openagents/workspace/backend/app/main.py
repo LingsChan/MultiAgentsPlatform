@@ -691,6 +691,10 @@ from fastapi.responses import JSONResponse as _ValidationJSONResponse
 
 @app.exception_handler(RequestValidationError)
 async def _log_validation_errors(request: Request, exc: RequestValidationError):
+    if request.scope.get("endpoint") is auth.create_local_session:
+        return _ValidationJSONResponse(
+            status_code=422, content={"message": "Enter a valid email and password"},
+        )
     try:
         body = await request.body()
         body_preview = body.decode("utf-8", errors="replace")[:1024]

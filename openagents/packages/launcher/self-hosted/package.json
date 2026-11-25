@@ -1,0 +1,8 @@
+{
+  "name": "multiagents-platform",
+  "productName": "MultiAgentsPlatform",
+  "version": "0.2.1",
+  "description": "MultiAgentsPlatform self-hosted workspace client",
+  "private": true,
+  "main": "main.cjs"
+}

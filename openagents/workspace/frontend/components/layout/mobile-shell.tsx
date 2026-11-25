@@ -99,14 +99,14 @@ export function MobileShell({
             <div className="h-full overflow-hidden bg-background"><ArtifactPanel /></div>
           ) : mobilePane === 'list' ? (
             /* List pane — full width */
-            <div className="flex h-full flex-col bg-background overflow-hidden">
+            <div className="optics-mobile-list flex h-full flex-col bg-background overflow-hidden">
               {viewMode === 'threads' && <ThreadList />}
               {viewMode === 'files' && <FileList />}
               {viewMode === 'knowledge' && <KnowledgeList />}
             </div>
           ) : (
             /* Detail pane — full width, edge-to-edge on mobile */
-            <div className="relative h-full bg-background overflow-hidden">
+            <div className="optics-mobile-chat relative h-full bg-background overflow-hidden">
               {viewMode === 'threads' && (
                 <div className="h-full">
                   <ChatView />

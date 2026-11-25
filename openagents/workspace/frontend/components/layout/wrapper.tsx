@@ -42,6 +42,7 @@ import { useT } from '@/lib/i18n';
 import { NewThreadDialogHost } from '@/components/threads/new-thread-dialog-host';
 import { WorkspaceLoadError } from './workspace-load-error';
 import { WorkspaceLoadingScreen } from './workspace-loading-screen';
+import { LOCAL_WORKSPACE_AUTH } from '@/lib/auth-redirects';
 import { useSearchParams } from 'next/navigation';
 
 /** Narrowest the workspace shell lays out at — the desktop app's minimum window width. */
@@ -221,7 +222,14 @@ export function Wrapper() {
   return (
     <OnboardingSurfaceContext.Provider value={{ active: showOnboarding, welcome: showOnboarding && welcomeActive,
       welcomeAvailable, onOpenWelcome: openWelcome, onOpenConnect: openConnect, onDismiss: dismissOnboarding }}>
-    <div className="h-[calc(100vh-var(--oa-banner-h,0px))] w-full overflow-x-auto overflow-y-hidden">
+    <div className="optics-workspace flex h-[calc(100vh-var(--oa-banner-h,0px))] w-full flex-col">
+    {LOCAL_WORKSPACE_AUTH && <header className="observatory-heading">
+        <h1>{workspace?.name || t('nav.workspaceFallback')}</h1>
+        <p className="observatory-presence" data-online={agents.some(a => !a.builtin && a.status === 'online')}>
+          {t('optics.agents', { count: agents.filter(a => !a.builtin && a.status === 'online').length })}
+        </p>
+    </header>}
+    <div className="min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
     <SidebarProvider
       open={sidebarOpen}
       onOpenChange={setSidebarOpen}
@@ -311,6 +319,7 @@ export function Wrapper() {
       <NewThreadDialogHost />
       <ImportSessionsHost />
     </SidebarProvider>
+    </div>
     </div>
     </OnboardingSurfaceContext.Provider>
   );

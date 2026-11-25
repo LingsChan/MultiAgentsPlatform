@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import {
   exchangeHandoffToken, loadWorkspaceSession, renewWorkspaceSession, saveWorkspaceSession, sessionNeedsRenewal,
+  signInToLocalWorkspace,
 } from './workspace-session';
 
 const request = vi.fn();
@@ -48,6 +49,21 @@ it('does not silently route a network failure or subsequent API traffic through 
 
 const held = { token: 'held-session', email: 'test@example.com', displayName: 'Test', expiresAt: Math.floor(Date.now() / 1000) + 3600 };
 
+it('signs in with a local password and stores the issued identity', async () => {
+  request.mockResolvedValue(new Response(JSON.stringify({ data: {
+    session_token: held.token, email: held.email, display_name: held.displayName,
+    expires_at: new Date(held.expiresAt * 1000).toISOString(),
+  } })));
+  await expect(signInToLocalWorkspace(held.email, 'example-password')).resolves.toEqual(held);
+  expect(request).toHaveBeenCalledExactlyOnceWith(
+    'https://workspace-endpoint.openagents.org/v1/auth/local-session', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: held.email, password: 'example-password' }),
+    },
+  );
+  expect(loadWorkspaceSession()).toEqual(held);
+});
+
 it('renews a held session with it as the bearer and stores the new one', async () => {
   saveWorkspaceSession(held);
   const expiresAt = new Date(Date.now() + 30 * 86400_000);
@@ -75,6 +91,19 @@ it('keeps the stored session when renewal cannot reach the server', async () => 
   request.mockRejectedValue(new TypeError('Failed to fetch'));
   await expect(renewWorkspaceSession(held)).rejects.toThrow();
   expect(loadWorkspaceSession()).toEqual(held);
+});
+
+it.each([200, 401])('keeps a new account when the previous renewal returns %s', async status => {
+  saveWorkspaceSession(held);
+  request.mockResolvedValue(new Response(JSON.stringify({ data: {
+    session_token: 'fresh-session', email: held.email, display_name: held.displayName,
+    expires_at: new Date(held.expiresAt * 1000).toISOString(),
+  } }), { status }));
+  const pending = renewWorkspaceSession(held);
+  const replacement = { ...held, token: 'other-session', email: 'other@example.com' };
+  saveWorkspaceSession(replacement);
+  await pending;
+  expect(loadWorkspaceSession()).toEqual(replacement);
 });
 
 it('asks for renewal only in the last week of a session', () => {

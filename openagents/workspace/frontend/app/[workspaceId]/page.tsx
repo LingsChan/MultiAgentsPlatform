@@ -7,47 +7,15 @@ import { useSearchParams } from 'next/navigation';
 import { WorkspaceProvider, useWorkspace } from '@/lib/workspace-context';
 import { LayoutProvider } from '@/components/layout/layout-context';
 import { Wrapper } from '@/components/layout/wrapper';
+import { WorkspaceLoadingScreen } from '@/components/layout/workspace-loading-screen';
 import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
-import { goToCentralLogin, redirectToLogin } from '@/lib/auth-redirects';
+import { goToCentralLogin, LOCAL_WORKSPACE_AUTH, redirectToLogin } from '@/lib/auth-redirects';
 import { LogIn } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty';
 import { useT } from '@/lib/i18n';
 import { recallWorkspaceToken, rememberWorkspaceToken } from '@/lib/workspace-snapshot';
 
-function WorkspaceLoadingSplash() {
-  const t = useT();
-  return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-background">
-      <div className="flex flex-col items-center gap-5">
-        <img
-          src="/logo-icon.png"
-          alt="OpenAgents"
-          className="size-16 animate-[pulse_2s_ease-in-out_infinite] dark:hidden"
-        />
-        <img
-          src="/logo-white.png"
-          alt="OpenAgents"
-          className="size-16 animate-[pulse_2s_ease-in-out_infinite] hidden dark:block"
-        />
-        <div className="text-center">
-          <h1 className="text-xl font-semibold tracking-tight">OpenAgents</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">{t('workspaceGate.workspace')}</p>
-        </div>
-      </div>
-      <div className="absolute bottom-0 left-0 right-0 h-1 bg-muted overflow-hidden">
-        <div className="h-full w-1/3 bg-primary rounded-full animate-[loading-bar_1.5s_ease-in-out_infinite]" />
-      </div>
-      <style>{`
-        @keyframes loading-bar {
-          0% { transform: translateX(-100%); }
-          50% { transform: translateX(150%); }
-          100% { transform: translateX(400%); }
-        }
-      `}</style>
-    </div>
-  );
-}
 
 // Share the cookie across openagents.org subdomains, but fall back to a
 // host-only cookie anywhere else. A browser silently drops a cookie whose
@@ -60,6 +28,7 @@ function workspaceCookieDomain(hostname: string): string {
 }
 
 function setWorkspaceCookie(slug: string, token: string) {
+  if (LOCAL_WORKSPACE_AUTH) return;
   const maxAge = 30 * 24 * 60 * 60;
   const domain = workspaceCookieDomain(window.location.hostname);
   const shared = `path=/;max-age=${maxAge};secure;samesite=lax${domain}`;
@@ -143,7 +112,7 @@ function BearerWorkspace({ workspaceId, idToken }: { workspaceId: string; idToke
     return () => { cancelled = true; };
   }, [workspaceId, idToken, attempt]);
 
-  if (state.kind === 'loading') return <WorkspaceLoadingSplash />;
+  if (state.kind === 'loading') return <WorkspaceLoadingScreen />;
 
   if (state.kind === 'ok') {
     return (
@@ -213,7 +182,7 @@ function WorkspaceContent({ workspaceId }: { workspaceId: string }) {
   }, [authLoading, isOpenAgentsDomain, user, idToken]);
 
   // Wait for the person's identity before ever configuring a token-only client.
-  if (authLoading || (isOpenAgentsDomain && (!user || !idToken))) return <WorkspaceLoadingSplash />;
+  if (authLoading || (isOpenAgentsDomain && (!user || !idToken))) return <WorkspaceLoadingScreen />;
 
   // Has workspace token in URL — use it directly
   if (token) {
@@ -231,7 +200,7 @@ function WorkspaceContent({ workspaceId }: { workspaceId: string }) {
   // No token — check if user is logged in via OpenAgents
   if (isOpenAgentsDomain) {
     if (authLoading) {
-      return <WorkspaceLoadingSplash />;
+      return <WorkspaceLoadingScreen />;
     }
 
     if (user && idToken) {
@@ -284,7 +253,7 @@ export default function WorkspacePage({
   const { workspaceId } = use(params);
 
   return (
-    <Suspense fallback={<WorkspaceLoadingSplash />}>
+    <Suspense fallback={<WorkspaceLoadingScreen />}>
       <WorkspaceContent workspaceId={workspaceId} />
     </Suspense>
   );

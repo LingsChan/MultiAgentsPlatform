@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/reui/button';
 import { useConfirm } from '@/components/ui/dialogs-provider';
 import { Input } from '@/components/ui/reui/input';
 import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
+import { goToCentralLogout, LOCAL_WORKSPACE_AUTH, redirectToLogin } from '@/lib/auth-redirects';
 import { listAccountWorkspaces, createAccountWorkspace, type AccountWorkspace } from '@/lib/account-api';
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
 import { useCreateWorkspace } from '@/hooks/use-create-workspace';
@@ -558,7 +559,7 @@ function MembershipHome({
 }: {
   idToken: string;
   userEmail: string;
-  onSignOut: () => void;
+  onSignOut: () => Promise<void>;
 }) {
   const router = useRouter();
   const t = useT();
@@ -654,7 +655,9 @@ function MembershipHome({
   // phone). So do users invited to one workspace whose own is still the empty
   // one we created. See lib/first-workspace for the rules; the workspace then
   // says why it opened.
-  const target = loading ? null : landingTarget(workspaces);
+  const explicitlyOpenedList = LOCAL_WORKSPACE_AUTH && typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('workspaces') === '1';
+  const target = loading || explicitlyOpenedList ? null : landingTarget(workspaces);
   const firstWorkspace = target?.workspace ?? null;
   const willAutoEnter = target !== null;
   const autoEnteredRef = useRef(false);
@@ -688,17 +691,7 @@ function MembershipHome({
       destructive: true,
     });
     if (!ok) return;
-    try {
-      await onSignOut();
-    } catch {
-      /* already signed out */
-    }
-    // Also end the central openagents.org session — otherwise the login
-    // redirect immediately re-authenticates and bounces back here. On localhost
-    // there's no central login, so just fall through to the inline sign-in gate.
-    if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && !desktopHost()) {
-      window.location.href = 'https://openagents.org/logout';
-    }
+    await goToCentralLogout(onSignOut);
   };
 
   // The launcher's title-bar Sign out lands here, to ask with the same dialog.
@@ -709,10 +702,11 @@ function MembershipHome({
   // Inside the desktop app the launcher's Workspace bar carries the account on
   // this page, and the page wears the app's own look rather than the site's.
   const inDesktop = !!desktopHost();
-  if (inDesktop) {
+  if (inDesktop || LOCAL_WORKSPACE_AUTH) {
     return (
       <DesktopWorkspaceHome
-        workspaces={workspaces}
+        workspaces={orderWorkspaces(workspaces)}
+        account={LOCAL_WORKSPACE_AUTH ? { email: userEmail, signOut: handleSignOut } : undefined}
         loading={loading || willAutoEnter}
         error={error ? ('key' in error ? t(error.key) : error.text) : null}
         onRetry={load}
@@ -869,6 +863,10 @@ function SignInGate({ signIn }: { signIn: () => Promise<void> }) {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    if (LOCAL_WORKSPACE_AUTH) {
+      redirectToLogin();
+      return;
+    }
     if (isLocal) {
       setShowInline(true);
       return;

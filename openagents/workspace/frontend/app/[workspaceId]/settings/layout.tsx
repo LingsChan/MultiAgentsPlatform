@@ -13,7 +13,7 @@ import { SettingsNav } from '@/components/settings/settings-nav';
 import { workspaceApi } from '@/lib/api';
 import type { Workspace, WorkspaceMe } from '@/lib/types';
 import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
-import { goToCentralLogin, redirectToLogin } from '@/lib/auth-redirects';
+import { goToCentralLogin, LOCAL_WORKSPACE_AUTH, redirectToLogin } from '@/lib/auth-redirects';
 import { roleLabel } from '@/lib/roles';
 import { useT } from '@/lib/i18n';
 
@@ -53,8 +53,10 @@ function SettingsShell({ workspaceId, children }: { workspaceId: string; childre
   const [token, setToken] = useState<string | null>(null);
   useEffect(() => {
     if (urlToken) { setToken(urlToken); return; }
-    const fromCookie = readCookieToken(workspaceId);
-    if (fromCookie) { setToken(fromCookie); return; }
+    if (!LOCAL_WORKSPACE_AUTH) {
+      const fromCookie = readCookieToken(workspaceId);
+      if (fromCookie) { setToken(fromCookie); return; }
+    }
     if (authLoading) return;
     if (idToken) {
       let cancelled = false;

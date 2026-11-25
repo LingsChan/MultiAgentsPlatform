@@ -11,7 +11,7 @@ import {
 } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
 import { Menu, MessageSquare, FileText, Globe, PlusSquare } from 'lucide-react';
-import Image from 'next/image';
+import { WorkspaceMark } from './workspace-mark';
 import { useEffect, useState } from 'react';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -102,8 +102,7 @@ export function MobileHeader() {
             </Sheet>
 
             <div className="size-7 shrink-0 overflow-hidden">
-              <Image src="/logo-black.png" alt="" width={28} height={28} className="size-full object-contain dark:hidden" />
-              <Image src="/logo-white.png" alt="" width={28} height={28} className="size-full object-contain hidden dark:block" />
+              <WorkspaceMark size={28} />
             </div>
 
             <span className="text-sm font-medium truncate">

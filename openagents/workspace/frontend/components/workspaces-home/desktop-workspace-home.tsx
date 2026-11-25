@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { ArrowRight, Clock, Plus, RotateCw } from 'lucide-react';
+import { ArrowRight, Clock, LogOut, Plus, RotateCw } from 'lucide-react';
 
 import { Button } from '@/components/ui/reui/button';
 import { Input } from '@/components/ui/reui/input';
@@ -76,6 +76,7 @@ function CreateCard({ onClick }: { onClick: () => void }) {
 }
 
 export interface DesktopWorkspaceHomeProps {
+  account?: { email: string; signOut: () => void };
   workspaces: AccountWorkspace[];
   loading: boolean;
   /** Already translated. */
@@ -108,10 +109,16 @@ export interface DesktopWorkspaceHomeProps {
  * desktop app. The launcher's sidebar carries the brand and the account, so
  * there is no header here.
  */
-export function DesktopWorkspaceHome({ workspaces, loading, error, onRetry, onOpen, create }: DesktopWorkspaceHomeProps) {
+export function DesktopWorkspaceHome({ workspaces, loading, error, onRetry, onOpen, create, account }: DesktopWorkspaceHomeProps) {
   const t = useT();
   return (
-    <div className="min-h-screen bg-background text-foreground">
+    <div className={account ? 'optics-picker text-foreground' : 'min-h-screen bg-background text-foreground'}>
+      {account && <header className="observatory-heading">
+          <h1>{t('dashboard.desktopHeading')}</h1>
+          <button type="button" className="observatory-account" onClick={account.signOut} title={t('userMenu.signOut')}>
+            {account.email} <LogOut size={14}/><span className="sr-only">{t('userMenu.signOut')}</span>
+          </button>
+      </header>}
       {/* The launcher's page frame (its PageHeader: `px-9 pt-7`, a bold
           2xl title, the content 24px under it, full width rather than a
           centred column), so moving between This Computer's pages and this one
@@ -119,13 +126,13 @@ export function DesktopWorkspaceHome({ workspaces, loading, error, onRetry, onOp
       <main className="px-9 pt-7 pb-8">
         {/* Named as the sidebar entry that opens it. Creating is the first card
             of the grid rather than a header button. */}
-        <div className="mb-6 min-w-0">
+        {!account && <div className="mb-6 min-w-0">
           <h1 className="m-0 text-2xl font-bold tracking-tight">{t('dashboard.desktopHeading')}</h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {t('dashboard.subtitle')}
             {!loading && workspaces.length > 0 && <> · {t('dashboard.workspaceCount', { count: workspaces.length })}</>}
           </p>
-        </div>
+        </div>}
 
         {error && (
           <div role="alert" className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">

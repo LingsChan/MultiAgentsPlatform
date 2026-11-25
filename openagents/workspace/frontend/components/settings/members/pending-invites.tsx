@@ -1,8 +1,10 @@
 'use client';
 
+import { useState } from 'react';
 import { Link2, Mail, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Item, ItemActions, ItemContent, ItemDescription, ItemMedia, ItemTitle } from '@/components/ui/item';
 import { IconAction } from '@/components/settings/icon-action';
@@ -17,9 +19,15 @@ import { copyText } from './copy-text';
 /** Invites not yet redeemed: copy the link again, or revoke it. */
 export function PendingInvites({ invites, onChanged }: { invites: TeamInvite[]; onChanged: () => Promise<void> }) {
   const t = useT();
+  const [visibleLink, setVisibleLink] = useState<string | null>(null);
 
   const copyLink = async (invite: TeamInvite) => {
-    if (await copyText(invite.url)) toast.success(t('admin.linkCopied'));
+    if (await copyText(invite.url)) {
+      setVisibleLink(null);
+      toast.success(t('admin.linkCopied'));
+    } else {
+      setVisibleLink(invite.inviteId);
+    }
   };
 
   const revoke = async (invite: TeamInvite) => {
@@ -49,6 +57,10 @@ export function PendingInvites({ invites, onChanged }: { invites: TeamInvite[]; 
                 <ItemDescription className="text-xs">
                   {t('admin.inviteExpires', { time: new Date(inv.expiresAt).toLocaleDateString() })}
                 </ItemDescription>
+              )}
+              {visibleLink === inv.inviteId && (
+                <Input aria-label={t('admin.openInviteLink')} value={inv.url} readOnly
+                  onFocus={(event) => event.currentTarget.select()} />
               )}
             </ItemContent>
             <ItemActions>

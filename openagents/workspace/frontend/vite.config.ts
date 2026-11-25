@@ -53,6 +53,7 @@ export default defineConfig(({ mode }) => ({
     // launcher's preload — which runs before any page script — can set it to
     // a self-hosted endpoint first.
     'process.env.NEXT_PUBLIC_API_URL': '__OA_API_URL__',
+    'process.env.NEXT_PUBLIC_WORKSPACE_LOCAL_AUTH': JSON.stringify('0'),
     // `--mode development` keeps React's development build, whose errors are
     // sentences rather than "Minified React error #NNN" — the difference
     // between an afternoon and a minute when the app only breaks once bundled.

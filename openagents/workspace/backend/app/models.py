@@ -380,8 +380,7 @@ class WorkspaceCollaborator(Base):
 # ---------------------------------------------------------------------------
 
 class User(Base):
-    """A human end-user identity, resolved from a verified login-provider ID
-    token (Google via Firebase, or Sign in with Apple).
+    """A human end-user identity, resolved from a verified identity token.
 
     Distinct from `WorkspaceMember` (agents, keyed by agent_name) and the legacy
     email-only `WorkspaceCollaborator` ACL. A user's access to a workspace is
@@ -397,6 +396,7 @@ class User(Base):
     email = Column(Text, nullable=False)                 # normalized lowercase
     firebase_uid = Column(Text, nullable=True)           # Google/Firebase `uid` claim
     apple_sub = Column(Text, nullable=True)              # Sign in with Apple `sub` claim
+    local_password_hash = Column(Text, nullable=True)   # Admin-provisioned self-hosted login
     display_name = Column(Text, nullable=True)
     # Profile picture: a user-set photo or the verified provider's default.
     # Uploaded images are downscaled client-side to a small data:image URL.

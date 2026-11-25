@@ -384,7 +384,7 @@ class AgentConnector {
     if (!foregroundArgs) {
       // Auto-detect the CLI entry point for foreground mode
       const binPath = require.resolve('../bin/agent-connector.js');
-      foregroundArgs = [binPath, 'up', '--foreground'];
+      foregroundArgs = [binPath, 'up', '--foreground', '--config', path.resolve(this._configDir)];
     }
     Daemon.daemonize(this._configDir, foregroundArgs);
   }

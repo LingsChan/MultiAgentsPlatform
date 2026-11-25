@@ -48,10 +48,11 @@ class Config:
     )
 
     # Workspace-issued login session (HS256 JWT). Minted by POST /v1/auth/session
-    # after a server-side custom-token exchange and accepted as an identity
-    # bearer alongside Firebase / Apple ID tokens, so a signed-in browser never
+    # after a server-side custom-token exchange or local password sign-in.
+    # Accepted alongside Firebase / Apple ID tokens, so a signed-in browser never
     # has to talk to Google. Unset = the endpoint is disabled (503).
     WORKSPACE_SESSION_SECRET: str = os.environ.get("WORKSPACE_SESSION_SECRET", "")
+    WORKSPACE_LOCAL_AUTH_ENABLED: bool = os.environ.get("WORKSPACE_LOCAL_AUTH_ENABLED") == "1"
     WORKSPACE_SESSION_TTL_DAYS: int = int(os.environ.get("WORKSPACE_SESSION_TTL_DAYS", "30"))
     # A session can be renewed (POST /v1/auth/session/renew) for this long after
     # the sign-in that started it; past that the user signs in again. Bounds how

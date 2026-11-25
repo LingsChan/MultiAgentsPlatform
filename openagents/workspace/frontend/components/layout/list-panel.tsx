@@ -21,7 +21,7 @@ export function ListPanel() {
     // Wrapper): its own top, bottom and leading edge, and the seam on its
     // trailing edge. Squeezed to zero width the borders fall outside the
     // sidebar's overflow and vanish with it.
-    <div className="my-2 flex min-w-0 flex-1 flex-col overflow-hidden rounded-s-xl border bg-background">
+    <div className="optics-list my-2 flex min-w-0 flex-1 flex-col overflow-hidden rounded-s-xl border bg-background">
       {visited.current.has('threads') && <Activity mode={viewMode === 'threads' ? 'visible' : 'hidden'}><ThreadList /></Activity>}
       {visited.current.has('files') && <Activity mode={viewMode === 'files' ? 'visible' : 'hidden'}><FileList /></Activity>}
       {visited.current.has('knowledge') && <Activity mode={viewMode === 'knowledge' ? 'visible' : 'hidden'}><KnowledgeList /></Activity>}

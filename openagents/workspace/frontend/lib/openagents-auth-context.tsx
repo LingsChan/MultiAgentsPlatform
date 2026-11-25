@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { desktopHost } from './desktop-host';
+import { LOCAL_WORKSPACE_AUTH, redirectToLogin } from './auth-redirects';
 import { workspaceApi } from './api';
 import {
   clearWorkspaceSession, loadWorkspaceSession, renewWorkspaceSession, sessionNeedsRenewal, type WorkspaceSession,
@@ -62,7 +63,7 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
 
   useEffect(() => {
     const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
-    const isDomain = OPENAGENTS_HOSTNAMES.includes(hostname);
+    const isDomain = LOCAL_WORKSPACE_AUTH || OPENAGENTS_HOSTNAMES.includes(hostname);
     setIsOpenAgentsDomain(isDomain);
 
     if (!isDomain) {
@@ -86,7 +87,7 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
       return;
     }
 
-    if (desktopHost()) { setLoading(false); return; }
+    if (LOCAL_WORKSPACE_AUTH || desktopHost()) { setLoading(false); return; }
 
     // Dynamically import firebase to avoid loading it on non-openagents domains
     let unsubscribe: (() => void) | undefined;
@@ -184,7 +185,7 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
       if (!current) return Promise.resolve(null);
       inFlight ??= renewWorkspaceSession(current)
         .then((next) => {
-          if (stopped) return null;
+          if (stopped || sessionRef.current?.token !== current.token) return null;
           if (!next) {
             setSession(null);
             setUser(null);
@@ -218,6 +219,12 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
   }, [hasSession]);
 
   const signIn = useCallback(async () => {
+    if (LOCAL_WORKSPACE_AUTH) {
+      sessionRef.current = null;
+      clearWorkspaceSession();
+      redirectToLogin();
+      return;
+    }
     const host = desktopHost();
     if (host) { host.signIn(); return; }
     const { signInWithGoogle, getIdToken, getFreshIdToken, getResolvedEmail } = await import('./firebase');
@@ -245,6 +252,7 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
   }, []);
 
   const adoptWorkspaceSession = useCallback((session: WorkspaceSession) => {
+    sessionRef.current = session;
     setUser({
       email: session.email,
       displayName: session.displayName || session.email,
@@ -258,10 +266,12 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
   const signOut = useCallback(async () => {
     // Drop the workspace session first so a Firebase failure (Google
     // unreachable) can't leave the user signed in.
+    sessionRef.current = null;
     clearWorkspaceSession();
     setSession(null);
     setUser(null);
     setIdToken(null);
+    if (LOCAL_WORKSPACE_AUTH) return;
     const host = desktopHost();
     if (host) { host.signOut(); return; }
     const { signOutUser } = await import('./firebase');

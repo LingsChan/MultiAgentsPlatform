@@ -232,6 +232,7 @@ export function ChatInput({ conversationId, onSend, disabled, className, agents 
           the growing textarea, then a toolbar row with the `+` menu on the
           left and the round send button on the right. */}
       <InputGroup
+        data-chat-composer=""
         data-dragging={files.isDragging || undefined}
         className="bg-background data-dragging:border-dashed data-dragging:border-primary data-dragging:bg-primary/5"
       >

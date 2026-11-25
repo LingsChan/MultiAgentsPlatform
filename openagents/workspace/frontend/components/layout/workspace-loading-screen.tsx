@@ -1,6 +1,8 @@
 'use client';
  // v1.1 M2
 import { useT } from '@/lib/i18n';
+import { WorkspaceMark } from '@/components/layout/workspace-mark';
+import { LOCAL_WORKSPACE_AUTH } from '@/lib/auth-redirects';
 
 export function WorkspaceLoadingScreen() {
   const t = useT();
@@ -8,18 +10,9 @@ export function WorkspaceLoadingScreen() {
   return (
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-background">
       <div className="flex flex-col items-center gap-5">
-        <img
-          src="/logo-icon.png"
-          alt="OpenAgents"
-          className="size-16 animate-[pulse_2s_ease-in-out_infinite] dark:hidden"
-        />
-        <img
-          src="/logo-white.png"
-          alt="OpenAgents"
-          className="size-16 animate-[pulse_2s_ease-in-out_infinite] hidden dark:block"
-        />
+        <WorkspaceMark size={60} />
         <div className="text-center">
-          <h1 className="text-xl font-semibold tracking-tight">OpenAgents</h1>
+          <h1 className="text-xl font-semibold tracking-tight">{LOCAL_WORKSPACE_AUTH ? 'MultiAgentsPlatform' : 'OpenAgents'}</h1>
           <p className="text-sm text-muted-foreground mt-0.5">{t('nav.workspaceFallback')}</p>
         </div>
       </div>

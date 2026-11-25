@@ -1,10 +1,12 @@
+name: multiagents-platform
+
 services:
   db:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: openagents_workspace
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,28 +20,38 @@ services:
       context: ./backend
       dockerfile: backend.Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:-changeme}@db:5432/openagents_workspace
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:?Set DB_PASSWORD}@db:5432/openagents_workspace
       AUTH_MODE: workspace_token
       IDENTITY_MODE: standalone
-      # openagents://workspace is the Workspace bundled into the desktop
-      # launcher (packages/launcher/src/main/workspace-bundle.ts).
-      CORS_ORIGINS: ${CORS_ORIGINS:-https://workspace.openagents.org,openagents://workspace}
+      WORKSPACE_LOCAL_AUTH_ENABLED: ${WORKSPACE_LOCAL_AUTH_ENABLED:-1}
+      WORKSPACE_SESSION_SECRET: ${WORKSPACE_SESSION_SECRET:?Set WORKSPACE_SESSION_SECRET}
+      FRONTEND_BASE_URL: ${WORKSPACE_URL:-http://localhost:${WORKSPACE_PORT:-8180}}
+      PUBLIC_API_BASE: ${API_URL:-${WORKSPACE_URL:-http://localhost:${WORKSPACE_PORT:-8180}}}
+      CORS_ORIGINS: ${CORS_ORIGINS:-${WORKSPACE_URL:-http://localhost:${WORKSPACE_PORT:-8180}},openagents://workspace}
     depends_on:
       db:
         condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec", "alembic upgrade head && exec ./entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   frontend:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_URL: ${API_URL:-https://workspace-endpoint.openagents.org}
+        NEXT_PUBLIC_API_URL: ${API_URL:-${WORKSPACE_URL:-http://localhost:${WORKSPACE_PORT:-8180}}}
+        NEXT_PUBLIC_WORKSPACE_LOCAL_AUTH: ${WORKSPACE_LOCAL_AUTH_ENABLED:-1}
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
   nginx:
     image: nginx:alpine
     ports:
-      - "80:80"
+      - "${WORKSPACE_BIND:-127.0.0.1}:${WORKSPACE_PORT:-8180}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:

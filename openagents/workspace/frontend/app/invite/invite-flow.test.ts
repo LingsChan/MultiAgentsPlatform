@@ -8,7 +8,9 @@ const state = vi.hoisted(() => ({
 }));
 vi.mock('next/navigation', () => ({ useRouter: () => ({ replace: state.replace }) }));
 vi.mock('@/lib/openagents-auth-context', () => ({ useOpenAgentsAuth: () => state.auth }));
-vi.mock('@/lib/auth-redirects', () => ({ goToCentralLogin: state.login, goToCentralLogout: vi.fn() }));
+vi.mock('@/lib/auth-redirects', () => ({
+  LOCAL_WORKSPACE_AUTH: false, goToCentralLogin: state.login, goToCentralLogout: vi.fn(),
+}));
 vi.mock('@/lib/i18n', () => ({ useT: () => (key: string) => key }));
 vi.mock('@/lib/invite-api', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/invite-api')>(),

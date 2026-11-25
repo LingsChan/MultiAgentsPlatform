@@ -1,7 +1,7 @@
 'use client';
 
 import { useRef, useState } from 'react';
-import Image from 'next/image';
+import { WorkspaceMark } from './workspace-mark';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useT } from '@/lib/i18n';
 import { Button } from '@/components/ui/button';
@@ -36,8 +36,7 @@ export function Brand() {
   return (
     <div className="flex items-center gap-2.5 px-2 py-1.5 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0">
       <span className="relative flex size-5 shrink-0 items-center justify-center overflow-hidden">
-        <Image src="/logo-black.png" alt="" width={20} height={20} className="size-full object-contain dark:hidden" />
-        <Image src="/logo-white.png" alt="" width={20} height={20} className="size-full object-contain hidden dark:block" />
+        <WorkspaceMark size={20} />
       </span>
 
       <div className="grid min-w-0 flex-1 leading-tight group-data-[collapsible=icon]:hidden">

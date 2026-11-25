@@ -43,7 +43,7 @@ describe('Codex — live workspace model selection', () => {
   it('uses a model.set selection for the next codex exec invocation', async () => {
     let invocation;
     const fake = Object.assign(Object.create(CodexAdapter.prototype), {
-      agentEnv: { CODEX_MODEL: 'startup-model' },
+      agentEnv: { CODEX_MODEL: 'startup-model', OPENAGENTS_CODEX_SANDBOX: 'workspace-write' },
       workspaceModel: null,
       _directModel: 'startup-model',
       _directApiKey: '',
@@ -68,6 +68,7 @@ describe('Codex — live workspace model selection', () => {
       ['-m', 'selected-model'],
     );
     assert.strictEqual(invocation.env.CODEX_MODEL, 'selected-model');
+    assert.ok(invocation.cmd.includes('sandbox_mode="workspace-write"'));
   });
 });
 

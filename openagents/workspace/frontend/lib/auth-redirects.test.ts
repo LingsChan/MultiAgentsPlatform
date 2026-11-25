@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { goToCentralLogin, goToCentralLogout, redirectToLogin } from './auth-redirects';
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
 describe('desktop account boundaries', () => {
   it('uses desktop sign-in instead of navigating the embedded app to the account site', () => {
     const signIn = vi.fn();
@@ -54,4 +57,21 @@ it('can bypass inline login even on localhost', () => {
   goToCentralLogin(popup, { forceCentral: true });
   expect(popup).not.toHaveBeenCalled();
   expect(location.href).toContain('https://openagents.org/login?returnTo=');
+});
+
+it('preserves the invitation on the self-hosted origin through login and logout', async () => {
+  vi.stubEnv('NEXT_PUBLIC_WORKSPACE_LOCAL_AUTH', '1');
+  vi.resetModules();
+  const { goToCentralLogin, goToCentralLogout } = await import('./auth-redirects');
+  const replace = vi.fn();
+  const href = 'https://collab.example.test/invite/token?from=mail';
+  const location = { href, pathname: '/invite/token', search: '?from=mail', hash: '', replace };
+  vi.stubGlobal('window', { location });
+
+  goToCentralLogin(undefined, { forceCentral: true });
+  expect(replace).toHaveBeenCalledWith('/login?returnTo=%2Finvite%2Ftoken%3Ffrom%3Dmail');
+  const signOut = vi.fn().mockResolvedValue(undefined);
+  await goToCentralLogout(signOut);
+  expect(signOut).toHaveBeenCalledOnce();
+  expect(location.href).toBe(href);
 });

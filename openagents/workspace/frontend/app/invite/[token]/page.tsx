@@ -6,8 +6,9 @@ import { LogIn, Mail, UserPlus } from 'lucide-react';
 import { Button } from '@/components/ui/reui/button';
 import { getInvitePeek, acceptInvite, inviteLandingPath, type InvitePeek } from '@/lib/invite-api';
 import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
-import { goToCentralLogin, goToCentralLogout } from '@/lib/auth-redirects';
+import { goToCentralLogin, goToCentralLogout, LOCAL_WORKSPACE_AUTH } from '@/lib/auth-redirects';
 import { useT } from '@/lib/i18n';
+import { WorkspaceMark } from '@/components/layout/workspace-mark';
 import { Spinner } from '@/components/ui/spinner';
 
 /**
@@ -67,8 +68,7 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
   const card = (children: React.ReactNode) => (
     <div className="flex min-h-screen items-center justify-center bg-background p-6">
       <div className="w-full max-w-md space-y-5 rounded-2xl border bg-card p-8 text-center shadow-sm">
-        <img src="/logo-icon.png" alt="OpenAgents" className="mx-auto size-12 dark:hidden" />
-        <img src="/logo-white.png" alt="OpenAgents" className="mx-auto hidden size-12 dark:block" />
+        <div className="flex justify-center"><WorkspaceMark size={48} /></div>
         {children}
       </div>
     </div>
@@ -161,7 +161,9 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
             <LogIn className="size-4" />
             {t('invitePage.signInToAccept')}
           </Button>
-          <p className="text-xs text-muted-foreground">{t('invitePage.signInHint')}</p>
+          <p className="text-xs text-muted-foreground">
+            {t(LOCAL_WORKSPACE_AUTH ? 'localLogin.description' : 'invitePage.signInHint')}
+          </p>
         </div>
       )}
     </>,

@@ -1951,6 +1951,17 @@ export const messages: Messages = {
     renderUnavailable: '此网页暂时无法在这里显示，请下载后查看。',
   },
 
+  optics: {
+    lens: '切换透镜', pause: '暂停动效', play: '继续动效',
+    agents: '{count} 个 Agent 在线',
+  },
+  localLogin: {
+    title: '登录工作区',
+    description: '使用受邀邮箱登录。',
+    email: '电子邮箱',
+    password: '密码',
+  },
+
   workspaceGate: {
     workspace: '工作区',
     guest: '访客',

@@ -22,11 +22,19 @@ export interface WorkspaceSession {
 }
 
 /** Exchange a login-handoff custom token for a workspace session (server-side). */
-export async function exchangeHandoffToken(customToken: string): Promise<WorkspaceSession> {
-  const res = await fetch(`${API_URL}/v1/auth/session`, {
+export function exchangeHandoffToken(customToken: string): Promise<WorkspaceSession> {
+  return startWorkspaceSession('session', { custom_token: customToken });
+}
+
+export function signInToLocalWorkspace(email: string, password: string): Promise<WorkspaceSession> {
+  return startWorkspaceSession('local-session', { email, password });
+}
+
+async function startWorkspaceSession(endpoint: 'session' | 'local-session', body: Record<string, string>): Promise<WorkspaceSession> {
+  const res = await fetch(`${API_URL}/v1/auth/${endpoint}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ custom_token: customToken }),
+    body: JSON.stringify(body),
   });
   const json = await res.json().catch(() => null);
   if (!res.ok || !json?.data?.session_token) {
@@ -50,24 +58,25 @@ export function saveWorkspaceSession(session: WorkspaceSession): void {
   }
 }
 
-/** The stored session, or null if absent, malformed, or within a minute of expiry. */
-export function loadWorkspaceSession(): WorkspaceSession | null {
+function readStoredWorkspaceSession(): WorkspaceSession | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const s = JSON.parse(raw) as WorkspaceSession;
-    if (!s?.token || !s?.email || typeof s.expiresAt !== 'number') {
-      clearWorkspaceSession();
-      return null;
-    }
-    if (s.expiresAt - 60 < Date.now() / 1000) {
-      clearWorkspaceSession();
-      return null;
-    }
-    return s;
+    return raw ? JSON.parse(raw) as WorkspaceSession : null;
   } catch {
     return null;
   }
+}
+
+/** The stored session, or null if absent, malformed, or within a minute of expiry. */
+export function loadWorkspaceSession(): WorkspaceSession | null {
+  const session = readStoredWorkspaceSession();
+  if (!session) return null;
+  if (!session.token || !session.email || typeof session.expiresAt !== 'number'
+    || session.expiresAt - 60 < Date.now() / 1000) {
+    clearWorkspaceSession();
+    return null;
+  }
+  return session;
 }
 
 export function clearWorkspaceSession(): void {
@@ -100,8 +109,10 @@ export async function renewWorkspaceSession(session: WorkspaceSession): Promise<
     headers: { Authorization: `Bearer ${session.token}` },
   });
   const json = await res.json().catch(() => null);
+  // A logout or another sign-in may have happened while this request was open.
+  const isStillStored = readStoredWorkspaceSession()?.token === session.token;
   if (res.status === 401 || res.status === 403) {
-    clearWorkspaceSession();
+    if (isStillStored) clearWorkspaceSession();
     return null;
   }
   if (!res.ok || !json?.data?.session_token) throw new Error(`Session renewal failed (${res.status})`);
@@ -111,6 +122,6 @@ export async function renewWorkspaceSession(session: WorkspaceSession): Promise<
     displayName: json.data.display_name ?? session.displayName,
     expiresAt: Math.floor(new Date(json.data.expires_at).getTime() / 1000),
   };
-  saveWorkspaceSession(renewed);
+  if (isStillStored) saveWorkspaceSession(renewed);
   return renewed;
 }

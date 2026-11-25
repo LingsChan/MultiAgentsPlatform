@@ -47,6 +47,66 @@ Events flow through a mod pipeline: `mod/auth` → `mod/workspace` → `mod/pers
 
 ## Self-Hosting
 
+### Start MultiAgentsPlatform locally
+
+From `openagents/workspace`, create a local `.env` once and launch the
+self-hosted stack. The following commands use PowerShell and Docker Compose.
+
+```powershell
+if (-not (Test-Path -LiteralPath .env)) {
+    @(
+        "DB_PASSWORD=$([Security.Cryptography.RandomNumberGenerator]::GetHexString(32))"
+        "WORKSPACE_SESSION_SECRET=$([Security.Cryptography.RandomNumberGenerator]::GetHexString(32))"
+    ) | Set-Content -LiteralPath .env -Encoding ascii
+}
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+The backend applies database migrations as it starts. Provision each person's
+account from an interactive terminal. Each command prompts for a password.
+
+```powershell
+docker compose -f docker-compose.prod.yml exec backend python -m scripts.create_local_account owner@example.com --name "Owner"
+docker compose -f docker-compose.prod.yml exec backend python -m scripts.create_local_account teammate@example.com --name "Teammate"
+```
+
+Open `http://localhost:8180` and sign in as the owner. Create or open a
+workspace, then go to **Settings → Members** and invite the teammate by their
+provisioned email. Without a mail provider, the invitation link is copied and
+can also be copied again under **Pending invitations**. If clipboard access is
+blocked, the copy action displays the link. Open the link in a
+separate browser profile or device and sign in as the teammate. The link
+grants workspace membership to the matching account. It does not carry a
+machine token.
+
+The proxy binds to loopback by default. For other devices, set
+`WORKSPACE_URL` to the HTTPS origin they can reach and route that origin
+through your TLS reverse proxy to the published workspace port. Rebuild
+when the public origin changes because the frontend embeds its API URL.
+The local account workflow is enabled by default in this Compose file and
+can be switched off with `WORKSPACE_LOCAL_AUTH_ENABLED=0`.
+
+### Windows desktop client
+
+The MultiAgentsPlatform Windows client opens the self-hosted workspace in an
+Electron window. Sign in with the account provisioned on that workspace. The
+client defaults to `http://localhost:3000` for the local development preview.
+To connect to the Compose deployment or an HTTPS workspace, pass its web
+address as `--workspace-url`.
+
+Build the Windows x64 preview from `openagents/packages/launcher`.
+
+```powershell
+npm ci
+npm run build:self-hosted:win
+.\dist\self-hosted\0.2.1\win-unpacked\MultiAgentsPlatform.exe --workspace-url=http://localhost:8180
+```
+
+Keep the executable with the rest of the `win-unpacked` directory. To run the
+same client directly from source, use `npm run dev:self-hosted -- --workspace-url=http://localhost:8180`.
+
+### Upstream OpenAgents releases
+
 Self-hosted releases are cut from `develop` onto the `release` branch and tagged
 `workspace-vX.Y.Z` (see [Releases](https://github.com/openagents-org/openagents/releases)).
 Each release publishes the backend image

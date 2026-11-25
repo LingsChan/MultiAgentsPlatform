@@ -2,7 +2,7 @@
  * Codex adapter for OpenAgents workspace.
  *
  * Bridges OpenAI Codex CLI to an OpenAgents workspace via:
- * - Codex CLI subprocess (exec --json --full-auto) as primary mode
+ * - Codex CLI subprocess with a shell sandbox as primary mode
  * - Direct HTTP mode for OpenAI-compatible LLM APIs as fallback
  *
  * Similar to ClaudeAdapter: spawns the CLI per message, processes
@@ -500,6 +500,7 @@ class CodexAdapter extends BaseAdapter {
     // refused that once and a model it does list was picked instead.
     let effectiveModel = this._effectiveModel() || this._planFallbackModel || '';
     let planRetried = false;
+    const sandboxMode = env.OPENAGENTS_CODEX_SANDBOX === 'workspace-write' ? 'workspace-write' : 'read-only';
 
     // Set model via env if configured
     if (effectiveModel) env.CODEX_MODEL = effectiveModel;
@@ -516,7 +517,9 @@ class CodexAdapter extends BaseAdapter {
     for (let attempt = 0; attempt < 2; attempt++) {
       const cmd = [this._codexBin, 'exec'];
 
-      cmd.push('--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check');
+      cmd.push('--json', '--skip-git-repo-check',
+        '-c', `sandbox_mode="${sandboxMode}"`,
+        '-c', 'approval_policy="never"');
 
       // Model override
       if (effectiveModel) {
@@ -546,7 +549,7 @@ class CodexAdapter extends BaseAdapter {
       }
 
       // Resume goes LAST, after the exec options. `codex exec resume` takes
-      // -m, --json, --skip-git-repo-check and the bypass flags, but not -C,
+      // -m, --json, --skip-git-repo-check and config overrides, but not -C,
       // so the old order died with "unexpected argument '-C'" on every
       // follow-up. That read as a stale thread, the id was dropped and the
       // turn reran fresh, which is why a CLI-mode agent never remembered

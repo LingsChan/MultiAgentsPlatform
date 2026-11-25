@@ -65,7 +65,7 @@ export function AgentMessageRow({ message, agents, agent, agentNames, agentLabel
   };
 
   return (
-    <Message className="gap-3 py-2">
+    <Message className="observatory-agent-message gap-3 py-2">
       <MessageAvatar className="self-start">
         <AgentAvatar name={message.senderName} size={32} />
       </MessageAvatar>

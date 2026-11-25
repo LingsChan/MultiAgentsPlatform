@@ -12,7 +12,7 @@ vi.mock('@/lib/workspace-context', () => ({ WorkspaceProvider: ({children}:React
 vi.mock('@/components/layout/layout-context', () => ({ LayoutProvider: ({children}:React.PropsWithChildren) => children }));
 vi.mock('@/components/layout/wrapper', () => ({ Wrapper: () => React.createElement('div', null, 'Workspace opened') }));
 vi.mock('@/lib/i18n', () => ({ useT: () => (key:string) => key }));
-vi.mock('@/lib/auth-redirects', () => ({ redirectToLogin:vi.fn(),goToCentralLogin:vi.fn() }));
+vi.mock('@/lib/auth-redirects', () => ({ LOCAL_WORKSPACE_AUTH: false, redirectToLogin: vi.fn(), goToCentralLogin: vi.fn() }));
 const roster = [{slug:'test',workspaceId:'test',token:'workspace-key',role:'owner'}];
 it('opens normally with a stable login token', async () => {
   Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true}); clearWorkspaceSnapshots(); mocks.token='A'; mocks.list.mockResolvedValue(roster);

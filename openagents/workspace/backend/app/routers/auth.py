@@ -4,6 +4,7 @@ Login-session endpoints for the workspace web app.
 
 POST /v1/auth/session        Exchange an openagents.org login-handoff custom
                              token for a workspace-issued session JWT.
+POST /v1/auth/local-session  Sign in with a self-hosted account password.
 POST /v1/auth/apple-session  Exchange a native Sign in with Apple identity
                              token for the same kind of session JWT.
 POST /v1/auth/session/renew  Trade a still-valid session for a fresh one.
@@ -29,9 +30,13 @@ from datetime import datetime, timezone
 
 from typing import Optional
 
-from fastapi import APIRouter, Header
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, Header, Response
+from pydantic import BaseModel, Field, SecretStr
+from sqlalchemy.orm import Session
 
+from app.access import get_or_create_user
+from app.config import config
+from app.database import get_db
 from app.firebase_auth import (
     exchange_custom_token,
     verify_apple_claims,
@@ -40,6 +45,7 @@ from app.firebase_auth import (
     workspace_session_enabled,
 )
 from app.response import ResponseCode, json_response, success_response
+from app.services.local_accounts import MAX_PASSWORD_LENGTH, authenticate_local_account
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,41 @@ router = APIRouter(prefix="/v1/auth", tags=["Auth"])
 
 class SessionRequest(BaseModel):
     custom_token: str = Field(..., min_length=1, max_length=4096)
+
+
+def _session_response(token: str, expires_at: int, claims: dict):
+    return success_response({
+        "session_token": token,
+        "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+        "email": claims["email"],
+        "display_name": claims.get("display_name"),
+    })
+
+
+class LocalSessionRequest(BaseModel):
+    email: str = Field(min_length=1, max_length=254)
+    password: SecretStr = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+
+
+@router.post("/local-session")
+def create_local_session(body: LocalSessionRequest, response: Response, db: Session = Depends(get_db)):
+    if not config.WORKSPACE_LOCAL_AUTH_ENABLED:
+        return json_response(ResponseCode.NOT_FOUND, "Local sign-in is disabled")
+    if len(config.WORKSPACE_SESSION_SECRET.encode()) < 32:
+        return json_response(
+            ResponseCode.INTERNAL_ERROR, "Local sign-in is not configured", status_code=503,
+        )
+
+    user = authenticate_local_account(db, body.email, body.password.get_secret_value())
+    if user is None:
+        return json_response(ResponseCode.UNAUTHORIZED, "Incorrect email or password")
+
+    claims = {"email": user.email, "display_name": user.display_name}
+    get_or_create_user(db, claims)
+    db.commit()
+    token, expires_at = mint_workspace_session(claims)
+    response.headers["Cache-Control"] = "no-store"
+    return _session_response(token, expires_at, claims)
 
 
 @router.post("/session")
@@ -75,12 +116,7 @@ def create_session(body: SessionRequest):
 
     token, exp = mint_workspace_session(claims)
     logger.info("auth: issued workspace session for %s", claims["email"])
-    return success_response({
-        "session_token": token,
-        "expires_at": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat(),
-        "email": claims["email"],
-        "display_name": claims.get("display_name"),
-    })
+    return _session_response(token, exp, claims)
 
 
 @router.post("/session/renew")
@@ -119,12 +155,7 @@ def renew_session(authorization: Optional[str] = Header(None)):
 
     token, exp, claims = renewed
     logger.info("auth: renewed workspace session for %s", claims["email"])
-    return success_response({
-        "session_token": token,
-        "expires_at": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat(),
-        "email": claims["email"],
-        "display_name": claims.get("display_name"),
-    })
+    return _session_response(token, exp, claims)
 
 
 class AppleSessionRequest(BaseModel):
@@ -167,9 +198,4 @@ def create_apple_session(body: AppleSessionRequest):
     claims = {**claims, "email": claims["email"].strip().lower()}
     token, exp = mint_workspace_session(claims)
     logger.info("auth: issued workspace session for %s (apple)", claims["email"])
-    return success_response({
-        "session_token": token,
-        "expires_at": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat(),
-        "email": claims["email"],
-        "display_name": claims.get("display_name"),
-    })
+    return _session_response(token, exp, claims)

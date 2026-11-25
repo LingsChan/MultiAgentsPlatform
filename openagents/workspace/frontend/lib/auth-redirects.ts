@@ -9,6 +9,7 @@ import { desktopHost } from './desktop-host';
 // to the app's own Firebase flow / a plain sign-out for local development.
 
 const CENTRAL = 'https://openagents.org';
+export const LOCAL_WORKSPACE_AUTH = process.env.NEXT_PUBLIC_WORKSPACE_LOCAL_AUTH === '1';
 
 // NEXT_PUBLIC_INLINE_LOGIN=1 (build-time) makes every host behave like
 // localhost: sign in with the app's own Firebase popup instead of bouncing
@@ -21,6 +22,11 @@ function isLocalhost(): boolean {
   return typeof window !== 'undefined' && window.location.hostname === 'localhost';
 }
 
+function openLocalLogin(): void {
+  const returnTo = window.location.pathname + window.location.search + window.location.hash;
+  window.location.replace(`/login?returnTo=${encodeURIComponent(returnTo)}`);
+}
+
 /**
  * Send the user to the central login view. After they authenticate, it hands the
  * session back to this workspace and returns to where they started.
@@ -28,6 +34,7 @@ function isLocalhost(): boolean {
  */
 export function goToCentralLogin(fallbackSignIn?: () => void, options?: { forceCentral?: boolean }): void {
   if (typeof window === 'undefined') return;
+  if (LOCAL_WORKSPACE_AUTH) { openLocalLogin(); return; }
   const host = desktopHost();
   if (host) { host.signIn(); return; }
   if (isLocalhost() && !options?.forceCentral) {
@@ -48,17 +55,17 @@ export async function goToCentralLogout(signOut: () => Promise<void>): Promise<v
   } catch {
     /* already signed out */
   }
-  if (typeof window === 'undefined' || isLocalhost() || desktopHost()) return;
+  if (typeof window === 'undefined' || LOCAL_WORKSPACE_AUTH || isLocalhost() || desktopHost()) return;
   window.location.href = `${CENTRAL}/logout`;
 }
 
 /** Login route for protected pages; popup login must begin with a user click. */
 export function redirectToLogin(): void {
   if (typeof window === 'undefined') return;
+  if (LOCAL_WORKSPACE_AUTH) { openLocalLogin(); return; }
   if (desktopHost()) { desktopHost()?.signIn(); return; }
   if (isLocalhost() || window.location.hostname === 'workspace-preview.openagents.org') {
-    const returnTo = window.location.pathname + window.location.search + window.location.hash;
-    window.location.replace(`/login?returnTo=${encodeURIComponent(returnTo)}`);
+    openLocalLogin();
   } else {
     goToCentralLogin();
   }

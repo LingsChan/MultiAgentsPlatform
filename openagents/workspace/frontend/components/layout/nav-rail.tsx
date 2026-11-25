@@ -3,6 +3,7 @@ import { useOnboardingSurface, useDismissOnboarding, useWelcomeSurface, useWelco
 import { ConnectAgentButton } from './connect-agent-button';
 import * as React from 'react';
 import Image from 'next/image';
+import { LOCAL_WORKSPACE_AUTH } from '@/lib/auth-redirects';
 import {
 BookOpen,Bot,CircleDot,CalendarClock,FileText,Globe,
 Inbox,Mail,MessageSquare,Sparkles,Waypoints
@@ -131,7 +132,7 @@ export function NavRail() {
       {/* Brand, sized as shadcn dashboard-01's: a 20px mark and the name in
           text-base. Expanding and collapsing is the trailing edge's job
           (RailEdge) and Cmd/Ctrl+B. */}
-      <SidebarHeader className="px-1.5 pt-3 pb-0">
+      {!LOCAL_WORKSPACE_AUTH && <SidebarHeader className="px-1.5 pt-3 pb-0">
         <div
           className={cn(
             'flex h-8 items-center',
@@ -177,7 +178,7 @@ export function NavRail() {
             </span>
           )}
         </div>
-      </SidebarHeader>
+      </SidebarHeader>}
 
       {/* View nav + agents */}
       <SidebarContent>

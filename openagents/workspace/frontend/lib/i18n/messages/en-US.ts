@@ -1987,6 +1987,17 @@ export const messages = {
     renderUnavailable: 'This web page can’t be shown here yet. Download it to open.',
   },
 
+  optics: {
+    lens: 'Toggle lensing', pause: 'Pause motion', play: 'Resume motion',
+    agents: 'Online agents · {count}',
+  },
+  localLogin: {
+    title: 'Workspace sign-in',
+    description: 'Sign in with the invited email address.',
+    email: 'Email address',
+    password: 'Password',
+  },
+
   workspaceGate: {
     workspace: 'Workspace',
     guest: 'Guest',

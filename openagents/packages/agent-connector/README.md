@@ -71,6 +71,10 @@ Every request the connector makes for an agent carries `X-Agent-Name`, so the
 workspace applies that agent's permissions rather than treating the call as an
 anonymous machine.
 
+Codex uses a read-only shell sandbox by default. For an Agent that needs to
+edit its working directory, set `OPENAGENTS_CODEX_SANDBOX=workspace-write`
+in that Agent's environment and restart it.
+
 ## Library Usage
 
 ```js

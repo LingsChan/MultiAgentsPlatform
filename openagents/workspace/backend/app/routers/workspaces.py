@@ -248,7 +248,7 @@ def create_workspace(
     When called with a verified identity bearer (the logged-in web flow), the
     caller becomes the owner: their verified email is recorded as creator_email
     and an owner WorkspaceMembership is created. Anonymous creation (no bearer)
-    still works for backward compatibility — creator_email falls back to the
+    still works outside local-account mode — creator_email falls back to the
     request body, and ownership is reconciled the first time that user logs in.
     """
     # The creating agent's name enters router prompts verbatim — same
@@ -268,6 +268,8 @@ def create_workspace(
 
     from app.access import resolve_current_user
     owner = resolve_current_user(db, authorization)
+    if config.WORKSPACE_LOCAL_AUTH_ENABLED and owner is None:
+        return json_response(ResponseCode.UNAUTHORIZED, "Sign in to create a workspace")
     creator_email = owner.email if owner else body.creator_email
 
     workspace = Workspace(
@@ -2701,7 +2703,7 @@ def _invite_row(inv: WorkspaceInvite) -> dict:
         "inviteId": inv.id,
         "email": inv.email,
         "role": inv.role,
-        "url": f"{config.FRONTEND_BASE_URL}/invite/{inv.token}",
+        "url": f"{config.FRONTEND_BASE_URL.rstrip('/')}/invite/{inv.token}",
         "status": _invite_status(inv),
         "createdBy": inv.created_by,
         "createdAt": inv.created_at.isoformat() if inv.created_at else None,
@@ -2755,6 +2757,7 @@ def create_invite(
     db.add(invite)
     db.commit()
 
+    invite_data = _invite_row(invite)
     email_sent = False
     if email:
         from app.services.email import send_invite_email
@@ -2767,11 +2770,11 @@ def create_invite(
             to=email,
             workspace_name=workspace.name,
             role=body.role,
-            invite_url=f"{config.FRONTEND_BASE_URL}/invite/{invite.token}",
+            invite_url=invite_data["url"],
             invited_by=inviter_name,
         )
 
-    return success_response({**_invite_row(invite), "emailSent": email_sent})
+    return success_response({**invite_data, "emailSent": email_sent})
 
 
 @router.get("/{workspace_id}/invites")
