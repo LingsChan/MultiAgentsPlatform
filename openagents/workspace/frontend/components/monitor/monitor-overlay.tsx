@@ -1,0 +1,285 @@
+'use client';
+
+import { toast } from 'sonner';
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { ChatMessages } from '@/components/chat/chat-messages';
+import { ChatInput, type PendingFile } from '@/components/chat/chat-input';
+import { RoutineDialog } from '@/components/routines/routine-dialog';
+import { useWorkspace } from '@/lib/workspace-context';
+import { useT } from '@/lib/i18n';
+import { useMessagePolling } from '@/hooks/use-polling';
+import { workspaceApi } from '@/lib/api';
+import { Square } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { WithTooltip } from '@/components/ui/with-tooltip';
+import { Input } from '@/components/ui/input';
+import { Spinner } from '@/components/ui/spinner';
+import type { WorkspaceMessage, WorkspaceSession } from '@/lib/types';
+import { pendingResponderName, expectsAgentResponse } from '@/lib/pending-responder';
+
+interface MonitorOverlayProps {
+  sessionId: string;
+  session: WorkspaceSession;
+  /** Pre-loaded messages for instant display (from grid cache). */
+  initialMessages?: WorkspaceMessage[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}
+
+export function MonitorOverlay({ sessionId, session, initialMessages, open, onOpenChange }: MonitorOverlayProps) {
+  const { agents, currentUser, activeSessionIds, stoppingSessionIds, stopAllAgents, renameSession, createRoutine, markSessionUnarchived } = useWorkspace();
+  const t = useT();
+  const [showCreateRoutine, setShowCreateRoutine] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState('');
+  const titleInputRef = useRef<HTMLInputElement>(null);
+  const { messages, loading, forceRefresh, generation } = useMessagePolling({
+    sessionId: open ? sessionId : null,
+    initialMessages,
+  });
+
+  const [optimisticMessages, setOptimisticMessages] = useState<WorkspaceMessage[]>([]);
+  const [scrollKey, setScrollKey] = useState(0);
+  const [focusKey, setFocusKey] = useState(0);
+
+  // Scroll to bottom when backfill replaces messages
+  useEffect(() => {
+    if (generation > 0) setScrollKey((k) => k + 1);
+  }, [generation]);
+  const displayMessages = useMemo(() => [...messages, ...optimisticMessages], [messages, optimisticMessages]);
+
+  // Clear optimistic messages progressively:
+  // 1. Remove optimistic user msg once the real user message arrives from the server
+  // 2. Remove optimistic loading indicator once any real agent message arrives after the user msg
+  useEffect(() => {
+    if (optimisticMessages.length === 0) return;
+    let updated = [...optimisticMessages];
+
+    // Check if the real user message has arrived
+    const optimisticUser = updated.find((m) => m.messageId.startsWith('optimistic-user-'));
+    if (optimisticUser) {
+      const realUserFound = messages.some(
+        (m) => m.senderType !== 'agent' && m.content === optimisticUser.content
+      );
+      if (realUserFound) {
+        updated = updated.filter((m) => !m.messageId.startsWith('optimistic-user-'));
+      }
+    }
+
+    // Check if a real agent message has arrived AFTER the user message — clear loading indicator
+    const optimisticLoading = updated.find((m) => m.messageId.startsWith('optimistic-loading-'));
+    if (optimisticLoading) {
+      const userMsgIdx = messages.findIndex(
+        (m) => m.senderType !== 'agent' && m.content === optimisticLoading.metadata?._userContent
+      );
+      const hasAgentAfterUser = userMsgIdx >= 0 && messages.slice(userMsgIdx + 1).some(
+        (m) => m.senderType === 'agent'
+      );
+      if (hasAgentAfterUser) {
+        updated = updated.filter((m) => !m.messageId.startsWith('optimistic-loading-'));
+      }
+    }
+
+    if (updated.length !== optimisticMessages.length) {
+      setOptimisticMessages(updated);
+    }
+  }, [messages, optimisticMessages]);
+
+  // Reset state when overlay opens/closes
+  const prevOpenRef = useRef(open);
+  useEffect(() => {
+    if (open !== prevOpenRef.current) {
+      setOptimisticMessages([]);
+      setEditingTitle(false);
+      if (open) setFocusKey((k) => k + 1);
+      prevOpenRef.current = open;
+    }
+  }, [open]);
+
+  const startEditingTitle = () => {
+    setTitleDraft(session.title || '');
+    setEditingTitle(true);
+    setTimeout(() => titleInputRef.current?.select(), 0);
+  };
+
+  const commitTitle = () => {
+    setEditingTitle(false);
+    const trimmed = titleDraft.trim();
+    if (trimmed && trimmed !== session.title) {
+      renameSession(sessionId, trimmed);
+    }
+  };
+
+  const handleSend = useCallback(
+    async (content: string, mentions: string[] = [], files: PendingFile[] = [], mentionedHumans: string[] = []) => {
+      if (!currentUser.id || !currentUser.name.trim()) return;
+
+      // Optimistic messages
+      const timestamp = Date.now();
+      const userContent = content || (files.length > 0 ? files.map((f) => f.file.name).join(', ') : '');
+      const userOptimisticMsg: WorkspaceMessage = {
+        messageId: `optimistic-user-${timestamp}`,
+        sessionId,
+        senderId: currentUser.id,
+        senderName: currentUser.name,
+        senderType: 'human',
+        content: userContent,
+        messageType: 'chat',
+        mentions: [],
+        targetAgents: null,
+        createdAt: new Date().toISOString(),
+        metadata: {},
+      };
+
+      const loadingOptimisticMsg: WorkspaceMessage = {
+        messageId: `optimistic-loading-${timestamp}`,
+        sessionId,
+        senderName: pendingResponderName({
+          agents,
+          participants: session.participants || [],
+          master: session.master,
+          mentions,
+        }),
+        senderType: 'agent',
+        content: '',
+        messageType: 'loading',
+        mentions: [],
+        targetAgents: null,
+        createdAt: new Date().toISOString(),
+        metadata: { _userContent: userContent },
+      };
+
+      setOptimisticMessages([
+        userOptimisticMsg,
+        ...(expectsAgentResponse({ content, mentions, mentionedHumans, responseMode: /^(?:dm|routines?|task):/.test(sessionId) ? undefined : session.responseMode || 'proactive' }) ? [loadingOptimisticMsg] : []),
+      ]);
+      setScrollKey((k) => k + 1);
+
+      try {
+        let attachments: { fileId: string; filename: string; contentType: string; url: string }[] | undefined;
+        if (files.length > 0) {
+          const uploaded = await Promise.all(
+            files.map((pf) => workspaceApi.uploadFile(pf.file, sessionId))
+          );
+          attachments = uploaded.map((f) => ({
+            fileId: f.id,
+            filename: f.filename,
+            contentType: f.contentType,
+            url: workspaceApi.getFileUrl(f.id),
+          }));
+        }
+
+        const sent = await workspaceApi.sendMessage(
+          sessionId,
+          content || (attachments ? attachments.map((a) => a.filename).join(', ') : ''),
+          currentUser.name,
+          mentions.length > 0 ? mentions : undefined,
+          attachments,
+          currentUser.id,
+          mentionedHumans.length > 0 ? mentionedHumans : undefined,
+        );
+        if (sent.metadata?.thread_unarchived) markSessionUnarchived(sessionId);
+        if (sent.metadata?.router_unavailable) toast.warning(t('responseMode.routerUnavailable'));
+        if (Array.isArray(sent.metadata?.target_agents) && sent.metadata.target_agents.includes('__no_response__')) {
+          setOptimisticMessages((prev) => prev.filter((m) => m.messageId !== loadingOptimisticMsg.messageId));
+        }
+        forceRefresh();
+      } catch {
+        setOptimisticMessages([]);
+      }
+    },
+    [sessionId, currentUser.id, currentUser.name, forceRefresh, agents, session.participants, session.master, session.responseMode]
+  );
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent variant="fullscreen" className="flex flex-col p-0 gap-0" showCloseButton>
+        <DialogTitle className="sr-only">{session.title || t('monitor.threadFallback')}</DialogTitle>
+
+        {/* Header — pr-12 leaves room for the absolute-positioned close button */}
+        <div className="flex shrink-0 items-center gap-3 border-b py-3 pr-12 pl-5">
+          {editingTitle ? (
+            <Input
+              ref={titleInputRef}
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onBlur={commitTitle}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commitTitle();
+                if (e.key === 'Escape') setEditingTitle(false);
+              }}
+              aria-label={t('header.clickToRename')}
+              className="h-8 max-w-75 min-w-0 flex-1 text-sm font-semibold"
+              autoFocus
+            />
+          ) : (
+            <h2 className="flex min-w-0 flex-1">
+              <WithTooltip label={t('header.clickToRename')}>
+                <Button variant="ghost" size="sm" onClick={startEditingTitle} className="-mx-1 min-w-0 shrink px-1 text-sm font-semibold">
+                  <span className="truncate">{session.title || t('monitor.threadFallback')}</span>
+                </Button>
+              </WithTooltip>
+            </h2>
+          )}
+          {/* Stop button — visible when a Claude agent is working */}
+          {(() => {
+            const masterName = session.master;
+            const masterAgent = masterName ? agents.find((a) => a.agentName === masterName) : null;
+            const isClaude = masterAgent?.agentType === 'claude';
+            const isWorking = activeSessionIds.has(sessionId);
+            const isStopping = stoppingSessionIds.has(sessionId);
+            if (!isClaude || (!isWorking && !isStopping)) return null;
+            return (
+              <Button variant="destructive" size="xs" onClick={() => stopAllAgents(sessionId)} disabled={isStopping} className="shrink-0">
+                <Square data-icon="inline-start" className="fill-current" />
+                {isStopping ? t('chat.stopping') : t('chat.stop')}
+              </Button>
+            );
+          })()}
+        </div>
+
+        {/* Messages */}
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+          {loading && messages.length === 0 ? (
+            <div className="flex items-center justify-center flex-1">
+              <Spinner className="size-6 text-muted-foreground" />
+            </div>
+          ) : (
+            <ChatMessages
+              messages={displayMessages}
+              agents={agents}
+              scrollKey={scrollKey}
+              className="flex-1 overflow-y-auto px-5 py-3"
+            />
+          )}
+
+          {/* Input */}
+          <div className="px-4 py-3 border-t">
+            <div className="max-w-3xl mx-auto w-full">
+              <ChatInput conversationId={sessionId} onSend={handleSend} agents={agents} disabled={!currentUser.name.trim()} focusKey={focusKey} onCreateRoutine={() => setShowCreateRoutine(true)} />
+            </div>
+          </div>
+        </div>
+      </DialogContent>
+
+      <RoutineDialog
+        open={showCreateRoutine}
+        onOpenChange={setShowCreateRoutine}
+        agents={agents}
+        conversationHistory={(() => {
+          if (!messages.length) return undefined;
+          const recent = messages.filter((m) => m.messageType === 'chat').slice(-20);
+          if (!recent.length) return undefined;
+          return recent.map((m) => `${m.senderName}: ${m.content}`).join('\n');
+        })()}
+        onCreateRoutine={createRoutine}
+      />
+    </Dialog>
+  );
+}

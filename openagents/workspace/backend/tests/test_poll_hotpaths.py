@@ -1,0 +1,216 @@
+"""Caches on the hottest read paths stay exact and person-scoped."""
+import re
+import time
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import event
+
+from app import cache
+from app.services import dm_summary
+from app.models import Channel, ChannelHumanMember, EventRecord
+from app.services.access_model import Principal, thread_shared_agent_names
+from tests.test_people_messaging import people, quiet_side_effects, _as  # noqa: F401
+
+
+@pytest.fixture
+def memory_cache(monkeypatch, db):
+    state = SimpleNamespace(store={}, queries=[])
+
+    def capture(conn, cursor, statement, *args):
+        state.queries.append(statement)
+
+    monkeypatch.setattr(cache, 'get_bytes', lambda key: state.store.get(key))
+    monkeypatch.setattr(cache, 'set_bytes', lambda key, value, ttl: state.store.__setitem__(key, value))
+    monkeypatch.setattr(cache, 'delete_key', lambda key: state.store.pop(key, None))
+    monkeypatch.setattr(cache, '_lazy_client', lambda: None)
+    event.listen(db.bind, 'before_cursor_execute', capture)
+    yield state
+    event.remove(db.bind, 'before_cursor_execute', capture)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def add_event(db, workspace, source, target, timestamp, visibility='direct', content='hello'):
+    # Tests pass small offsets; real events carry current timestamps, which
+    # the incremental DM summary relies on (it counts rows newer than its base).
+    db.add(EventRecord(id=str(uuid4()), network_id=workspace['id'], source=source, target=target,
+                       timestamp=now_ms() + timestamp, type='workspace.message.posted', visibility=visibility,
+                       payload={'content': content}))
+    db.commit()
+
+
+def conversations(client, workspace, who):
+    response = client.get('/v1/events/conversations', params={'network': workspace['id']},
+                          headers=_as(who, workspace))
+    assert response.status_code == 200
+    return response.json()['data']['conversations']
+
+
+def aggregates(state):
+    return [q for q in state.queries if 'msg_count' in q]
+
+
+def test_dm_summary_is_reused_until_a_direct_message_changes(client, db, workspace, people, memory_cache, monkeypatch):
+    me = 'human:adam@acme.test'
+    add_event(db, workspace, me, 'openagents:mine', 100)
+    assert conversations(client, workspace, 'adam')[0]['message_count'] == 1
+
+    memory_cache.queries.clear()
+    add_event(db, workspace, 'openagents:mine', 'channel/general', 150, visibility='channel')
+    assert conversations(client, workspace, 'adam')[0]['message_count'] == 1
+    assert aggregates(memory_cache) == [], 'channel traffic must not invalidate DM summaries'
+
+    add_event(db, workspace, 'openagents:mine', me, 200, content='newer')
+    assert conversations(client, workspace, 'adam')[0]['message_count'] == 1
+    assert aggregates(memory_cache) == [], 'a busy workspace reuses the list for a few seconds'
+
+    later = time.time() + dm_summary.MERGED_MAX_STALE_SECONDS + 1
+    monkeypatch.setattr(time, 'time', lambda: later)
+    result = conversations(client, workspace, 'adam')
+    assert aggregates(memory_cache), 'after the stale window a new DM recomputes the summary'
+    assert result[0]['message_count'] == 2
+    assert result[0]['last_message']['content'] == 'newer'
+
+
+def test_dm_summary_cache_is_per_person(client, db, workspace, people, memory_cache):
+    add_event(db, workspace, 'human:adam@acme.test', 'openagents:mine', 100, content='adam chat')
+    add_event(db, workspace, 'human:mia@acme.test', 'openagents:hers', 200, content='mia chat')
+    assert [c['last_message']['content'] for c in conversations(client, workspace, 'adam')] == ['adam chat']
+    assert [c['last_message']['content'] for c in conversations(client, workspace, 'mia')] == ['mia chat']
+
+
+def poll(client, workspace, who):
+    response = client.get('/v1/events', params={'network': workspace['id']}, headers=_as(who, workspace))
+    assert response.status_code == 200
+    return [e['payload']['content'] for e in response.json()['data']['events']]
+
+
+def test_poll_with_hidden_threads_is_cached_per_view(client, db, workspace, people, memory_cache):
+    db.add(Channel(workspace_id=workspace['id'], name='mia-private', visibility='private',
+                   owner_email='mia@acme.test'))
+    db.commit()
+    add_event(db, workspace, 'human:mia@acme.test', 'channel/mia-private', 100, 'channel', 'secret')
+    add_event(db, workspace, 'human:adam@acme.test', 'channel/general', 200, 'channel', 'public')
+
+    assert poll(client, workspace, 'adam') == ['public']
+    memory_cache.queries.clear()
+    assert poll(client, workspace, 'adam') == ['public']
+    assert not [q for q in memory_cache.queries if re.search(r'\bFROM events\b', q)], 'served from cache'
+
+    # Another view never receives the cached page, and vice versa.
+    assert poll(client, workspace, 'mia') == ['secret', 'public']
+    assert poll(client, workspace, 'adam') == ['public']
+
+    # Access changes without an event write still take effect immediately.
+    channel = db.query(Channel).filter_by(workspace_id=workspace['id'], name='mia-private').one()
+    db.add(ChannelHumanMember(channel_id=channel.id, user_email='adam@acme.test'))
+    db.commit()
+    assert poll(client, workspace, 'adam') == ['secret', 'public']
+
+
+def test_agent_sharing_lookup_skips_the_join_without_opt_ins(db, workspace, people, memory_cache):
+    principal = Principal('human', email='adam@acme.test', workspace_id=workspace['id'])
+    assert thread_shared_agent_names(db, workspace['id'], principal) == set()
+    joins = [q for q in memory_cache.queries if 'channel_human_members' in q and 'channel_agent_sharing' in q]
+    assert joins == []
+
+
+def test_dm_summary_never_reuses_an_entry_after_the_generation_key_is_lost(
+        client, db, workspace, people, memory_cache, monkeypatch):
+    # A summary cached before the workspace's first DM write...
+    db.execute(EventRecord.__table__.insert().values(
+        id=str(uuid4()), network_id=workspace['id'], source='human:adam@acme.test', target='openagents:mine',
+        timestamp=now_ms() + 100, type='workspace.message.posted', visibility='direct', payload={'content': 'first'}))
+    db.commit()
+    assert conversations(client, workspace, 'adam')[0]['message_count'] == 1
+    # ...must not become current again when a later generation is evicted.
+    add_event(db, workspace, 'openagents:mine', 'human:adam@acme.test', 200, content='later')
+    for key in [k for k in memory_cache.store if k.startswith('v1events:dm-generation:')]:
+        del memory_cache.store[key]
+    later = time.time() + dm_summary.MERGED_MAX_STALE_SECONDS + 1
+    monkeypatch.setattr(time, 'time', lambda: later)
+    assert conversations(client, workspace, 'adam')[0]['message_count'] == 2
+
+
+def poll_type(client, workspace, event_type, **params):
+    response = client.get('/v1/events', params={'network': workspace['id'], 'type': event_type, **params},
+                          headers={'X-Workspace-Token': workspace['token']})
+    assert response.status_code == 200
+    return [e['payload']['content'] for e in response.json()['data']['events']]
+
+
+def test_prefix_type_polls_match_like_semantics(client, db, workspace):
+    from app.services.poll_queries import workspace_types_matching
+    for i, kind in enumerate(['workspace.message.posted', 'workspace.messageX', 'workspace.user.heartbeat',
+                              'workspace.toolXresult', 'workspace.tool_result']):
+        db.add(EventRecord(id=str(uuid4()), network_id=workspace['id'], source='openagents:a', target='channel/general',
+                           timestamp=now_ms() + i, type=kind, visibility='channel', payload={'content': kind}))
+    db.commit()
+    assert set(workspace_types_matching(db, workspace['id'], 'workspace.message')) == {'workspace.message.posted', 'workspace.messageX'}
+    # '_' is a single-character wildcard in LIKE, as before.
+    assert set(workspace_types_matching(db, workspace['id'], 'workspace.tool_')) == {'workspace.toolXresult', 'workspace.tool_result'}
+    assert set(poll_type(client, workspace, 'workspace.message')) >= {'workspace.message.posted', 'workspace.messageX'}
+    assert poll_type(client, workspace, 'workspace.nothing') == []
+
+
+def test_cursor_polls_return_exactly_the_newer_events(client, db, workspace):
+    base = now_ms()
+    # Two events share the cursor's timestamp: only the one with the larger id is newer.
+    for event_id, ts, content in [('a-tie', base, 'cursor'), ('b-tie', base, 'same-ms-after'),
+                                  ('c', base - 5, 'older'), ('d', base + 1, 'newer-1'), ('e', base + 2, 'newer-2')]:
+        db.add(EventRecord(id=event_id, network_id=workspace['id'], source='openagents:a', target='channel/general',
+                           timestamp=ts, type='workspace.message.posted', visibility='channel', payload={'content': content}))
+    db.add(EventRecord(id='hb', network_id=workspace['id'], source='human:x', target='channel/general',
+                       timestamp=base + 3, type='workspace.user.heartbeat', visibility='channel', payload={'content': 'hb'}))
+    db.commit()
+    assert poll_type(client, workspace, 'workspace.message', after='a-tie') == ['same-ms-after', 'newer-1', 'newer-2']
+    assert poll_type(client, workspace, 'workspace.message', before='d', sort='desc') == ['same-ms-after', 'cursor', 'older']
+
+
+def _capture_event_selects(db):
+    seen = []
+    from sqlalchemy import event as sa_event
+    capture = lambda conn, cursor, statement, *a: seen.append(statement) if 'FROM events' in statement and 'ORDER BY' in statement else None
+    sa_event.listen(db.bind, 'before_cursor_execute', capture)
+    return seen, lambda: sa_event.remove(db.bind, 'before_cursor_execute', capture)
+
+
+def _seed_two_types(db, workspace, base=None):
+    base = base or now_ms()
+    rows = [('mt-0', 'workspace.message.posted', 'general', base), ('mt-1', 'workspace.message.status', 'general', base + 1),
+            ('mt-2', 'workspace.message.posted', 'general', base + 2), ('mt-3', 'workspace.message.posted', 'other', base + 3),
+            ('mt-4', 'workspace.message.status', 'general', base + 4)]
+    for event_id, kind, ch, ts in rows:
+        db.add(EventRecord(id=event_id, network_id=workspace['id'], source='openagents:a', target=f'channel/{ch}',
+                           timestamp=ts, type=kind, visibility='channel', payload={'content': event_id}))
+    db.commit()
+
+
+def test_thread_poll_over_several_types_merges_per_type_scans(client, db, workspace):
+    _seed_two_types(db, workspace)
+    seen, stop = _capture_event_selects(db)
+    try:
+        newest = poll_type(client, workspace, 'workspace.message', channel='general', sort='desc')
+        oldest_two = poll_type(client, workspace, 'workspace.message', channel='general', limit=2)
+        after = poll_type(client, workspace, 'workspace.message', channel='general', after='mt-1')
+    finally:
+        stop()
+    assert newest == ['mt-4', 'mt-2', 'mt-1', 'mt-0']
+    assert oldest_two == ['mt-0', 'mt-1']
+    assert after == ['mt-2', 'mt-4']
+    assert any('UNION ALL' in q for q in seen) and not any('LIKE' in q.split('ORDER BY')[0] and 'type' in q for q in seen if 'UNION' in q)
+
+
+def test_workspace_wide_multi_type_poll_keeps_the_prefix_filter(client, db, workspace):
+    _seed_two_types(db, workspace)
+    seen, stop = _capture_event_selects(db)
+    try:
+        got = poll_type(client, workspace, 'workspace.message', sort='desc')
+    finally:
+        stop()
+    assert got[:2] == ['mt-4', 'mt-3']
+    assert any('LIKE' in q for q in seen) and not any('UNION' in q for q in seen)

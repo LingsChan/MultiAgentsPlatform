@@ -1,0 +1,284 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowLeft, BookOpen, Check, Copy, Pencil, Share2 } from 'lucide-react';
+import { Separator } from '@/components/ui/separator';
+import { Spinner } from '@/components/ui/spinner';
+import { toast } from 'sonner';
+import { MarkdownContent } from '@/components/chat/markdown-content';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '@/components/ui/input-group';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { WithTooltip } from '@/components/ui/with-tooltip';
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia } from '@/components/ui/empty';
+import { useLayout } from '@/components/layout/layout-context';
+import { DetailHeader } from '@/components/layout/app-header';
+import { workspaceApi } from '@/lib/api';
+import type { KnowledgeEntry } from '@/lib/types';
+import { cn } from '@/lib/utils';
+import { knowledgeTitle } from '@/lib/knowledge-title';
+import { useWorkspace } from '@/lib/workspace-context';
+import { useFormatters, useT } from '@/lib/i18n';
+import { KnowledgeOverview } from './knowledge-overview';
+import { KnowledgeExport } from './knowledge-export';
+import { KnowledgeEditor } from './knowledge-editor';
+import { knowledgeAuthorName, stripLeadingTitle } from './knowledge-utils';
+import { CopyResourceLink } from '@/components/sharing/copy-resource-link';
+import { ArtifactSharePopover } from '@/components/sharing/artifact-share';
+import { ArtifactOwner, ArtifactVisibilityBadge } from '@/components/sharing/artifact-access-badge';
+import { AccessExplainer } from '@/components/sharing/access-explainer';
+
+/**
+ * The knowledge detail pane. The entry list lives in the shell's list panel
+ * (see knowledge-list.tsx), so this view only renders the selected entry —
+ * same list/detail split as threads and files.
+ */
+export function KnowledgeView() {
+  const { knowledge, sessions, refreshKnowledge, agents, selectedKnowledgeId, updateKnowledge } = useWorkspace();
+  const { isMobile, openMobileList } = useLayout();
+  const t = useT();
+  const { timeAgo } = useFormatters();
+  const agentNames = agents.map((a) => a.agentName);
+
+  const [content, setContent] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingEntry, setEditingEntry] = useState<(KnowledgeEntry & { content: string }) | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const entry = knowledge.find((k) => k.id === selectedKnowledgeId) || null;
+
+  // A save that bumps updatedAt should re-fetch the body — but depend on that
+  // timestamp, NOT on the `knowledge` array. refreshKnowledge() calls
+  // setKnowledge() with a brand-new array every time, so depending on the array
+  // itself threw away the rendered article and flashed a spinner on every list
+  // refresh, tab switch, and delete.
+  const entryVersion = entry?.updatedAt || entry?.createdAt || null;
+  // <Activity> re-runs this when Knowledge is shown again; the same entry at
+  // the same version is still rendered, so don't fetch it again.
+  const loadedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!selectedKnowledgeId) {
+      loadedFor.current = null;
+      setContent('');
+      return;
+    }
+    const loadKey = `${selectedKnowledgeId}:${entryVersion}`;
+    if (loadedFor.current === loadKey) return;
+    let cancelled = false;
+    setLoading(true);
+    workspaceApi
+      .getKnowledgeEntry(selectedKnowledgeId)
+      .then((full) => { if (!cancelled) { setContent(full.content); loadedFor.current = loadKey; } })
+      .catch(() => { if (!cancelled) setContent(t('knowledge.loadFailed')); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [selectedKnowledgeId, entryVersion, t]);
+
+  const handleEdit = useCallback(async () => {
+    if (!entry) return;
+    try {
+      const full = await workspaceApi.getKnowledgeEntry(entry.id);
+      setEditingEntry({ ...full });
+      setEditorOpen(true);
+    } catch {
+      // ignore — the entry may have been removed
+    }
+  }, [entry]);
+
+  // The mention is what this entry is *for* — it's how an agent pulls the
+  // content into a thread — so it gets a copy affordance, not grey small print.
+  const handleCopyMention = useCallback(async () => {
+    if (!entry) return;
+    try {
+      await navigator.clipboard.writeText(`@knowledge:${entry.slug}`);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error(t('chat.copyFailed'));
+    }
+  }, [entry, t]);
+
+  if (!entry && !selectedKnowledgeId) return <KnowledgeOverview />;
+
+  if (!entry) {
+    return (
+      <Empty className="h-full">
+        <EmptyHeader>
+          <EmptyMedia variant="icon">
+            <BookOpen />
+          </EmptyMedia>
+          <EmptyDescription>
+            {selectedKnowledgeId ? t('resourceLinks.unavailable') : t('knowledge.selectEntry')}
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    );
+  }
+
+  return (
+    <div className="flex h-full flex-col">
+      <DetailHeader
+        titleInHeader
+        title={<>
+          {isMobile && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={openMobileList}
+              aria-label={t('common.back')}
+              className="-ms-1"
+            >
+              <ArrowLeft />
+            </Button>
+          )}
+          <BookOpen className="size-4 shrink-0 text-muted-foreground" />
+          <h2 className="min-w-0 truncate text-sm font-medium text-muted-foreground" title={entry.path || `/${[entry.folderPath, entry.slug].filter(Boolean).join('/')}`}>
+            {entry.path || `/${[entry.folderPath, entry.slug].filter(Boolean).join('/')}`}
+          </h2>
+        </>}
+      >
+        <KnowledgeExport entry={{ ...entry, title: knowledgeTitle(entry.title, sessions) }} />
+        <CopyResourceLink view="knowledge" id={entry.id} />
+        {/* Tooltip wraps the popover so its trigger can compose with the popover's. */}
+        <Tooltip>
+          <ArtifactSharePopover
+            kind="knowledge"
+            id={entry.id}
+            name={knowledgeTitle(entry.title, sessions)}
+            visibility={entry.visibility}
+            effectiveVisibility={entry.effectiveVisibility}
+            canManage={entry.canManage}
+            onVisibilityChange={async (v) => { if (v) await updateKnowledge(entry.id, { visibility: v }); }}
+            trigger={
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={t('artifactAccess.share')}
+                  className="text-muted-foreground"
+                >
+                  <Share2 />
+                </Button>
+              </TooltipTrigger>
+            }
+          />
+          <TooltipContent>{t('artifactAccess.share')}</TooltipContent>
+        </Tooltip>
+        <WithTooltip label={t('knowledge.editEntry')}><Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label={t('knowledge.editEntry')}
+              onClick={handleEdit}
+              className="text-muted-foreground"
+            >
+              <Pencil />
+            </Button></WithTooltip>
+      </DetailHeader>
+
+      {/* One centred reading column, the way docs pages lay out an article:
+          title, card, divider and body all share the same width, so a wide
+          pane splits its spare room evenly instead of leaving the text
+          left-aligned under a full-width rule with an empty right half. */}
+      <div className="flex-1 overflow-y-auto">
+        <article className="mx-auto w-full max-w-3xl px-5 py-7 sm:px-8 sm:py-9">
+          <header>
+            <h1 className="text-2xl leading-snug font-semibold tracking-tight text-foreground sm:text-3xl">
+              {knowledgeTitle(entry.title, sessions)}
+            </h1>
+            {entry.description && (
+              <p className="mt-2.5 text-sm leading-relaxed text-muted-foreground">
+                {entry.description}
+              </p>
+            )}
+            <div className="mt-5 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground">
+              {entry.owner ? (
+                <ArtifactOwner owner={entry.owner} ownerLabel={entry.ownerLabel} size={18} />
+              ) : (
+                <span>{knowledgeAuthorName(entry.updatedBy || entry.createdBy)}</span>
+              )}
+              {(entry.updatedAt || entry.createdAt) && (
+                <span>{t('knowledge.updated', { time: timeAgo(entry.updatedAt || entry.createdAt) })}</span>
+              )}
+              <div className="inline-flex items-center gap-1">
+                <ArtifactVisibilityBadge kind="knowledge" visibility={entry.visibility} effectiveVisibility={entry.effectiveVisibility} />
+                <AccessExplainer compact resourceKind="knowledge" resourceId={entry.id} />
+              </div>
+            </div>
+            <Card size="sm" className="mt-5">
+              <CardHeader>
+                <CardTitle>{t('knowledge.library.useTitle')}</CardTitle>
+                <CardDescription className="text-xs leading-5">{t('knowledge.library.mentionHint')}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <InputGroup>
+                  <InputGroupInput
+                    readOnly
+                    value={`@knowledge:${entry.slug}`}
+                    aria-label={t('knowledge.library.useTitle')}
+                    onFocus={(e) => e.currentTarget.select()}
+                    className="font-mono text-xs"
+                  />
+                  <InputGroupAddon align="inline-end">
+                    <InputGroupButton onClick={handleCopyMention}>
+                      {copied ? <Check className="text-success" /> : <Copy />}
+                      {t('knowledge.copyMention')}
+                    </InputGroupButton>
+                  </InputGroupAddon>
+                </InputGroup>
+              </CardContent>
+            </Card>
+          </header>
+
+          {/* The header renders from list data that's already loaded, so only
+              the body waits — the title no longer blinks in after a fetch.
+              No `prose` wrapper on the body: MarkdownContent styles every
+              element itself, and `prose-sm` would pin it back to 14px. */}
+          <Separator className="mt-6 mb-7" />
+          <div>
+            {loading ? (
+              <div className="flex items-center justify-center py-16">
+                <Spinner className="size-6 text-muted-foreground" />
+              </div>
+            ) : (
+              <div
+                className={cn(
+                  'text-sm leading-7',
+                  // MarkdownContent's own scale is tuned for chat bubbles, where
+                  // headings sit inside a short message. In a long reference doc
+                  // an h2 at 16px against 15px body text reads as bold text, not
+                  // as a section break — so the hierarchy and rhythm are opened
+                  // up here rather than in the shared component.
+                  '[&_.markdown-content>h1]:mt-10 [&_.markdown-content>h1]:mb-3 [&_.markdown-content>h1]:text-xl',
+                  '[&_.markdown-content>h2]:mt-9 [&_.markdown-content>h2]:mb-2.5 [&_.markdown-content>h2]:text-lg',
+                  '[&_.markdown-content>h3]:mt-7 [&_.markdown-content>h3]:mb-2 [&_.markdown-content>h3]:text-base',
+                  '[&_.markdown-content>*:first-child]:mt-0',
+                  '[&_.markdown-content>p]:mb-4 [&_.markdown-content>ul]:my-4 [&_.markdown-content>ol]:my-4',
+                  '[&_.markdown-content>pre]:my-5 [&_.markdown-content>pre]:p-4',
+                  '[&_.markdown-content>div]:my-5',
+                )}
+              >
+                <MarkdownContent
+                  content={stripLeadingTitle(content, entry.title)}
+                  agentNames={agentNames}
+                />
+              </div>
+            )}
+          </div>
+        </article>
+      </div>
+
+      <KnowledgeEditor
+        open={editorOpen}
+        entry={editingEntry}
+        onClose={() => { setEditorOpen(false); setEditingEntry(null); }}
+        onSaved={async () => {
+          setEditorOpen(false);
+          setEditingEntry(null);
+          await refreshKnowledge();
+        }}
+      />
+    </div>
+  );
+}

@@ -1,0 +1,15 @@
+{
+  "kinds": {
+    "agent_error": "智能体错误",
+    "agent_finished": "智能体已完成",
+    "agent_mention": "智能体提及",
+    "agent_waiting_input": "智能体等待输入",
+    "workspace_mention": "工作区 @提及",
+    "workspace_message": "工作区消息",
+    "workspace_error": "工作区错误",
+    "platform_error": "平台错误",
+    "github": "GitHub",
+    "update_available": "更新可用",
+    "system": "系统"
+  }
+}

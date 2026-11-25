@@ -1,0 +1,1003 @@
+'use strict';
+
+/**
+ * Codex adapter failure-surfacing tests.
+ *
+ * Covers the fix for the generic "No response generated. Please try again."
+ * reply: turn.failed / error event messages, stderr, and exit codes are now
+ * surfaced to the user (redacted), mirroring the OpenCode adapter. All
+ * fixtures are synthetic — no network, no CLI.
+ */
+
+const { describe, it, before, after } = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const CodexAdapter = require('../src/adapters/codex');
+
+// ---------------------------------------------------------------------------
+// live workspace model selection
+// ---------------------------------------------------------------------------
+
+describe('Codex — live workspace model selection', () => {
+  it('passes a custom Responses provider to the real CLI without exposing its key in arguments', async () => {
+    let invocation;
+    const fake = Object.assign(Object.create(CodexAdapter.prototype), {
+      agentEnv: {}, workspaceModel: null, _directModel: 'test-model',
+      _directApiKey: 'test-secret', _directBaseUrl: 'https://relay.example/v1',
+      _customProvider: { baseUrl: 'https://relay.example/v1', reasoningEffort: 'low' },
+      _codexBin: 'codex', _channelThreads: {}, workingDir: '',
+      _buildSystemContext: () => 'system context', _log: () => {},
+      _spawnCodex: async (cmd, env) => { invocation = { cmd, env }; return { responseText: 'ok', exitCode: 0 }; },
+      sendResponse: async () => {},
+    });
+    await fake._handleViaSubprocess('hello', 'general');
+    assert.ok(invocation.cmd.includes('model_providers.openagents.wire_api="responses"'));
+    assert.ok(invocation.cmd.includes('model_providers.openagents.base_url="https://relay.example/v1"'));
+    assert.ok(!invocation.cmd.join(' ').includes('test-secret'));
+    assert.equal(invocation.env.OPENAI_API_KEY, 'test-secret');
+  });
+
+  it('uses a model.set selection for the next codex exec invocation', async () => {
+    let invocation;
+    const fake = Object.assign(Object.create(CodexAdapter.prototype), {
+      agentEnv: { CODEX_MODEL: 'startup-model' },
+      workspaceModel: null,
+      _directModel: 'startup-model',
+      _directApiKey: '',
+      _directBaseUrl: '',
+      _codexBin: 'codex',
+      _channelThreads: {},
+      workingDir: '',
+      _buildSystemContext: () => 'system context',
+      _log: () => {},
+      _spawnCodex: async (cmd, env) => {
+        invocation = { cmd, env };
+        return { responseText: 'ok', exitCode: 0 };
+      },
+      sendResponse: async () => {},
+    });
+
+    await fake._onControlAction('model.set', { model: 'selected-model' });
+    await fake._handleViaSubprocess('hello', 'general');
+
+    assert.deepStrictEqual(
+      invocation.cmd.slice(invocation.cmd.indexOf('-m'), invocation.cmd.indexOf('-m') + 2),
+      ['-m', 'selected-model'],
+    );
+    assert.strictEqual(invocation.env.CODEX_MODEL, 'selected-model');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// _redact
+// ---------------------------------------------------------------------------
+
+describe('Codex — secret redaction', () => {
+  it('redacts OpenAI-style keys', () => {
+    const out = CodexAdapter._redact('Incorrect API key provided: sk-Mzax7abcdef123456');
+    assert.ok(!out.includes('sk-Mzax7'));
+    assert.ok(out.includes('sk-[REDACTED]'));
+  });
+
+  it('redacts bearer tokens', () => {
+    const out = CodexAdapter._redact('bearer abc123def456');
+    assert.ok(!out.includes('abc123def456'));
+  });
+
+  it('passes plain text through', () => {
+    assert.strictEqual(CodexAdapter._redact('model not found'), 'model not found');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// _failureDetail
+// ---------------------------------------------------------------------------
+
+describe('Codex — failure detail selection', () => {
+  // Field report: a custom endpoint with no Responses API failed every
+  // message as "Codex failed to complete this run".
+  it('says an endpoint without /v1/responses is the cause', () => {
+    const detail = CodexAdapter._failureDetail({
+      errorMessage: 'unexpected status 404 Not Found: 404 page not found, url: http://8.136.44.20:7863/v1/responses',
+      exitCode: 1,
+    }, { customProvider: { baseUrl: 'http://8.136.44.20:7863/v1' } });
+    assert.match(detail, /^unexpected status 404/);
+    assert.match(detail, /\(8\.136\.44\.20:7863\) has no Responses API/);
+    assert.match(detail, /Chat only · Chat Completions API/);
+  });
+
+  it('prefers the turn.failed / error event message', () => {
+    const detail = CodexAdapter._failureDetail({
+      errorMessage: 'Incorrect API key provided: sk-Mzax7abcdef123456',
+      stderr: 'some stderr noise',
+      exitCode: 1,
+    });
+    assert.ok(detail.startsWith('Incorrect API key provided'));
+    assert.ok(detail.includes('sk-[REDACTED]'));
+  });
+
+  it('falls back to the stderr tail', () => {
+    const stderr = Array.from({ length: 10 }, (_, i) => `line ${i}`).join('\n');
+    const detail = CodexAdapter._failureDetail({ errorMessage: '', stderr, exitCode: 1 });
+    assert.ok(detail.includes('line 9'));
+    assert.ok(!detail.includes('line 0'), 'only the tail should be kept');
+  });
+
+  it('quotes the headline of a Node exception from codex.js, not its stack', () => {
+    // Daily errors dashboard, 2026-11-25: a scoop Node install whose Codex
+    // lacked its native build read "> at file:///…/codex.js:113:20 at
+    // ModuleJob.run" on every message.
+    const stderr = [
+      'file:///C:/Users/Qa/scoop/persist/nodejs-lts/bin/node_modules/@openai/codex/bin/codex.js:108',
+      '  throw new Error(',
+      '        ^',
+      '',
+      'Error: Missing optional dependency @openai/codex-win32-x64. Reinstall Codex: npm install -g @openai/codex@latest',
+      '    at findCodexExecutable (file:///C:/Users/Qa/scoop/persist/nodejs-lts/bin/node_modules/@openai/codex/bin/codex.js:108:9)',
+      '    at file:///C:/Users/Qa/scoop/persist/nodejs-lts/bin/node_modules/@openai/codex/bin/codex.js:113:20',
+      '    at ModuleJob.run (node:internal/modules/esm/module_job:343:25)',
+      '    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:665:26)',
+      '    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:117:5)',
+      '',
+      'Node.js v22.20.0',
+    ].join('\n');
+    const detail = CodexAdapter._failureDetail({ errorMessage: '', stderr, exitCode: 1 });
+    assert.match(detail, /^Error: Missing optional dependency @openai\/codex-win32-x64\. Reinstall Codex/);
+    assert.ok(!/\bat ModuleJob/.test(detail), detail);
+  });
+
+  it('keeps the tail when "at …" lines are not a stack under an exception', () => {
+    const stderr = ['Error: model refused request', 'at most 3 tool calls are allowed per turn; reduce parallelism'].join('\n');
+    const detail = CodexAdapter._failureDetail({ errorMessage: '', stderr, exitCode: 1 });
+    assert.match(detail, /Error: model refused request\nat most 3 tool calls/);
+  });
+
+  it('drops tracing noise so the CLI\'s own sentence is what reaches the chat', () => {
+    const stderr = [
+      'Reading prompt from stdin...',
+      'Reading additional input from stdin...',
+      '2026-10-27T09:39:59.971283Z  WARN codex_skills::interface: ignoring interface.icon_small: icon path with \'..\' must stay inside the skill',
+      '2026-10-27T09:44:46.677023Z  WARN codex_core_plugins::manager: failed to refresh remote installed plugins cache',
+      "You've hit your usage limit. Upgrade to Pro or try again later.",
+      '2026-10-27T09:44:47.000000Z  WARN codex_core::session: shutting down',
+    ].join('\n');
+    const detail = CodexAdapter._failureDetail({ errorMessage: '', stderr, exitCode: 1 });
+    assert.strictEqual(detail, "You've hit your usage limit. Upgrade to Pro or try again later.");
+  });
+
+  it('falls back to ERROR records, stripped of timestamp and module, when the CLI printed nothing else', () => {
+    const stderr = [
+      'Reading prompt from stdin...',
+      '2026-10-27T04:08:56.500724Z ERROR codex_models_manager::manager: failed to refresh available models: request timed out',
+      '2026-10-27T04:08:56.600000Z  WARN codex_core::client: retrying',
+      '2026-10-27T04:08:57.500724Z ERROR codex_models_manager::manager: failed to refresh available models: request timed out',
+    ].join('\n');
+    const detail = CodexAdapter._failureDetail({ errorMessage: '', stderr, exitCode: 1 });
+    const [quoted, advice] = detail.split('\n\n');
+    assert.strictEqual(quoted, 'failed to refresh available models: request timed out');
+    // A request that timed out is a connection problem, so the network advice follows.
+    assert.match(advice, /network, proxy or firewall/);
+  });
+
+  it('keeps the raw tail when every line is a warning', () => {
+    const stderr = '2026-10-27T04:08:56.500724Z  WARN codex_core::x: only a warning';
+    const detail = CodexAdapter._failureDetail({ errorMessage: '', stderr, exitCode: 1 });
+    assert.ok(detail.includes('only a warning'));
+  });
+
+  it('never quotes the stdin banner as the reason', () => {
+    // Every failure in one channel read "> Reading prompt from stdin..." —
+    // the banner was the only stderr line, and the fallback quoted it.
+    const stderr = 'Reading prompt from stdin...\n';
+    assert.strictEqual(
+      CodexAdapter._failureDetail({ errorMessage: '', stderr, exitCode: 1 }),
+      'codex exited with code 1',
+    );
+    assert.strictEqual(CodexAdapter._failureDetail({ errorMessage: '', stderr, exitCode: 0 }), '');
+  });
+
+  it('names the signal when codex was killed', () => {
+    assert.strictEqual(
+      CodexAdapter._failureDetail({ errorMessage: '', stderr: 'Reading prompt from stdin...', exitCode: null, signal: 'SIGKILL' }),
+      'codex was terminated by SIGKILL',
+    );
+  });
+
+  it('falls back to the exit code', () => {
+    assert.strictEqual(
+      CodexAdapter._failureDetail({ errorMessage: '', stderr: '', exitCode: 2 }),
+      'codex exited with code 2',
+    );
+  });
+
+  it('is empty for a clean run with no diagnostics', () => {
+    assert.strictEqual(CodexAdapter._failureDetail({ exitCode: 0 }), '');
+    assert.strictEqual(CodexAdapter._failureDetail({}), '');
+  });
+
+  it('caps detail length', () => {
+    const detail = CodexAdapter._failureDetail({ errorMessage: 'x'.repeat(2000) });
+    assert.ok(detail.length <= 500);
+  });
+});
+
+/**
+ * Field report 2026-10-29: every failed Codex turn in one team's channels read
+ * "Codex failed to complete this run. > Reading prompt from stdin..." —
+ * codex's startup banner, quoted as the reason. Behind it were two timestamped
+ * log lines and, when the cut allowed, the real error.
+ */
+describe('Codex — what of stderr is quoted', () => {
+  const BANNER = 'Reading prompt from stdin...';
+  const REFRESH = '2026-10-29T00:41:21.779976Z ERROR codex_models_manager::manager: failed to refresh available models: '
+    + 'timeout waiting for child process to exit';
+  const WEBSOCKET = '2026-10-29T03:23:15.645472Z ERROR codex_api::endpoint::responses_websocket: failed to connect to '
+    + 'websocket: IO error: tls handshake eof, url: wss://chatgpt.com/backend-api/codex/responses';
+  const FINAL = 'Error: stream disconnected before completion: error sending request for url '
+    + '(https://chatgpt.com/backend-api/codex/responses)';
+
+  it('a banner alone is not a reason: a clean exit reads as "no reply"', async () => {
+    assert.strictEqual(CodexAdapter._failureDetail({ stderr: `${BANNER}\n`, exitCode: 0 }), '');
+    const sent = [];
+    await CodexAdapter.prototype._sendRunFailure.call(
+      { sendError: async (c, content) => { sent.push(content); } },
+      'chan', { stderr: `${BANNER}\n`, exitCode: 0 },
+    );
+    assert.match(sent[0], /without producing a reply/);
+    assert.ok(!sent[0].includes(BANNER));
+  });
+
+  it('a banner alone with a failed exit names the exit code', () => {
+    assert.strictEqual(
+      CodexAdapter._failureDetail({ stderr: `Reading additional input from stdin...\n`, exitCode: 1 }),
+      'codex exited with code 1',
+    );
+  });
+
+  it('quotes the error line whole, without the banner, timestamps or side notes', () => {
+    const detail = CodexAdapter._failureDetail({ stderr: [BANNER, REFRESH, WEBSOCKET, FINAL].join('\n'), exitCode: 1 });
+    assert.ok(!detail.includes(BANNER), detail);
+    assert.ok(!detail.includes('failed to refresh available models'), 'side note left out when more was said');
+    assert.ok(!/2026-10-29T/.test(detail), 'log timestamps stripped');
+    assert.ok(detail.includes(FINAL), 'the final error survives the cut whole');
+  });
+
+  it('keeps the END of a long stderr', () => {
+    const noise = Array.from({ length: 4 }, (_, i) => `ERROR something_else::module: ${'x'.repeat(200)} ${i}`);
+    const detail = CodexAdapter._failureDetail({ stderr: [BANNER, ...noise, FINAL].join('\n'), exitCode: 1 });
+    assert.ok(detail.includes(FINAL), detail);
+    assert.ok(detail.startsWith('…'), 'says it was cut');
+  });
+
+  it('leaves out the unknown-model metadata warning', () => {
+    const detail = CodexAdapter._failureDetail({
+      stderr: [BANNER, 'warning: Model metadata for `gpt-6-sol` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.'].join('\n'),
+      exitCode: 1,
+    });
+    assert.strictEqual(detail, 'codex exited with code 1');
+  });
+
+  it('says a lost connection is the network, after the quote and whatever its length', () => {
+    const noise = Array.from({ length: 4 }, (_, i) => `ERROR other::module: ${'y'.repeat(200)} ${i}`);
+    const detail = CodexAdapter._failureDetail({ stderr: [BANNER, ...noise, FINAL].join('\n'), exitCode: 1 });
+    assert.match(detail, /lost its connection to the model service/);
+    assert.match(detail, /network, proxy or firewall/);
+    assert.ok(detail.indexOf(FINAL) < detail.indexOf('lost its connection'));
+  });
+
+  it('gives no network advice when the service answered with a refusal', () => {
+    const detail = CodexAdapter._failureDetail({
+      stderr: 'ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized',
+      exitCode: 1,
+    });
+    assert.doesNotMatch(detail, /lost its connection/);
+    const quota = CodexAdapter._failureDetail({
+      errorMessage: "stream disconnected before completion: You've hit your usage limit.",
+    });
+    assert.doesNotMatch(quota, /lost its connection/);
+  });
+
+  it('a stream that dropped mid-run gets the same advice', () => {
+    const detail = CodexAdapter._failureDetail({
+      errorMessage: 'stream disconnected before completion: stream closed before response.completed',
+    });
+    assert.match(detail, /lost its connection/);
+  });
+
+  // codex warns of a timed-out model refresh on runs that then fail for
+  // another reason; that warning is not evidence of a lost connection.
+  const REFRESH_WARN = '2026-10-29T13:09:20.000000Z  WARN codex_models_manager::manager: failed to refresh available models: request timed out';
+
+  it('gives no network advice for a quota, with a timed-out refresh warning in stderr', () => {
+    const detail = CodexAdapter._failureDetail({
+      errorMessage: 'Quota exceeded. Check your plan and billing details.',
+      stderr: [BANNER, REFRESH_WARN].join('\n'),
+      exitCode: 1,
+    });
+    assert.strictEqual(detail, 'Quota exceeded. Check your plan and billing details.');
+  });
+
+  it('gives no network advice for a rejected model, with a timed-out refresh warning in stderr', () => {
+    const detail = CodexAdapter._failureDetail({
+      errorMessage: 'stream error: 400 Bad Request: model not supported',
+      stderr: [BANNER, REFRESH_WARN].join('\n'),
+      exitCode: 1,
+    });
+    assert.strictEqual(detail, 'stream error: 400 Bad Request: model not supported');
+  });
+
+  it('keeps the upgrade hint, not network advice, for a model that needs a newer Codex (#649)', () => {
+    const detail = CodexAdapter._failureDetail({
+      errorMessage: '{"detail":"The \'gpt-5.6-sol\' model requires a newer version of Codex."}',
+      stderr: [BANNER, REFRESH_WARN].join('\n'),
+      exitCode: 1,
+    });
+    assert.ok(detail.startsWith("The 'gpt-5.6-sol' model requires a newer version of Codex."), detail);
+    assert.match(detail, /Update the Codex CLI from OpenAgents Launcher/);
+    assert.doesNotMatch(detail, /lost its connection/);
+  });
+
+  it('says to pick another model when the ChatGPT plan does not include it', () => {
+    const detail = CodexAdapter._failureDetail({
+      errorMessage: '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The \'gpt-6.1-sol\' model is not supported when using Codex with a ChatGPT account."}}',
+      stderr: [BANNER, REFRESH_WARN].join('\n'),
+      exitCode: 1,
+    });
+    assert.ok(detail.startsWith("The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."), detail);
+    assert.match(detail, /Pick another model for this agent/);
+    assert.doesNotMatch(detail, /lost its connection/);
+  });
+
+  it('still names the network when stderr ends in a real connection error', () => {
+    const detail = CodexAdapter._failureDetail({
+      stderr: [
+        BANNER,
+        REFRESH_WARN,
+        '2026-10-29T13:09:30.000000Z ERROR codex_core::client: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)',
+      ].join('\n'),
+      exitCode: 1,
+    });
+    assert.match(detail, /stream disconnected before completion/);
+    assert.match(detail, /lost its connection to the model service/);
+  });
+});
+
+/**
+ * Field report 2026-11-08: one agent's channel read "Codex failed to complete
+ * this run. > failed to load skill …/impeccable/SKILL.md: invalid YAML" twice,
+ * and other channels quoted codex's ChatGPT connector ("worker quit with fatal:
+ * Transport channel closed …"). codex-cli 0.167 skips a skill it cannot parse
+ * and answers anyway: the line is logged on every run, failed or not.
+ */
+describe('Codex — log lines written beside a run are not its failure', () => {
+  // Verbatim from codex-cli 0.167.0 with a SKILL.md whose front matter has a line without a colon.
+  const SKILL = '2026-11-08T05:00:34.736481Z ERROR codex_core::session::session: failed to load skill '
+    + '/Users/u/.codex/skills/impeccable/SKILL.md: invalid YAML: could not find expected \':\' at line 4 column 1, '
+    + 'while scanning a simple key at line 3 column 1';
+  const RMCP = '2026-11-08T02:50:52.116025Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel '
+    + 'closed, when Client(HttpRequest(HttpRequest("error decoding response body")))';
+  const QUOTA = '2026-11-08T05:00:40.000000Z ERROR codex_core::session: turn error: You\'ve hit your usage limit.';
+
+  it('a clean exit with no reply says so, whatever stderr holds', async () => {
+    for (const stderr of [SKILL, RMCP, `${SKILL}\n${RMCP}`]) {
+      assert.strictEqual(CodexAdapter._failureDetail({ stderr, exitCode: 0 }), '');
+      const sent = [];
+      await CodexAdapter.prototype._sendRunFailure.call(
+        { sendError: async (c, content) => { sent.push(content); } },
+        'chan', { responseText: '', stderr, exitCode: 0, turnStarted: true },
+      );
+      assert.match(sent[0], /finished without producing a reply/);
+      assert.doesNotMatch(sent[0], /failed to load skill|Transport channel closed/);
+    }
+  });
+
+  it('a clean exit still quotes codex\'s own error event', () => {
+    const detail = CodexAdapter._failureDetail({ errorMessage: 'Reconnecting... 5/5 (request timed out)', stderr: SKILL, exitCode: 0 });
+    assert.match(detail, /Reconnecting/);
+  });
+
+  it('a failed run quotes the real error, not the skill or connector line before it', () => {
+    const detail = CodexAdapter._failureDetail({ stderr: [SKILL, RMCP, QUOTA].join('\n'), exitCode: 1 });
+    assert.match(detail, /usage limit/);
+    assert.doesNotMatch(detail, /failed to load skill|Transport channel closed/);
+  });
+
+  it('quotes them only when codex logged nothing else', () => {
+    const detail = CodexAdapter._failureDetail({ stderr: SKILL, exitCode: 1 });
+    assert.match(detail, /failed to load skill/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// _sendRunFailure
+// ---------------------------------------------------------------------------
+
+describe('Codex — user-visible failure message', () => {
+  async function capture(result) {
+    const sent = [];
+    const fake = { sendError: async (channel, content) => { sent.push({ channel, content }); } };
+    await CodexAdapter.prototype._sendRunFailure.call(fake, 'chan', result);
+    return sent[0];
+  }
+
+  it('includes the failure reason as a quoted detail', async () => {
+    const msg = await capture({ errorMessage: 'stream error: 401 Unauthorized', exitCode: 1 });
+    assert.ok(msg.content.includes("Codex couldn't run"));
+    assert.ok(msg.content.includes('> stream error: 401 Unauthorized'));
+  });
+
+  it('falls back to a retry message when there is nothing to report', async () => {
+    const msg = await capture({ exitCode: 0 });
+    assert.ok(msg.content.includes("Codex couldn't run"));
+    assert.ok(msg.content.includes('without producing a reply'));
+    assert.ok(!msg.content.includes('>'), 'no empty quote block');
+  });
+});
+
+// What codex-cli 0.167.0 emits when its Responses endpoint refuses a field
+// it sends on every turn, verbatim from a run against a relay that does.
+// Reported 2026-11-07: the channel only ever read "Unsupported Responses
+// request parameter." — no field, nothing to do about it.
+const PARAM_REFUSED_TURN = '{"error":{"message":"Unsupported Responses request parameter.","type":"invalid_request_error","param":"client_metadata","code":"unsupported_parameter"}}';
+
+describe('Codex — a Responses endpoint that refuses a field Codex sends', () => {
+  const relay = { baseUrl: 'https://relay.example.com/v1', reasoningEffort: null };
+
+  it('names the field the endpoint refused', () => {
+    assert.strictEqual(CodexAdapter._unwrap(PARAM_REFUSED_TURN),
+      'Unsupported Responses request parameter. (parameter: client_metadata)');
+    // Not twice when the message already says it.
+    assert.strictEqual(
+      CodexAdapter._unwrap('{"error":{"message":"Unknown parameter: client_metadata","param":"client_metadata"}}'),
+      'Unknown parameter: client_metadata');
+  });
+
+  it('says every run there will fail, and what to change, on a custom provider', () => {
+    const detail = CodexAdapter._failureDetail({ errorMessage: PARAM_REFUSED_TURN, stderr: '', exitCode: 1 }, { customProvider: relay });
+    const [quoted, advice] = detail.split('\n\n');
+    assert.strictEqual(quoted, 'Unsupported Responses request parameter. (parameter: client_metadata)');
+    assert.match(advice, /\(relay\.example\.com\) takes Responses API requests but refuses the "client_metadata" field/);
+    assert.match(advice, /every run here will fail the same way/);
+    assert.match(advice, /Agent capabilities to "Chat only · Chat Completions API"/);
+    assert.doesNotMatch(detail, /lost its connection/);
+  });
+
+  it('reaches the channel through the adapter\'s own provider', async () => {
+    const sent = [];
+    const fake = { _customProvider: relay, sendError: async (_c, content) => { sent.push(content); } };
+    await CodexAdapter.prototype._sendRunFailure.call(fake, 'chan', { errorMessage: PARAM_REFUSED_TURN, exitCode: 1, turnFailed: true });
+    assert.match(sent[0], /Codex couldn't run/);
+    assert.match(sent[0], /> Unsupported Responses request parameter\. \(parameter: client_metadata\)/);
+    assert.match(sent[0], /Chat only · Chat Completions API/);
+  });
+
+  it('gives no such advice on OpenAI itself, or for a refusal that is not about a field', () => {
+    const native = CodexAdapter._failureDetail({ errorMessage: PARAM_REFUSED_TURN, exitCode: 1 });
+    assert.strictEqual(native, 'Unsupported Responses request parameter. (parameter: client_metadata)');
+    const model = CodexAdapter._failureDetail(
+      { errorMessage: '{"error":{"message":"The model `gpt-9` does not exist","param":"model"}}', exitCode: 1 },
+      { customProvider: relay });
+    assert.doesNotMatch(model, /Agent capabilities/);
+  });
+
+  it('leaves a setting the chosen model does not support to the model, not the endpoint', () => {
+    const detail = CodexAdapter._failureDetail(
+      { errorMessage: '{"error":{"message":"Unsupported parameter: \'reasoning.effort\' is not supported with this model.","param":"reasoning.effort","code":"unsupported_parameter"}}', exitCode: 1 },
+      { customProvider: relay });
+    assert.doesNotMatch(detail, /every run here will fail|Agent capabilities/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a run that spoke, then died
+// ---------------------------------------------------------------------------
+
+/**
+ * Field report (2026-10, Windows): every Codex turn posted one opening line
+ * ("I'll check the install script first…") as its finished reply and stopped.
+ * The run had failed after that line, but any text at all was treated as
+ * success, so the error only reached daemon.log.
+ */
+describe('Codex — partial run that then failed', () => {
+  function fakeAdapter(result) {
+    const sent = [];
+    const fake = Object.assign(Object.create(CodexAdapter.prototype), {
+      agentEnv: {},
+      workspaceModel: null,
+      _directModel: '',
+      _directApiKey: '',
+      _directBaseUrl: '',
+      _codexBin: 'codex',
+      _channelThreads: {},
+      workingDir: '',
+      _buildSystemContext: () => 'system context',
+      _log: () => {},
+      _spawnCodex: async () => result,
+      sendResponse: async (channel, content, options) => { sent.push({ kind: 'response', content, options }); },
+      sendError: async (channel, content) => { sent.push({ kind: 'error', content }); },
+    });
+    return { fake, sent };
+  }
+
+  it('posts the text and then why the run stopped', async () => {
+    const { fake, sent } = fakeAdapter({
+      responseText: "I'll check the install script first.",
+      exitCode: 1,
+      turnFailed: true,
+      errorMessage: 'stream disconnected before completion',
+    });
+    await fake._handleViaSubprocess('fix it', 'general');
+    assert.deepStrictEqual(sent.map((m) => m.kind), ['response', 'error']);
+    assert.equal(sent[0].options.statusKind, 'error');
+    assert.ok(sent[1].content.includes('stopped partway'));
+    assert.ok(sent[1].content.includes('> stream disconnected before completion'));
+  });
+
+  it('treats a non-zero exit with no turn.failed as stopped too', async () => {
+    const { fake, sent } = fakeAdapter({ responseText: 'Looking…', exitCode: 1, stderr: 'boom' });
+    await fake._handleViaSubprocess('fix it', 'general');
+    assert.deepStrictEqual(sent.map((m) => m.kind), ['response', 'error']);
+  });
+
+  it('looks the binary up again when the cached path has gone (ENOENT)', async () => {
+    const { fake, sent } = fakeAdapter({ responseText: 'Done.', exitCode: 0 });
+    const spawned = [];
+    fake._codexBin = '/old/runtimes/codex/node_modules/.bin/codex';
+    fake._findCodexBinary = () => '/new/bin/codex';
+    fake._spawnCodex = async (cmd) => {
+      spawned.push(cmd[0]);
+      if (cmd[0].startsWith('/old/')) throw Object.assign(new Error(`spawn ${cmd[0]} ENOENT`), { code: 'ENOENT' });
+      return { responseText: 'Done.', exitCode: 0 };
+    };
+    await fake._handleViaSubprocess('fix it', 'general');
+    assert.deepStrictEqual(spawned, ['/old/runtimes/codex/node_modules/.bin/codex', '/new/bin/codex']);
+    assert.deepStrictEqual(sent.map((m) => m.kind), ['response']);
+  });
+
+  it('says the CLI is gone when no binary can be found any more', async () => {
+    const { fake, sent } = fakeAdapter({});
+    fake._findCodexBinary = () => null;
+    fake._spawnCodex = async () => { throw Object.assign(new Error('spawn codex ENOENT'), { code: 'ENOENT' }); };
+    await fake._handleViaSubprocess('fix it', 'general');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].content.includes('no longer installed'));
+  });
+
+  it('stays quiet when the run reconnected and completed', async () => {
+    // codex emits `error` events for retries it recovers from.
+    const { fake, sent } = fakeAdapter({
+      responseText: 'Done.',
+      exitCode: 0,
+      errorMessage: 'Reconnecting... 2/5',
+    });
+    await fake._handleViaSubprocess('fix it', 'general');
+    assert.deepStrictEqual(sent.map((m) => m.kind), ['response']);
+    assert.equal(sent[0].options.statusKind, 'completed');
+  });
+});
+
+/**
+ * #649: a run died with the API's raw envelope —
+ * {"detail":"The 'gpt-5.6-sol' model requires a newer version of Codex..."} —
+ * posted into workspace chat braces and all, with no hint about what to do.
+ */
+describe('CodexAdapter._failureDetail — backend rejections', () => {
+  it('unwraps the JSON envelope and names the remedy', () => {
+    const out = CodexAdapter._failureDetail({
+      errorMessage: JSON.stringify({
+        detail: "The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.",
+      }),
+    });
+    assert.ok(!out.includes('{'), 'no JSON braces reach the user');
+    assert.ok(out.includes("requires a newer version of Codex"), 'keeps the backend sentence');
+    assert.ok(/Agents → Codex → Update/.test(out), 'says where the update button is');
+    assert.ok(/@openai\/codex@latest/.test(out), 'gives the CLI escape hatch');
+  });
+
+  it('unwraps the nested { error: { message } } shape', () => {
+    const out = CodexAdapter._failureDetail({
+      errorMessage: JSON.stringify({ error: { message: 'rate limit exceeded' } }),
+    });
+    assert.equal(out, 'rate limit exceeded');
+  });
+
+  it('leaves an unrelated failure exactly as it was', () => {
+    assert.equal(
+      CodexAdapter._failureDetail({ errorMessage: 'connection reset by peer' }),
+      'connection reset by peer',
+    );
+    assert.equal(CodexAdapter._failureDetail({ exitCode: 2 }), 'codex exited with code 2');
+  });
+
+  it('still redacts secrets after unwrapping', () => {
+    const out = CodexAdapter._failureDetail({
+      errorMessage: JSON.stringify({ detail: 'bad key sk-abcdef123456789' }),
+    });
+    assert.ok(!out.includes('sk-abcdef123456789'));
+  });
+});
+
+/**
+ * Field test 2026-10-29: with the device's way to OpenAI cut, the channel sat
+ * on "thinking" and the hint above never showed. Reproduced against
+ * codex-cli 0.160 behind a dead proxy: it retries in silence (21s when the
+ * connection is refused, over four minutes when packets are dropped), then
+ * fails with only "workspace routing discovery failed" — the connection
+ * errors are in stderr. These fixtures are that run's own output.
+ */
+describe('Codex — a device that cannot reach the model service', () => {
+  const REFUSED_STDERR = [
+    '2026-10-29T13:09:22.594334Z ERROR codex_models_manager::manager: failed to refresh available models: Connection failed: error sending request',
+    '2026-10-29T13:09:25.989624Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Client(HttpRequest(HttpRequest("http/request failed: error sending request for url (https://chatgpt.com/backend-api/ps/mcp)")))',
+  ].join('\n');
+  const DROPPED_STDERR = '2026-10-29T13:09:24.317400Z ERROR codex_models_manager::manager: failed to refresh available models: request timed out';
+
+  it('names the network when the run fails with only "workspace routing discovery failed"', () => {
+    const detail = CodexAdapter._failureDetail({ errorMessage: 'workspace routing discovery failed', stderr: REFUSED_STDERR, exitCode: 1 });
+    assert.ok(detail.startsWith('workspace routing discovery failed'), detail);
+    assert.match(detail, /lost its connection to the model service/);
+  });
+
+  it('and when it timed out instead', () => {
+    const detail = CodexAdapter._failureDetail({ errorMessage: 'workspace routing discovery timed out', stderr: DROPPED_STDERR, exitCode: 1 });
+    assert.match(detail, /lost its connection to the model service/);
+  });
+
+  it('does not let a sign-in note from codex\'s own MCP connector rule it out', () => {
+    const stderr = `${REFUSED_STDERR}\n2026-10-29T13:09:30Z ERROR rmcp::transport::worker: worker quit with fatal: AuthRequired 401 Unauthorized`;
+    const detail = CodexAdapter._failureDetail({ errorMessage: 'workspace routing discovery failed', stderr, exitCode: 1 });
+    assert.match(detail, /lost its connection/);
+  });
+
+  it('reads a retry as a status, and anything else as nothing', () => {
+    assert.equal(
+      CodexAdapter._reconnectStatus('Reconnecting... 2/5 (workspace routing discovery failed)'),
+      'Codex is having trouble reaching the model service and is retrying (workspace routing discovery failed)…',
+    );
+    assert.equal(
+      CodexAdapter._reconnectStatus('Reconnecting... 3/5'),
+      'Codex is having trouble reaching the model service and is retrying…',
+    );
+    assert.equal(CodexAdapter._reconnectStatus('workspace routing discovery failed'), '');
+    assert.equal(CodexAdapter._reconnectStatus(''), '');
+    assert.ok(!CodexAdapter._reconnectStatus('Reconnecting... 1/5 (bad key sk-abcdef1234567890xyz)').includes('sk-abcdef1234567890xyz'));
+  });
+
+  describe('end to end, through a CLI that replays that run', () => {
+    const IS_WINDOWS = process.platform === 'win32';
+    let root;
+    let bin;
+    let runsLog;
+    before(() => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), 'oa-codex-offline-'));
+      const events = [
+        { type: 'thread.started', thread_id: 't-1' },
+        { type: 'turn.started' },
+        ...[2, 3, 4, 5].map((n) => ({ type: 'error', message: `Reconnecting... ${n}/5 (workspace routing discovery failed)` })),
+        { type: 'item.completed', item: { id: 'item_0', type: 'error', message: 'Falling back from WebSockets to HTTPS transport. workspace routing discovery failed' } },
+        ...[1, 2, 3, 4, 5].map((n) => ({ type: 'error', message: `Reconnecting... ${n}/5 (workspace routing discovery failed)` })),
+        { type: 'error', message: 'workspace routing discovery failed' },
+        { type: 'turn.failed', error: { message: 'workspace routing discovery failed' } },
+      ];
+      const entry = path.join(root, 'fake-codex.js');
+      runsLog = path.join(root, 'runs.log');
+      fs.writeFileSync(entry, [
+        `require('fs').appendFileSync(${JSON.stringify(runsLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+        "process.stdin.resume();",
+        "process.stdin.on('end', () => {",
+        `  process.stderr.write(${JSON.stringify(`Reading prompt from stdin...\n${REFUSED_STDERR}\n`)});`,
+        `  for (const e of ${JSON.stringify(events)}) process.stdout.write(JSON.stringify(e) + '\\n');`,
+        "  process.exitCode = 1;",
+        "});",
+      ].join('\n'));
+      if (IS_WINDOWS) {
+        bin = path.join(root, 'codex.cmd');
+        fs.writeFileSync(bin, '@ECHO off\r\n"%_prog%"  "%dp0%\\fake-codex.js" %*\r\n');
+      } else {
+        fs.chmodSync(entry, 0o755);
+        fs.writeFileSync(path.join(root, 'codex'), `#!/bin/sh\nexec "${process.execPath}" "${entry}" "$@"\n`);
+        fs.chmodSync(path.join(root, 'codex'), 0o755);
+        bin = path.join(root, 'codex');
+      }
+    });
+    after(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+    const runs = () => (fs.existsSync(runsLog) ? fs.readFileSync(runsLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
+
+    it('says once that it is retrying, then fails with the network named', async () => {
+      fs.rmSync(runsLog, { force: true });
+      const posted = [];
+      const adapter = Object.assign(Object.create(CodexAdapter.prototype), {
+        agentEnv: { ...process.env }, workspaceModel: null, _directModel: '', _directApiKey: '', _directBaseUrl: '',
+        _codexBin: bin, _channelThreads: {}, _channelProcesses: {}, workingDir: root,
+        _buildSystemContext: () => 'system context', _log: () => {}, _saveSessions: () => {},
+        _stoppedBeforeStart: () => false, _stopRequestedDuringTurn: () => false,
+        sendThinking: async () => {},
+        sendStatus: async (ch, m) => { posted.push({ kind: 'status', m }); },
+        sendResponse: async (ch, m) => { posted.push({ kind: 'response', m }); },
+        sendError: async (ch, m) => { posted.push({ kind: 'error', m }); },
+      });
+      await adapter._handleViaSubprocess('hi', 'general');
+      assert.deepEqual(posted.map((p) => p.kind), ['status', 'error'], JSON.stringify(posted));
+      assert.match(posted[0].m, /retrying \(workspace routing discovery failed\)/);
+      assert.match(posted[1].m, /> workspace routing discovery failed/);
+      assert.match(posted[1].m, /network, proxy or firewall/);
+      assert.ok(!posted[1].m.includes('Reading prompt from stdin'));
+    });
+
+    // The field test that found this: the status showed twice and the
+    // failure took seven minutes, because the failed resumed run was taken
+    // for a stale thread, the thread dropped and the whole run repeated.
+    it('runs once on a resumed thread, and keeps the thread', async () => {
+      fs.rmSync(runsLog, { force: true });
+      const posted = [];
+      let saved = 0;
+      const adapter = Object.assign(Object.create(CodexAdapter.prototype), {
+        agentEnv: { ...process.env }, workspaceModel: null, _directModel: '', _directApiKey: '', _directBaseUrl: '',
+        _codexBin: bin, _channelThreads: { general: 't-1' }, _channelProcesses: {}, workingDir: root,
+        _buildSystemContext: () => 'system context', _log: () => {}, _saveSessions: () => { saved++; },
+        _stoppedBeforeStart: () => false, _stopRequestedDuringTurn: () => false,
+        sendThinking: async () => {},
+        sendStatus: async (ch, m) => { posted.push({ kind: 'status', m }); },
+        sendResponse: async (ch, m) => { posted.push({ kind: 'response', m }); },
+        sendError: async (ch, m) => { posted.push({ kind: 'error', m }); },
+      });
+      await adapter._handleViaSubprocess('hi', 'general');
+      assert.equal(runs().length, 1, JSON.stringify(runs()));
+      assert.deepEqual(runs()[0].slice(-2), ['resume', 't-1']);
+      assert.deepEqual(posted.map((p) => p.kind), ['status', 'error'], JSON.stringify(posted));
+      assert.equal(adapter._channelThreads.general, 't-1');
+    });
+  });
+});
+
+describe('Codex — what counts as a stale thread', () => {
+  function fakeAdapter(results) {
+    const calls = [];
+    const sent = [];
+    const fake = Object.assign(Object.create(CodexAdapter.prototype), {
+      agentEnv: {}, workspaceModel: null, _directModel: '', _directApiKey: '', _directBaseUrl: '',
+      _codexBin: 'codex', _channelThreads: { general: 'old-thread' }, workingDir: '',
+      _buildSystemContext: () => 'system context', _log: () => {}, _saveSessions: () => {},
+      _spawnCodex: async (cmd) => { calls.push(cmd); return results[calls.length - 1]; },
+      sendStatus: async (ch, m) => { sent.push({ kind: 'status', m }); },
+      sendResponse: async (ch, m) => { sent.push({ kind: 'response', m }); },
+      sendError: async (ch, m) => { sent.push({ kind: 'error', m }); },
+    });
+    return { fake, calls, sent };
+  }
+
+  // Field report (core 0.2.226): one channel failed every message with this,
+  // because codex resends the whole thread and one item in it is over the limit.
+  it('a thread the API refuses as too large is dropped, said so, and the turn run fresh', async () => {
+    const { fake, calls, sent } = fakeAdapter([
+      { exitCode: 1, responseText: '', turnStarted: true, turnFailed: true,
+        errorMessage: "[ArrayParam] [input[77].content] [array_above_max_length] Invalid 'input[77].content': array too long. Expected an array with maximum length 128" },
+      { exitCode: 0, responseText: 'fresh answer', turnStarted: true },
+    ]);
+    await fake._handleViaSubprocess('hi', 'general');
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0].includes('resume'));
+    assert.ok(!calls[1].includes('resume'));
+    assert.deepEqual(sent.map((s) => s.kind), ['status', 'response'], JSON.stringify(sent));
+    assert.match(sent[0].m, /continues in a new one/);
+    assert.equal(sent[1].m, 'fresh answer');
+  });
+
+  it('a new thread that is still too large is reported, not run a third time', async () => {
+    const tooLarge = { exitCode: 1, responseText: '', turnStarted: true, turnFailed: true,
+      errorMessage: "Invalid 'input[3].content': array too long [array_above_max_length]" };
+    const { fake, calls, sent } = fakeAdapter([tooLarge, tooLarge]);
+    await fake._handleViaSubprocess('hi', 'general');
+    assert.equal(calls.length, 2);
+    assert.equal(sent[sent.length - 1].kind, 'error');
+    assert.match(sent[sent.length - 1].m, /array_above_max_length/);
+  });
+
+  it('only the run error or the stderr reason counts as a too-large thread', () => {
+    assert.equal(CodexAdapter._threadTooLarge({ errorMessage: 'context_length_exceeded: input too long' }), true);
+    assert.equal(CodexAdapter._threadTooLarge({ stderr: 'Error: array_above_max_length' }), true);
+    assert.equal(CodexAdapter._threadTooLarge({ errorMessage: 'usage limit', stderr: 'Error: array_above_max_length' }), false);
+    assert.equal(CodexAdapter._threadTooLarge({}), false);
+  });
+
+  // Daily errors dashboard, 2026-11-17: two agents failed every message for
+  // hours after their user signed Codex in to another ChatGPT account.
+  it('a thread whose encrypted content this account cannot verify is dropped, said so, and run fresh', async () => {
+    const { fake, calls, sent } = fakeAdapter([
+      { exitCode: 1, responseText: '', turnStarted: true, turnFailed: true,
+        errorMessage: 'Error running remote compact task: {"type":"error","error":{"message":"The encrypted content for item '
+          + 'rs_0c2f9e1d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f could not be verified. Reason: Encrypted content item_id did not '
+          + 'match the target item id.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}' },
+      { exitCode: 0, responseText: 'fresh answer', turnStarted: true },
+    ]);
+    await fake._handleViaSubprocess('hi', 'general');
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0].includes('resume'));
+    assert.ok(!calls[1].includes('resume'));
+    assert.deepEqual(sent.map((s) => s.kind), ['status', 'response'], JSON.stringify(sent));
+    assert.match(sent[0].m, /different account/);
+    assert.equal(sent[1].m, 'fresh answer');
+  });
+
+  it('a new thread that still fails verification is reported, not run a third time', async () => {
+    const unverifiable = { exitCode: 1, responseText: '', turnStarted: true, turnFailed: true,
+      errorMessage: 'The encrypted content for item rs_1 could not be verified.' };
+    const { fake, calls, sent } = fakeAdapter([unverifiable, unverifiable]);
+    await fake._handleViaSubprocess('hi', 'general');
+    assert.equal(calls.length, 2);
+    assert.equal(sent[sent.length - 1].kind, 'error');
+    assert.match(sent[sent.length - 1].m, /could not be verified/);
+  });
+
+  it('a reply cut short by unverifiable content is posted, and the next message starts a new thread', async () => {
+    const { fake, calls, sent } = fakeAdapter([
+      { exitCode: 1, responseText: 'Looking at the skill list', turnStarted: true, turnFailed: true,
+        errorMessage: 'Error running remote compact task: {"error":{"code":"invalid_encrypted_content"}}' },
+    ]);
+    await fake._handleViaSubprocess('hi', 'general');
+    assert.equal(calls.length, 1);
+    assert.equal(fake._channelThreads.general, undefined);
+    assert.equal(sent[0].kind, 'response');
+    assert.match(sent[sent.length - 1].m, /continues in a new one/);
+  });
+
+  it('only the run error or the stderr reason counts as unverifiable content', () => {
+    assert.equal(CodexAdapter._threadUnverifiable({ errorMessage: 'code: invalid_encrypted_content' }), true);
+    assert.equal(CodexAdapter._threadUnverifiable({ stderr: 'Error: The encrypted content for item rs_9 could not be decrypted' }), true);
+    assert.equal(CodexAdapter._threadUnverifiable({ errorMessage: 'usage limit', stderr: 'Error: invalid_encrypted_content' }), false);
+    assert.equal(CodexAdapter._threadUnverifiable({ errorMessage: 'stream disconnected before completion' }), false);
+    assert.equal(CodexAdapter._threadUnverifiable({}), false);
+  });
+
+  it('a thread codex cannot find is dropped and the turn run fresh', async () => {
+    const { fake, calls, sent } = fakeAdapter([
+      { exitCode: 1, responseText: '', turnStarted: false,
+        stderr: 'Error: thread/resume: thread/resume failed: no rollout found for thread id old-thread (code -32600)' },
+      { exitCode: 0, responseText: 'fresh answer', turnStarted: true },
+    ]);
+    await fake._handleViaSubprocess('hi', 'general');
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0].includes('resume'));
+    assert.ok(!calls[1].includes('resume'));
+    assert.equal(fake._channelThreads.general, undefined);
+    assert.deepEqual(sent, [{ kind: 'response', m: 'fresh answer' }]);
+  });
+
+  it('a resumed turn that failed keeps its thread and is not run again', async () => {
+    const { fake, calls, sent } = fakeAdapter([
+      { exitCode: 1, responseText: '', turnStarted: true, turnFailed: true,
+        errorMessage: 'workspace routing discovery failed', stderr: 'ERROR codex_models_manager::manager: failed to refresh available models: Connection failed: error sending request' },
+    ]);
+    await fake._handleViaSubprocess('hi', 'general');
+    assert.equal(calls.length, 1);
+    assert.equal(fake._channelThreads.general, 'old-thread');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].kind, 'error');
+    assert.match(sent[0].m, /lost its connection/);
+  });
+});
+
+/**
+ * Field report 2026-11-17 (daily errors dashboard): two agents acknowledged
+ * each other in a channel, codex ended each turn with nothing to add, and one
+ * agent posted "Codex couldn't run — Codex finished without producing a
+ * reply" 14 times in two minutes.
+ */
+describe('Codex — a turn another agent started may end without a reply', () => {
+  const fakeAdapter = (result) => {
+    const errors = [];
+    const statuses = [];
+    const fake = Object.assign(Object.create(CodexAdapter.prototype), {
+      agentEnv: {}, workspaceModel: null, _directModel: 'gpt-test',
+      _directApiKey: '', _directBaseUrl: '', _codexBin: 'codex',
+      _channelThreads: {}, workingDir: '',
+      _buildSystemContext: () => 'system context', _log: () => {},
+      _spawnCodex: async () => result,
+      sendError: async (c, content) => { errors.push(content); },
+      sendStatus: async (c, content) => { statuses.push(content); },
+      sendResponse: async () => { throw new Error('no reply expected'); },
+    });
+    return { fake, errors, statuses };
+  };
+  const QUIET = { responseText: '', stderr: '', exitCode: 0, turnStarted: true };
+
+  it('posts a status, not an error, when codex finished cleanly', async () => {
+    const { fake, errors, statuses } = fakeAdapter(QUIET);
+    await fake._handleViaSubprocess('Noted, thanks.', 'general', [], { fromAgent: true });
+    assert.deepStrictEqual(errors, []);
+    assert.deepStrictEqual(statuses, ['Nothing to add, so no reply was posted.']);
+  });
+
+  it('a turn that ran commands or edited files and said nothing still gets the error', async () => {
+    // Review of PR #1112: another agent asked for a task, codex did work and
+    // wrote no reply; a status alone left whoever asked waiting.
+    const { fake, errors, statuses } = fakeAdapter({ ...QUIET, ranTools: true });
+    await fake._handleViaSubprocess('Please run the migration', 'general', [], { fromAgent: true });
+    assert.strictEqual(errors.length, 1);
+    assert.match(errors[0], /finished without producing a reply/);
+    assert.deepStrictEqual(statuses, []);
+  });
+
+  it('a person\'s message still gets the error', async () => {
+    const { fake, errors } = fakeAdapter(QUIET);
+    await fake._handleViaSubprocess('hello', 'general');
+    assert.strictEqual(errors.length, 1);
+    assert.match(errors[0], /finished without producing a reply/);
+  });
+
+  it('a run that failed is reported whoever sent the message', async () => {
+    for (const result of [
+      { ...QUIET, errorMessage: 'stream disconnected before completion' },
+      { ...QUIET, turnFailed: true, errorMessage: 'turn failed' },
+      { ...QUIET, exitCode: 1 },
+      { ...QUIET, exitCode: null, signal: 'SIGTERM' },
+    ]) {
+      const { fake, errors } = fakeAdapter(result);
+      await fake._handleViaSubprocess('Noted, thanks.', 'general', [], { fromAgent: true });
+      assert.strictEqual(errors.length, 1, JSON.stringify(result));
+      assert.doesNotMatch(errors[0], /finished without producing a reply/);
+    }
+  });
+
+  it('_handleMessage marks another agent\'s message, but not a workflow step handed on', async () => {
+    const seen = [];
+    const fake = Object.assign(Object.create(CodexAdapter.prototype), {
+      channelName: 'general', _useCliMode: true, _log: () => {},
+      _autoTitleChannel: async () => {}, sendStatus: async () => {},
+      _handleViaSubprocess: async (content, channel, atts, opts) => { seen.push(opts.fromAgent); },
+    });
+    await fake._handleMessage({ content: 'noted', senderType: 'agent' });
+    await fake._handleMessage({ content: 'next step', senderType: 'agent', metadata: { orchestration: { action: 'next' } } });
+    await fake._handleMessage({ content: 'hi', senderType: 'human' });
+    assert.deepStrictEqual(seen, [true, false, false]);
+  });
+});
+
+/**
+ * Field report 2026-11-17: an agent pointed at a DeepSeek-compatible endpoint
+ * with no model set failed every message with "The supported API model names
+ * are deepseek-flash, deepseek-v4-pro, but you passed gpt-6.1-sol": Codex had
+ * sent its own default.
+ */
+describe('Codex — an endpoint that serves other models', () => {
+  const REFUSAL = 'The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed gpt-6.1-sol. (request_id: 5f3a55aa)';
+
+  it('names the default Codex sent when no model is set, and the models the endpoint serves', () => {
+    const detail = CodexAdapter._failureDetail({ errorMessage: REFUSAL, exitCode: 1 }, { modelChosen: false });
+    assert.ok(detail.startsWith(REFUSAL), detail);
+    assert.match(detail, /This endpoint serves deepseek-flash, deepseek-v4-pro\./);
+    assert.match(detail, /No model is set for this agent, so Codex sent its own default \(gpt-6\.1-sol\)\./);
+    assert.match(detail, /Pick one of those models/);
+  });
+
+  it('does not blame a missing model when one was chosen', () => {
+    const detail = CodexAdapter._failureDetail({ errorMessage: REFUSAL, exitCode: 1 });
+    assert.match(detail, /This endpoint serves deepseek-flash, deepseek-v4-pro\. Pick one/);
+    assert.doesNotMatch(detail, /No model is set/);
+  });
+
+  it('the channel is told which case it is', async () => {
+    const sent = [];
+    const ctx = Object.assign(Object.create(CodexAdapter.prototype), {
+      workspaceModel: null, _directModel: '', _planFallbackModel: null, _customProvider: null,
+      sendError: async (c, content) => { sent.push(content); },
+    });
+    await ctx._sendRunFailure('chan', { errorMessage: REFUSAL, exitCode: 1 });
+    assert.match(sent[0], /Codex couldn't run/);
+    assert.match(sent[0], /sent its own default \(gpt-6\.1-sol\)/);
+  });
+});
+
+describe('Codex — an endpoint with a long list of models', () => {
+  it('still explains when the list pushes the passed model past the quoted cap', () => {
+    const names = Array.from({ length: 60 }, (_, i) => `vendor-model-${i}`).join(', ');
+    const errorMessage = `The supported API model names are ${names}, but you passed gpt-6.1-sol.`;
+    const detail = CodexAdapter._failureDetail({ errorMessage, exitCode: 1 }, { modelChosen: false });
+    assert.match(detail, /sent its own default \(gpt-6\.1-sol\)/);
+    assert.match(detail, /This endpoint serves vendor-model-0, .*…\./);
+  });
+});

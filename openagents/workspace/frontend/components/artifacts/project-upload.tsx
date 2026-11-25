@@ -1,0 +1,57 @@
+'use client';
+import { useId, useRef, useState } from 'react';
+import { FolderUp, X } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
+import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import { Field, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { workspaceApi } from '@/lib/api';
+import { useWorkspace } from '@/lib/workspace-context';
+import { encodeProjectFiles, projectFiles } from '@/lib/web-projects';
+import { openArtifactPreview } from '@/lib/thread-artifacts';
+import { useT } from '@/lib/i18n';
+
+export function ProjectUpload({ projectId, revision, onPublished }: {projectId?: string; revision?: string; onPublished?: () => void}) {
+  const t = useT();
+  const {currentSessionId, refreshFiles} = useWorkspace();
+  const input = useRef<HTMLInputElement>(null);
+  const id = useId();
+  const [files,setFiles] = useState<ReturnType<typeof projectFiles>>([]);
+  const [title,setTitle] = useState(''); const [entry,setEntry] = useState('index.html');
+  const [busy,setBusy] = useState(false);
+  const publish = async () => {
+    setBusy(true);
+    try {
+      const encoded = await encodeProjectFiles(files);
+      const channel = currentSessionId && !currentSessionId.startsWith('dm:') ? currentSessionId : undefined;
+      const result = await workspaceApi.publishWebProject({title,entrypoint:entry,files:encoded,channel_name:channel,visibility:channel?'inherit':'private',expected_revision:revision},projectId);
+      await refreshFiles(); setFiles([]); onPublished?.(); openArtifactPreview({kind:'file',id:result.id});
+      toast.success(t('webProject.published'));
+    } catch(error) { toast.error(error instanceof Error ? error.message : t('artifactPanel.failed')); }
+    finally {setBusy(false);}
+  };
+  return <div>
+    <input ref={input} type="file" multiple {...{'webkitdirectory':''}} className="hidden" aria-label={t('webProject.choose')} onChange={event=>{
+      const selected=projectFiles(Array.from(event.target.files || [])); setFiles(selected);
+      setTitle(event.target.files?.[0]?.webkitRelativePath.split('/')[0] || 'Web project');
+      setEntry(selected.find(f=>f.path==='index.html')?.path || selected.find(f=>/\.html?$/i.test(f.path))?.path || '');
+      event.target.value='';
+    }} />
+    {!files.length ? <Button size="sm" variant="outline" onClick={()=>input.current?.click()}><FolderUp className="size-4" />{t(projectId?'webProject.update':'webProject.upload')}</Button> : <div className="flex flex-col gap-3 rounded-lg border bg-muted/20 p-3">
+      <div className="flex items-center justify-between"><strong className="text-sm">{t(projectId?'webProject.update':'webProject.upload')}</strong><Button size="icon-sm" variant="ghost" disabled={busy} aria-label={t('artifactPanel.close')} onClick={()=>setFiles([])}><X className="size-4" /></Button></div>
+      <Field className="gap-1"><FieldLabel htmlFor={`${id}-name`} className="text-xs">{t('webProject.name')}</FieldLabel><Input id={`${id}-name`} value={title} maxLength={120} disabled={busy} onChange={e=>setTitle(e.target.value)} /></Field>
+      <Field className="gap-1"><FieldLabel htmlFor={`${id}-entry`} className="text-xs">{t('webProject.entry')}</FieldLabel>
+        <Select value={entry || undefined} disabled={busy} onValueChange={setEntry}>
+          <SelectTrigger id={`${id}-entry`} className="w-full"><SelectValue /></SelectTrigger>
+          <SelectContent>{files.filter(f=>/\.html?$/i.test(f.path)).map(f=><SelectItem key={f.path} value={f.path}>{f.path}</SelectItem>)}</SelectContent>
+        </Select>
+      </Field>
+      <p className="text-xs leading-5 text-muted-foreground">{files.length} {t('webProject.files')} · {t(projectId?'webProject.keepsSharing':currentSessionId&&!currentSessionId.startsWith('dm:')?'webProject.threadSharing':'webProject.private')}</p>
+      <p className="text-xs leading-5 text-muted-foreground">{t('webProject.help')}</p>
+      {!entry && <p role="alert" className="text-xs text-destructive">{t('webProject.noHtml')}</p>}
+      <Button size="sm" disabled={busy || !entry || !title.trim()} onClick={()=>void publish()}>{busy&&<Spinner />}{t('webProject.publish')}</Button>
+    </div>}
+  </div>;
+}

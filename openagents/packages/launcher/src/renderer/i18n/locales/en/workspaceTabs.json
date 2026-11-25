@@ -1,0 +1,6 @@
+{
+  "label": "Open workspaces",
+  "close": "Close {{name}}",
+  "more_one": "{{count}} more open workspace",
+  "more_other": "{{count}} more open workspaces"
+}

@@ -1,0 +1,246 @@
+'use strict';
+
+const { describe, it, beforeEach, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { EnvManager, AUTH_MODE_KEY, CLI_LOGIN, credentialKeys, stripForCliLogin, typeEnvFor } = require('../src/env');
+
+let tmpDir;
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-env-'));
+});
+
+afterEach(() => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe('EnvManager', () => {
+  it('load returns empty object for missing file', () => {
+    const env = new EnvManager(tmpDir);
+    assert.deepEqual(env.load('nonexistent'), {});
+  });
+
+  it('save and load round-trip', () => {
+    const env = new EnvManager(tmpDir);
+    env.save('openclaw', { LLM_API_KEY: 'sk-test', LLM_BASE_URL: 'https://api.openai.com/v1' });
+    const loaded = env.load('openclaw');
+    assert.equal(loaded.LLM_API_KEY, 'sk-test');
+    assert.equal(loaded.LLM_BASE_URL, 'https://api.openai.com/v1');
+  });
+
+  it('save merges with existing values', () => {
+    const env = new EnvManager(tmpDir);
+    env.save('test', { A: '1', B: '2' });
+    env.save('test', { B: '3', C: '4' });
+    const loaded = env.load('test');
+    assert.equal(loaded.A, '1');
+    assert.equal(loaded.B, '3');
+    assert.equal(loaded.C, '4');
+  });
+
+  it('delete removes env file', () => {
+    const env = new EnvManager(tmpDir);
+    env.save('todel', { X: '1' });
+    env.delete('todel');
+    assert.deepEqual(env.load('todel'), {});
+  });
+
+  it('resolve applies rules', () => {
+    const env = new EnvManager(tmpDir);
+    const saved = { LLM_API_KEY: 'sk-abc', LLM_BASE_URL: 'https://api.openai.com/v1', LLM_MODEL: 'gpt-4o' };
+    const mockRegistry = {
+      getResolveRules: () => [
+        { from: 'LLM_API_KEY', to: 'OPENAI_API_KEY', unless_base_url_contains: 'anthropic' },
+        { from: 'LLM_API_KEY', to: 'ANTHROPIC_API_KEY', if_base_url_contains: 'anthropic' },
+        { from: 'LLM_BASE_URL', to: 'OPENAI_BASE_URL' },
+        { from: 'LLM_MODEL', to: 'OPENCLAW_MODEL' },
+      ],
+    };
+    const resolved = env.resolve('openclaw', saved, mockRegistry);
+    assert.equal(resolved.OPENAI_API_KEY, 'sk-abc');
+    assert.equal(resolved.ANTHROPIC_API_KEY, undefined);
+    assert.equal(resolved.OPENAI_BASE_URL, 'https://api.openai.com/v1');
+    assert.equal(resolved.OPENCLAW_MODEL, 'gpt-4o');
+  });
+
+  it('resolve applies anthropic conditional rule', () => {
+    const env = new EnvManager(tmpDir);
+    const saved = { LLM_API_KEY: 'sk-ant', LLM_BASE_URL: 'https://api.anthropic.com/v1' };
+    const mockRegistry = {
+      getResolveRules: () => [
+        { from: 'LLM_API_KEY', to: 'OPENAI_API_KEY', unless_base_url_contains: 'anthropic' },
+        { from: 'LLM_API_KEY', to: 'ANTHROPIC_API_KEY', if_base_url_contains: 'anthropic' },
+      ],
+    };
+    const resolved = env.resolve('openclaw', saved, mockRegistry);
+    assert.equal(resolved.OPENAI_API_KEY, undefined);
+    assert.equal(resolved.ANTHROPIC_API_KEY, 'sk-ant');
+  });
+
+  it('getEffective combines saved and resolved', () => {
+    const env = new EnvManager(tmpDir);
+    env.save('openclaw', { LLM_API_KEY: 'sk-test', LLM_BASE_URL: 'https://api.openai.com/v1' });
+    const mockRegistry = {
+      getResolveRules: () => [
+        { from: 'LLM_API_KEY', to: 'OPENAI_API_KEY' },
+      ],
+    };
+    const effective = env.getEffective('openclaw', mockRegistry);
+    assert.equal(effective.LLM_API_KEY, 'sk-test');
+    assert.equal(effective.OPENAI_API_KEY, 'sk-test');
+  });
+
+  // Anthropic's SDK owns the /v1 path segment: a base URL saved WITH it makes
+  // the claude CLI call …/v1/v1/messages (404, mis-reported as a bad model).
+  // The resolution layer must strip it no matter which path wrote the env.
+  it('strips a trailing /v1 when resolving to ANTHROPIC_BASE_URL', () => {
+    const env = new EnvManager(tmpDir);
+    const saved = { LLM_API_KEY: 'sk-r', LLM_BASE_URL: 'https://yinli.one/v1' };
+    const mockRegistry = {
+      getResolveRules: () => [
+        { from: 'LLM_BASE_URL', to: 'ANTHROPIC_BASE_URL' },
+      ],
+    };
+    const resolved = env.resolve('claude', saved, mockRegistry);
+    assert.equal(resolved.ANTHROPIC_BASE_URL, 'https://yinli.one');
+  });
+
+  it('normalizes a directly-saved ANTHROPIC_BASE_URL in getEffective', () => {
+    const env = new EnvManager(tmpDir);
+    env.save('claude', { ANTHROPIC_BASE_URL: 'https://relay.example/v1/' });
+    const effective = env.getEffective('claude', { getResolveRules: () => [] });
+    assert.equal(effective.ANTHROPIC_BASE_URL, 'https://relay.example');
+  });
+
+  it('leaves OpenAI-style base URLs (which legitimately carry /v1) untouched', () => {
+    const env = new EnvManager(tmpDir);
+    const saved = { LLM_BASE_URL: 'https://api.openai.com/v1' };
+    const mockRegistry = {
+      getResolveRules: () => [
+        { from: 'LLM_BASE_URL', to: 'OPENAI_BASE_URL' },
+      ],
+    };
+    const resolved = env.resolve('codex', saved, mockRegistry);
+    assert.equal(resolved.OPENAI_BASE_URL, 'https://api.openai.com/v1');
+  });
+});
+
+describe('stripForCliLogin', () => {
+  const { Registry } = require('../src/registry');
+  const registry = new Registry(fs.mkdtempSync(path.join(os.tmpdir(), 'ac-reg-')));
+  const keyed = {
+    OPENAI_API_KEY: 'sk-old',
+    OPENAI_BASE_URL: 'https://relay.example/v1',
+    LLM_API_KEY: 'sk-llm',
+    LLM_BASE_URL: 'https://relay.example/v1',
+    CODEX_MODEL: 'gpt-5.5',
+    PATH: '/usr/bin',
+  };
+
+  const signedIn = { [AUTH_MODE_KEY]: CLI_LOGIN };
+
+  it('leaves an agent that runs on a key alone', () => {
+    assert.deepEqual(stripForCliLogin('codex', keyed, registry, {}), keyed);
+  });
+
+  it('reads the marker from the agent itself, not an inherited type or process env', () => {
+    const inherited = { ...keyed, [AUTH_MODE_KEY]: CLI_LOGIN };
+    assert.equal(stripForCliLogin('codex', inherited, registry, { OPENAI_API_KEY: 'sk-old' }).OPENAI_API_KEY, 'sk-old');
+  });
+
+  it('drops every codex key and endpoint once the agent signs in, keeping the model', () => {
+    // CODEX_API_KEY is the CLI's own name for a key; it is not a registry
+    // field, but the CLI prefers it over its sign-in all the same.
+    const env = stripForCliLogin('codex', { ...keyed, CODEX_API_KEY: 'sk-codex', ...signedIn }, registry, signedIn);
+    for (const key of ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY', 'LLM_API_KEY', 'LLM_BASE_URL']) {
+      assert.equal(env[key], undefined, key);
+    }
+    assert.equal(env.CODEX_MODEL, 'gpt-5.5');
+    assert.equal(env.PATH, '/usr/bin');
+  });
+
+  it('covers claude, whose keys are only known through resolve_env', () => {
+    const keys = credentialKeys('claude', registry);
+    for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']) {
+      assert.ok(keys.has(key), key);
+    }
+    assert.ok(!keys.has('ANTHROPIC_MODEL'));
+    // The setup-token OAuth token is the sign-in itself.
+    assert.ok(!keys.has('CLAUDE_CODE_OAUTH_TOKEN'));
+  });
+
+  it('covers gemini, whose keys are only known through its readiness check', () => {
+    const env = stripForCliLogin('gemini',
+      { GEMINI_API_KEY: 'g-old', GOOGLE_API_KEY: 'g-old', GEMINI_MODEL: 'gemini-3-pro', ...signedIn }, registry, signedIn);
+    assert.equal(env.GEMINI_API_KEY, undefined);
+    assert.equal(env.GOOGLE_API_KEY, undefined);
+    assert.equal(env.GEMINI_MODEL, 'gemini-3-pro');
+  });
+
+  it('keeps readiness variables that are not keys', () => {
+    assert.ok(!credentialKeys('copilot', registry).has('GH_TOKEN'));
+  });
+});
+
+describe('typeEnvFor', () => {
+  const { Registry } = require('../src/registry');
+  const registry = new Registry(fs.mkdtempSync(path.join(os.tmpdir(), 'ac-reg-')));
+  const typeEnv = { LLM_API_KEY: 'k', LLM_MODEL: 'relay-model', ANTHROPIC_MODEL: 'relay-model', CLAUDE_CODE_MAX_TURNS: '10' };
+
+  it('gives an agent on a key the whole type env', () => {
+    assert.deepEqual(typeEnvFor('claude', typeEnv, registry, {}), typeEnv);
+  });
+
+  it('gives a signed-in agent neither the type key nor the model picked with it', () => {
+    const env = typeEnvFor('claude', typeEnv, registry, { [AUTH_MODE_KEY]: CLI_LOGIN });
+    assert.deepEqual(env, { CLAUDE_CODE_MAX_TURNS: '10' });
+  });
+
+  it('gives an agent with its own key neither the type key, endpoint nor model', () => {
+    const env = typeEnvFor('claude', { ...typeEnv, LLM_BASE_URL: 'https://relay.example/v1' }, registry, {
+      ANTHROPIC_API_KEY: 'own',
+    });
+    assert.deepEqual(env, { CLAUDE_CODE_MAX_TURNS: '10' });
+  });
+
+  it('an endpoint alone is not a key of its own', () => {
+    assert.deepEqual(typeEnvFor('claude', typeEnv, registry, { ANTHROPIC_BASE_URL: 'https://relay.example' }), typeEnv);
+  });
+});
+
+describe('EnvManager.getForAgent', () => {
+  const { Registry } = require('../src/registry');
+  const registry = new Registry(fs.mkdtempSync(path.join(os.tmpdir(), 'ac-reg-')));
+
+  it('runs a Pi agent on its own provider, not a relay left in pi.env', () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-env-'));
+    const mgr = new EnvManager(configDir);
+    mgr.save('pi', {
+      LLM_API_KEY: 'relay-key',
+      LLM_BASE_URL: 'https://relay.example/v1',
+      LLM_MODEL: 'gpt-5.6-terra',
+    });
+    const env = mgr.getForAgent('pi', registry, {
+      PI_PROVIDER: 'deepseek',
+      PI_API_KEY: 'deepseek-key',
+      PI_MODEL: 'deepseek-flash',
+    });
+    assert.equal(env.PI_API_KEY, 'deepseek-key');
+    assert.equal(env.PI_MODEL, 'deepseek-flash');
+    assert.equal(env.PI_BASE_URL, undefined);
+    assert.equal(env.LLM_BASE_URL, undefined);
+  });
+
+  it('still runs an agent without a key of its own on the type env', () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-env-'));
+    const mgr = new EnvManager(configDir);
+    mgr.save('pi', { LLM_API_KEY: 'relay-key', LLM_BASE_URL: 'https://relay.example/v1', LLM_MODEL: 'm' });
+    const env = mgr.getForAgent('pi', registry, {});
+    assert.equal(env.PI_API_KEY, 'relay-key');
+    assert.equal(env.PI_BASE_URL, 'https://relay.example/v1');
+    assert.equal(env.PI_MODEL, 'm');
+  });
+});

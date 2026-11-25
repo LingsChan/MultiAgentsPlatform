@@ -1,0 +1,43 @@
+'use client';
+import { useEffect, useState } from 'react';
+import { FolderTree } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Spinner } from '@/components/ui/spinner';
+import { workspaceApi } from '@/lib/api';
+import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
+import { useT } from '@/lib/i18n';
+import type { ProjectPreview as Preview } from '@/lib/web-projects';
+import { ProjectUpload } from './project-upload';
+
+export function ProjectPreview({id, revision=0, showDetails=true}: {id: string; revision?: number; showDetails?: boolean}) {
+  const t = useT(); const {idToken} = useOpenAgentsAuth();
+  const [data,setData] = useState<Preview|null>(null); const [failed,setFailed] = useState(false);
+  const [version,setVersion] = useState(0); const [tree,setTree] = useState(false);
+  useEffect(()=>{
+    let active=true; setData(null); setFailed(false);
+    void workspaceApi.previewWebProject(id).then(result=>{if(active)setData(result);}).catch(()=>{if(active)setFailed(true);});
+    const refresh=setTimeout(()=>setVersion(v=>v+1),55*60*1000);
+    return ()=>{active=false;clearTimeout(refresh);};
+  },[id,revision,version,idToken]);
+  useEffect(()=>{
+    if(!data) return;
+    let active=true;
+    const poll=setInterval(()=>{
+      if(document.visibilityState==='hidden') return;
+      void workspaceApi.getWebProjectRevision(id).then(latest=>{
+        if(active && latest.revision!==data.revision) setVersion(v=>v+1);
+      }).catch(()=>{if(active){setData(null);setFailed(true);}});
+    },15000);
+    return ()=>{active=false;clearInterval(poll);};
+  },[id,data]);
+  if(failed) return <p role="alert" className="p-5 text-sm text-muted-foreground">{t('artifactPanel.unavailable')}</p>;
+  if(!data) return <div className="flex h-full items-center justify-center"><Spinner className="size-5" /></div>;
+  return <div className="flex h-full min-h-0 flex-col">
+    {showDetails && <div className="shrink-0 flex flex-col gap-2 border-b p-3">
+      <Button variant="ghost" size="xs" className="self-start font-normal text-muted-foreground" onClick={()=>setTree(!tree)} aria-expanded={tree}><FolderTree data-icon="inline-start" />{data.entrypoint} · {data.files.length} {t('webProject.files')}</Button>
+      {tree && <ul className="max-h-36 overflow-auto rounded bg-muted/30 p-2 font-mono text-xs">{data.files.map(path=><li key={path} className="py-0.5">{path}</li>)}</ul>}
+      {data.can_update&&<ProjectUpload projectId={id} revision={data.revision} onPublished={()=>setVersion(v=>v+1)} />}
+    </div>}
+    <iframe key={data.preview_path} title={t('webProject.preview')} src={data.preview_path} sandbox="allow-scripts" referrerPolicy="no-referrer" className="min-h-0 w-full flex-1 border-0 bg-white" />
+  </div>;
+}

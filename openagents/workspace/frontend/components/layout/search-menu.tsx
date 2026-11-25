@@ -1,0 +1,162 @@
+'use client';
+import { isRoutineSession } from '@/lib/conversation-list';
+
+import { useEffect, useState } from 'react';
+import { MessageSquare, Search } from 'lucide-react';
+import {
+  Command,
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandShortcut,
+} from '@/components/ui/command';
+import { AgentAvatar } from '@/components/agents/agent-avatar';
+import { getFileIcon } from '@/components/files/file-utils';
+import { agentLabel, isRecentAgent } from '@/lib/helpers';
+import { useWorkspace } from '@/lib/workspace-context';
+import { useT } from '@/lib/i18n';
+import { useModKey } from '@/hooks/use-mod-key';
+import { Kbd } from '@/components/ui/kbd';
+import { SidebarMenuButton, SidebarMenuItem } from '@/components/ui/sidebar';
+import { useLayout } from './layout-context';
+
+/** ⌘K palette over threads, files and agents. Its trigger is an ordinary
+ * sidebar nav item (icon, "Search", ⌘K hint), not an input look-alike: it opens
+ * the palette rather than taking typing in place. Icon-only on the collapsed
+ * rail, where the tooltip carries the label. */
+export function SearchMenu({ iconOnly = false }: { iconOnly?: boolean } = {}) {
+  const [open, setOpen] = useState(false);
+  const { sessions, files, agents, setCurrentSessionId, setSelectedFileId } = useWorkspace();
+  const { openView, setSelectedAgentName, openMobileDetail } = useLayout();
+  const t = useT();
+  const mod = useModKey();
+  const shortcut = `${mod}${mod === '⌘' ? '' : '+'}K`;
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'k' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        setOpen((prev) => !prev);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  const threads = sessions.filter((s) => !isRoutineSession(s));
+  const recentAgents = agents.filter(isRecentAgent);
+
+  const run = (fn: () => void) => {
+    fn();
+    setOpen(false);
+  };
+
+  return (
+    <>
+      <SidebarMenuItem>
+        <SidebarMenuButton
+          onClick={() => setOpen(true)}
+          aria-label={t('search.trigger', { shortcut })}
+          tooltip={{ children: t('search.trigger', { shortcut }), hidden: !iconOnly }}
+          className={iconOnly ? 'justify-center!' : undefined}
+        >
+          <Search />
+          {!iconOnly && (
+            <>
+              <span className="truncate">{t('search.label')}</span>
+              <Kbd className="ml-auto">{shortcut}</Kbd>
+            </>
+          )}
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+
+      <CommandDialog
+        open={open}
+        onOpenChange={setOpen}
+        title={t('search.dialogTitle')}
+        description={t('search.dialogDescription')}
+      >
+        {/* CommandDialog only renders the dialog shell — cmdk still needs its own root */}
+        <Command>
+          <CommandInput placeholder={t('search.placeholder')} />
+          <CommandList>
+            <CommandEmpty>{t('search.empty')}</CommandEmpty>
+
+            {threads.length > 0 && (
+              <CommandGroup heading={t('search.groupThreads')}>
+                {threads.map((session) => (
+                  <CommandItem
+                    key={session.sessionId}
+                    value={`thread ${session.title} ${session.sessionId}`}
+                    onSelect={() =>
+                      run(() => {
+                        openView('threads');
+                        setCurrentSessionId(session.sessionId);
+                        openMobileDetail();
+                      })
+                    }
+                  >
+                    <MessageSquare />
+                    <span className="truncate">{session.title || t('search.untitledThread')}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
+
+            {files.length > 0 && (
+              <CommandGroup heading={t('search.groupFiles')}>
+                {files.map((file) => (
+                  <CommandItem
+                    key={file.id}
+                    value={`file ${file.filename}`}
+                    onSelect={() =>
+                      run(() => {
+                        openView('files');
+                        setSelectedFileId(file.id);
+                        openMobileDetail();
+                      })
+                    }
+                  >
+                    {getFileIcon(file.contentType, file.filename)}
+                    <span className="truncate">{file.filename}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
+
+            {recentAgents.length > 0 && (
+              <CommandGroup heading={t('search.groupAgents')}>
+                {recentAgents.map((agent) => (
+                  <CommandItem
+                    key={agent.agentName}
+                    value={`agent ${agent.agentName} ${agentLabel(agent)}`}
+                    onSelect={() => run(() => setSelectedAgentName(agent.agentName))}
+                  >
+                    <AgentAvatar
+                      name={agent.agentName}
+                      size={20}
+                      status={agent.status}
+                      className="[&_svg]:size-full!"
+                    />
+                    <span className="truncate">{agentLabel(agent)}</span>
+                    {/* CommandShortcut, not a bare `ml-auto` span: CommandItem
+                        always renders a trailing check icon that also carries
+                        `ml-auto`, and two auto margins split the free space
+                        between them — which parked the status mid-row. The
+                        `data-slot` on CommandShortcut hides that check. */}
+                    <CommandShortcut className="tracking-normal">
+                      {agent.status === 'online' ? t('agentStatus.online') : t('agentStatus.offline')}
+                    </CommandShortcut>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
+          </CommandList>
+        </Command>
+      </CommandDialog>
+    </>
+  );
+}

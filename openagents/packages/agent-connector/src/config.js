@@ -1,0 +1,644 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+// Windows refuses to replace or open a file another process holds open (the
+// daemon and its `agn` children read daemon.yaml all the time). Such a refusal
+// passes in milliseconds, so both sides wait a little and try again.
+const BUSY_CODES = ['EPERM', 'EACCES', 'EBUSY'];
+const BUSY_WAITS_MS = [10, 25, 50, 100, 200];
+
+function pause(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {}
+}
+
+/**
+ * Manages ~/.openagents/daemon.yaml — the agent/network configuration file.
+ * Compatible with the Python SDK's daemon_config.py format.
+ */
+class Config {
+  constructor(configDir) {
+    this.configDir = configDir;
+    this.configFile = path.join(configDir, 'daemon.yaml');
+    this.statusFile = path.join(configDir, 'daemon.status.json');
+    this.pidFile = path.join(configDir, 'daemon.pid');
+    this.cmdFile = path.join(configDir, 'daemon.cmd');
+    this.logFile = path.join(configDir, 'daemon.log');
+  }
+
+  // -- Read --
+
+  /**
+   * The config as it is on disk. A read that hits the file while it is held
+   * (Windows) or while a writer that could not replace it is rewriting it in
+   * place (empty for that moment) is tried again: read as "no agents", it made
+   * a probe started right after a save report "No agent named '<name>' on
+   * this device", and that result stood for an hour.
+   */
+  load() {
+    for (let attempt = 0; ; attempt++) {
+      const last = attempt >= BUSY_WAITS_MS.length;
+      try {
+        if (!fs.existsSync(this.configFile)) break;
+        const text = fs.readFileSync(this.configFile, 'utf-8');
+        // An empty file is tried again only briefly: a writer's in-place
+        // rewrite is over within that, and a file that really is empty must
+        // not slow down every read.
+        if (text.trim() || last || attempt >= 2) return parseYaml(text);
+      } catch (err) {
+        if (last || !BUSY_CODES.includes(err.code)) {
+          console.error('Failed to load config:', err.message);
+          break;
+        }
+      }
+      pause(BUSY_WAITS_MS[attempt]);
+    }
+    return { version: 2, agents: [], networks: [] };
+  }
+
+  getAgents() {
+    return this.load().agents || [];
+  }
+
+  getNetworks() {
+    return this.load().networks || [];
+  }
+
+  getAgent(name) {
+    return this.getAgents().find((a) => a.name === name) || null;
+  }
+
+  // -- Write --
+
+  /**
+   * Replace the file in one step. A plain writeFileSync truncates first, and
+   * the daemon and its `agn` children read this file all the time: a probe
+   * started right after a create read it empty and reported the new agent as
+   * "Unknown agent type '<name>'", and a read-modify-write in that window
+   * saves the empty list back. Windows can refuse the rename while a reader
+   * holds the file open, so that case retries for a moment (the hold is a
+   * read, gone in milliseconds) and only then writes in place.
+   */
+  save(config) {
+    fs.mkdirSync(this.configDir, { recursive: true });
+    const text = serializeYaml(config);
+    const tmp = `${this.configFile}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, text, 'utf-8');
+    for (let attempt = 0; attempt <= BUSY_WAITS_MS.length; attempt++) {
+      if (attempt > 0) pause(BUSY_WAITS_MS[attempt - 1]);
+      try {
+        fs.renameSync(tmp, this.configFile);
+        return;
+      } catch (err) {
+        if (!BUSY_CODES.includes(err.code)) {
+          try { fs.unlinkSync(tmp); } catch {}
+          throw err;
+        }
+      }
+    }
+    try { fs.unlinkSync(tmp); } catch {}
+    fs.writeFileSync(this.configFile, text, 'utf-8');
+  }
+
+  addAgent({ name, type, role, path: agentPath, env }) {
+    const config = this.load();
+    if (config.agents.some((a) => a.name === name)) {
+      throw new Error(`Agent '${name}' already exists`);
+    }
+    const entry = { name, type: type || 'openclaw', role: role || 'worker' };
+    if (agentPath) entry.path = agentPath;
+    if (env && Object.keys(env).length > 0) entry.env = env;
+    config.agents.push(entry);
+    this.save(config);
+    return entry;
+  }
+
+  removeAgent(name) {
+    const config = this.load();
+    const idx = config.agents.findIndex((a) => a.name === name);
+    if (idx === -1) return false;
+    config.agents.splice(idx, 1);
+    this.save(config);
+    return true;
+  }
+
+  updateAgent(name, updates) {
+    const config = this.load();
+    const agent = config.agents.find((a) => a.name === name);
+    if (!agent) throw new Error(`Agent '${name}' not found`);
+    Object.assign(agent, updates);
+    this.save(config);
+    return agent;
+  }
+
+  updateAgentEnv(name, env) {
+    const config = this.load();
+    const agent = config.agents.find((a) => a.name === name);
+    if (!agent) throw new Error(`Agent '${name}' not found`);
+
+    const merged = { ...(agent.env || {}), ...(env || {}) };
+    const cleaned = {};
+    for (const [key, value] of Object.entries(merged)) {
+      if (value !== null && value !== undefined && value !== '') cleaned[key] = value;
+    }
+
+    if (Object.keys(cleaned).length > 0) {
+      agent.env = cleaned;
+    } else {
+      delete agent.env;
+    }
+
+    this.save(config);
+    return agent.env || {};
+  }
+
+  setAgentNetwork(agentName, networkSlug) {
+    const config = this.load();
+    const agent = config.agents.find((a) => a.name === agentName);
+    if (!agent) throw new Error(`Agent '${agentName}' not found`);
+    if (networkSlug) {
+      agent.network = networkSlug;
+    } else {
+      delete agent.network;
+      delete agent.node_id;
+    }
+    this.save(config);
+  }
+
+  addNetwork({ id, slug, name, endpoint, token }) {
+    const config = this.load();
+    // Upsert, not insert-only: re-registering a known workspace refreshes its
+    // credentials. The old early-return silently kept a stale token after a
+    // rotation or re-pair — both the launcher and the CLI then had to carry
+    // their own read-modify-write patches around it.
+    const existing = config.networks.find((n) => n.slug === slug || n.id === id);
+    if (existing) {
+      if (id) existing.id = id;
+      if (slug) existing.slug = slug;
+      if (name) existing.name = name;
+      if (endpoint) existing.endpoint = endpoint;
+      if (token) existing.token = token;
+      this.save(config);
+      return existing;
+    }
+    const entry = { id, slug };
+    if (name) entry.name = name;
+    if (endpoint) entry.endpoint = endpoint;
+    if (token) entry.token = token;
+    config.networks.push(entry);
+    this.save(config);
+    return entry;
+  }
+
+  removeNetwork(slug) {
+    const config = this.load();
+    const idx = config.networks.findIndex((n) => n.slug === slug || n.id === slug);
+    if (idx === -1) return false;
+    config.networks.splice(idx, 1);
+    // Disconnect any agents that were on this network
+    for (const agent of config.agents) {
+      if (agent.network === slug) delete agent.network;
+    }
+    this.save(config);
+    return true;
+  }
+
+  // -- Status / PID --
+
+  getStatus() {
+    try {
+      if (fs.existsSync(this.statusFile)) {
+        const data = JSON.parse(fs.readFileSync(this.statusFile, 'utf-8'));
+        return data.agents || {};
+      }
+    } catch {}
+    return {};
+  }
+
+  getDaemonPid() {
+    try {
+      if (!fs.existsSync(this.pidFile)) return null;
+      const pid = parseInt(fs.readFileSync(this.pidFile, 'utf-8').trim(), 10);
+      return isNaN(pid) ? null : pid;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Queue a line for the daemon, which reads and deletes the file every 200ms.
+   * Appended, not overwritten: two commands landing inside one poll (a Start
+   * clicked in the launcher and a heartbeat nudge from a workspace page) both
+   * have to arrive.
+   */
+  writeCommand(cmd) {
+    fs.appendFileSync(this.cmdFile, cmd + '\n', 'utf-8');
+  }
+
+  getLogs(agentName, lines = 200) {
+    try {
+      return this.tailLogs({ agent: agentName, lines }).lines;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Tail log file with optional filter. Returns { lines, size, reset }.
+   * Reads only the end of the file (or what was appended since `offset`), so
+   * the cost tracks what is returned rather than how large daemon.log grew.
+   * @param {Object} opts - { agent, lines, offset }
+   * @param {string} [opts.agent] - Filter by agent name
+   * @param {number} [opts.lines=100] - Number of lines to return
+   * @param {number} [opts.offset=0] - Byte offset for incremental reads (0 = from end)
+   * @returns {{ lines: string[], size: number, reset: boolean }} `size` is the
+   *   offset for the next call; `reset` means the file shrank (cleared or
+   *   replaced) and `lines` replace what the caller had.
+   */
+  tailLogs(opts = {}) {
+    const { agent, lines = 100, offset = 0 } = opts;
+    const keep = agent
+      ? (l) => l.includes(agent) || l.includes('daemon') || l.includes('Daemon')
+      : () => true;
+    let size;
+    try {
+      size = fs.statSync(this.logFile).size;
+    } catch {
+      return { lines: [], size: 0, reset: offset > 0 };
+    }
+    // Nothing appended since the last read.
+    if (offset > 0 && offset === size) return { lines: [], size, reset: false };
+
+    try {
+      const fd = fs.openSync(this.logFile, 'r');
+      try {
+        if (offset > 0 && offset < size) {
+          const start = Math.max(offset, size - MAX_INCREMENT_BYTES);
+          const buf = readRange(fd, start, size);
+          const lastNewline = buf.lastIndexOf(0x0a);
+          // A line still being written is left for the next read.
+          if (lastNewline < 0) {
+            return { lines: [], size: start > offset ? size : offset, reset: false };
+          }
+          let body = buf.subarray(0, lastNewline + 1);
+          // Skipped part of the backlog: drop the fragment the read landed in.
+          if (start > offset) body = body.subarray(body.indexOf(0x0a) + 1);
+          return { lines: splitLines(body, keep), size: start + lastNewline + 1, reset: false };
+        }
+        // First read, or the file shrank under us (cleared, replaced).
+        const tail = readLastLines(fd, size, lines, keep);
+        return { lines: tail.lines, size: tail.end, reset: offset > 0 };
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return { lines: [], size: 0, reset: offset > 0 };
+    }
+  }
+
+  /**
+   * Remove log entries whose leading timestamp falls within [start, end].
+   * Lines without a parseable timestamp are preserved to avoid deleting
+   * stack traces or continuation lines incorrectly.
+   * @param {Object} opts - { start, end }
+   * @param {string|number|Date} opts.start
+   * @param {string|number|Date} opts.end
+   * @returns {{ removed: number, remaining: number }}
+   */
+  clearLogsInRange(opts = {}) {
+    const start = normalizeTimeValue(opts.start);
+    const end = normalizeTimeValue(opts.end);
+
+    if (!start || !end) {
+      throw new Error('Start time and end time are required');
+    }
+    if (start.getTime() > end.getTime()) {
+      throw new Error('Start time must be before end time');
+    }
+    if (!fs.existsSync(this.logFile)) {
+      return { removed: 0, remaining: 0 };
+    }
+
+    const content = fs.readFileSync(this.logFile, 'utf-8');
+    const hasTrailingNewline = content.endsWith('\n');
+    const allLines = content.split('\n');
+    if (hasTrailingNewline) allLines.pop();
+    const { keptLines, removed } = filterLogsByTimeRange(allLines, start, end);
+
+    const nextContent = keptLines.join('\n') + (hasTrailingNewline && keptLines.length > 0 ? '\n' : '');
+    // Rewrite in place, not write-temp + rename: the running daemon's stdout
+    // and stderr are append-mode handles to daemon.log. A rename leaves them
+    // writing into the replaced file (and fails outright on Windows while they
+    // are open); truncating in place keeps them appending to daemon.log.
+    const nextBytes = Buffer.from(nextContent, 'utf-8');
+    const fd = fs.openSync(this.logFile, 'r+');
+    try {
+      if (nextBytes.length > 0) fs.writeSync(fd, nextBytes, 0, nextBytes.length, 0);
+      fs.ftruncateSync(fd, nextBytes.length);
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    return { removed, remaining: keptLines.length };
+  }
+}
+
+// -- YAML parser (compatible with Python SDK's daemon.yaml format) --
+
+function parseYaml(text) {
+  const lines = text.split('\n');
+  const result = { version: 2, agents: [], networks: [] };
+  let currentList = null;
+  let currentItem = null;
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '');
+    const stripped = line.trimStart();
+
+    if (!stripped || stripped.startsWith('#')) continue;
+
+    const indent = line.length - stripped.length;
+
+    // List item start (- key: value)
+    if (stripped.startsWith('- ') && currentList) {
+      if (currentItem) result[currentList].push(currentItem);
+      currentItem = {};
+      const rest = stripped.slice(2).trim();
+      if (rest.includes(':')) {
+        const [key, ...valParts] = rest.split(':');
+        currentItem[key.trim()] = parseYamlValue(valParts.join(':').trim());
+      }
+      continue;
+    }
+
+    // Top-level keys
+    if (indent === 0 && stripped.includes(':') && !stripped.startsWith('- ')) {
+      if (currentItem && currentList) {
+        result[currentList].push(currentItem);
+        currentItem = null;
+      }
+      const [key, ...rest] = stripped.split(':');
+      const val = rest.join(':').trim();
+      if (key === 'version') {
+        result.version = parseInt(val, 10) || 2;
+        currentList = null;
+      } else if (key === 'agents') {
+        currentList = 'agents';
+      } else if (key === 'networks') {
+        currentList = 'networks';
+      } else {
+        currentList = null;
+      }
+      continue;
+    }
+
+    // Continuation of current item (indented key: value)
+    if (currentItem && indent >= 2 && stripped.includes(':')) {
+      const [key, ...valParts] = stripped.split(':');
+      currentItem[key.trim()] = parseYamlValue(valParts.join(':').trim());
+    }
+  }
+
+  if (currentItem && currentList) result[currentList].push(currentItem);
+  return result;
+}
+
+/** Bytes read per step when walking back from the end of the log. */
+const TAIL_CHUNK = 64 * 1024;
+/** How far back a first read may walk looking for lines matching the agent filter. */
+const MAX_SCAN_BYTES = 16 * 1024 * 1024;
+/** The most an incremental read takes in one go; older backlog is skipped. */
+const MAX_INCREMENT_BYTES = 4 * 1024 * 1024;
+
+function readRange(fd, start, end) {
+  const buf = Buffer.alloc(end - start);
+  let read = 0;
+  while (read < buf.length) {
+    const n = fs.readSync(fd, buf, read, buf.length - read, start + read);
+    if (n === 0) break;
+    read += n;
+  }
+  return read === buf.length ? buf : buf.subarray(0, read);
+}
+
+function splitLines(buf, keep) {
+  return buf.toString('utf-8').split('\n').filter((l) => l && keep(l));
+}
+
+/**
+ * The last `count` matching lines, read backwards in chunks. Stops at the last
+ * newline: a line still being written is left for the next incremental read.
+ */
+function readLastLines(fd, size, count, keep) {
+  const lastChunk = readRange(fd, Math.max(0, size - TAIL_CHUNK), size);
+  const lastNewline = lastChunk.lastIndexOf(0x0a);
+  const end = lastNewline >= 0 ? size - lastChunk.length + lastNewline + 1 : size;
+
+  let lines = [];
+  let pos = end;
+  let carry = Buffer.alloc(0);
+  while (pos > 0 && lines.length < count && end - pos < MAX_SCAN_BYTES) {
+    const start = Math.max(0, pos - TAIL_CHUNK);
+    const block = Buffer.concat([readRange(fd, start, pos), carry]);
+    pos = start;
+    let body = block;
+    if (pos > 0) {
+      // The block starts mid-line; that fragment joins the next block.
+      const firstNewline = block.indexOf(0x0a);
+      if (firstNewline < 0) {
+        carry = block;
+        continue;
+      }
+      carry = block.subarray(0, firstNewline);
+      body = block.subarray(firstNewline + 1);
+    } else {
+      carry = Buffer.alloc(0);
+    }
+    lines = [...splitLines(body, keep), ...lines];
+  }
+  return { lines: lines.slice(-count), end };
+}
+
+function normalizeTimeValue(value) {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+  if (typeof value === 'number') {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  return null;
+}
+
+function filterLogsByTimeRange(lines, start, end) {
+  const headerTimes = resolveLogHeaderTimestamps(lines, end);
+  let activeRemove = false;
+  let removed = 0;
+  const keptLines = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const headerTime = headerTimes[index];
+    if (headerTime) {
+      const time = headerTime.getTime();
+      activeRemove = time >= start.getTime() && time <= end.getTime();
+    }
+
+    if (activeRemove) {
+      removed += 1;
+    } else {
+      keptLines.push(lines[index]);
+    }
+  }
+
+  return { keptLines, removed };
+}
+
+function resolveLogHeaderTimestamps(lines, referenceTime) {
+  const resolved = new Array(lines.length).fill(null);
+  let currentDay = startOfLocalDay(referenceTime);
+  let lastClockSeconds = null;
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const token = parseLogTimestampToken(lines[index]);
+    if (!token) continue;
+
+    if (token.kind === 'iso') {
+      resolved[index] = token.date;
+      currentDay = startOfLocalDay(token.date);
+      lastClockSeconds = (
+        token.date.getHours() * 3600 +
+        token.date.getMinutes() * 60 +
+        token.date.getSeconds()
+      );
+      continue;
+    }
+
+    if (lastClockSeconds !== null && token.seconds > lastClockSeconds) {
+      currentDay = addLocalDays(currentDay, -1);
+    }
+
+    resolved[index] = withLocalClock(currentDay, token.seconds);
+    lastClockSeconds = token.seconds;
+  }
+
+  return resolved;
+}
+
+function parseLogTimestampToken(line) {
+  if (!line) return null;
+
+  const isoMatch = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2}))/);
+  if (isoMatch) {
+    const date = new Date(isoMatch[1]);
+    if (!Number.isNaN(date.getTime())) {
+      return { kind: 'iso', date };
+    }
+  }
+
+  const clockMatch = line.match(/^\[(\d{2}):(\d{2}):(\d{2})\]/);
+  if (clockMatch) {
+    return {
+      kind: 'clock',
+      seconds:
+        Number(clockMatch[1]) * 3600 +
+        Number(clockMatch[2]) * 60 +
+        Number(clockMatch[3]),
+    };
+  }
+
+  return null;
+}
+
+function startOfLocalDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function addLocalDays(date, days) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
+}
+
+function withLocalClock(day, seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate(), hours, minutes, secs);
+}
+
+function parseYamlValue(val) {
+  if (val === '' || val === 'null' || val === '~') return null;
+  if (val === 'true') return true;
+  if (val === 'false') return false;
+  if (/^\d+$/.test(val)) return parseInt(val, 10);
+  if (val.startsWith('"') && val.endsWith('"')) {
+    // Reverse serializeYamlValue's escaping (\\ → \, \" → "). Without this a
+    // double-quoted Windows path like "D:\重要资料" (quoted because of the drive
+    // colon) round-trips to D:\\重要资料 and accumulates an extra backslash on
+    // every save/load cycle, corrupting the agent's working dir.
+    return val.slice(1, -1).replace(/\\(["\\])/g, '$1');
+  }
+  if (val.startsWith("'") && val.endsWith("'")) {
+    return val.slice(1, -1);
+  }
+  if (val.startsWith('{') || val.startsWith('[')) {
+    try { return JSON.parse(val); } catch { return val; }
+  }
+  return val;
+}
+
+// -- YAML serializer --
+
+function serializeYaml(config) {
+  const lines = [`version: ${config.version || 2}`];
+
+  lines.push('agents:');
+  for (const agent of (config.agents || [])) {
+    const keys = Object.keys(agent);
+    if (keys.length === 0) continue;
+    lines.push(`- name: ${serializeYamlValue(agent.name)}`);
+    for (const key of keys) {
+      if (key === 'name') continue;
+      lines.push(`  ${key}: ${serializeYamlValue(agent[key])}`);
+    }
+  }
+  if (!config.agents || config.agents.length === 0) {
+    lines[lines.length - 1] += ' []';
+  }
+
+  lines.push('networks:');
+  for (const net of (config.networks || [])) {
+    const keys = Object.keys(net);
+    if (keys.length === 0) continue;
+    const firstKey = keys[0];
+    lines.push(`- ${firstKey}: ${serializeYamlValue(net[firstKey])}`);
+    for (const key of keys.slice(1)) {
+      lines.push(`  ${key}: ${serializeYamlValue(net[key])}`);
+    }
+  }
+  if (!config.networks || config.networks.length === 0) {
+    lines[lines.length - 1] += ' []';
+  }
+
+  return lines.join('\n') + '\n';
+}
+
+function serializeYamlValue(val) {
+  if (val === null || val === undefined) return 'null';
+  if (typeof val === 'boolean') return val ? 'true' : 'false';
+  if (typeof val === 'number') return String(val);
+  if (typeof val === 'object') return JSON.stringify(val);
+  const s = String(val);
+  // Quote strings that contain special YAML chars
+  if (s.includes(':') || s.includes('#') || s.includes("'") || s.includes('"') ||
+      s.includes('\n') || s.startsWith(' ') || s.endsWith(' ') ||
+      s === 'true' || s === 'false' || s === 'null' || /^\d+$/.test(s)) {
+    return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  }
+  return s;
+}
+
+module.exports = { Config, parseYaml, serializeYaml };

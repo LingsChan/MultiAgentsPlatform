@@ -1,0 +1,345 @@
+import { describe, expect, it } from "vitest"
+
+import { CliLoginManager, type CliLoginEvent } from "./cli-login"
+import {
+  BROWSER_CLAIMED,
+  CODE_PROMPT,
+  findAuthUrl,
+  LOGIN_FAILURE,
+  LOGIN_SUCCESS,
+  loginArgs,
+  needsRealTerminal,
+  NO_TTY,
+  stripAnsi,
+  TERMINAL_ONLY_LOGIN,
+  YES_NO_PROMPT,
+} from "./cli-login-patterns"
+
+/**
+ * Verbatim output, captured by running each CLI under pipes. If a CLI changes
+ * its wording these are the tests that should fail — the in-app login reads
+ * nothing else.
+ */
+const CLAUDE_URL =
+  "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" +
+  "&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback" +
+  "&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge=0_RSa6pkUkgxcAu0PZ4u7GJRIFt9NMX7fa2HnA-TG18" +
+  "&code_challenge_method=S256&state=svzpX2wox3hNEMjeTxeH21_x6YAMKX-bt0N6EfRSWow"
+
+const CLAUDE_LOGIN = `Opening browser to sign in…\nIf the browser didn't open, visit: ${CLAUDE_URL}\nPaste code here if prompted > `
+
+const CURSOR_LOGIN =
+  "Starting login process...\nAuthenticating with Cursor...\n" +
+  "Waiting for browser authentication...\nIf your browser didn't open, use this link:\n" +
+  "https://cursor.com/loginDeepControl?challenge=VnvuidaFF1g&uuid=ee041919-af3d&mode=login&redirectTarget=cli\n"
+
+const MIMO_URL =
+  "https://platform.xiaomimimo.com/authorize?pk=MCowBQYDK2VuAyEA8MvkPg8NlkJ8NuEfU2hF2sZhKT5LukHVWfGvoG53Ync" +
+  "&redirect_uri=https%3A%2F%2Fplatform.xiaomimimo.com%2Fauthorize%2Fcode%2Fcallback&kn=mimocode&key_name=mimo-code-cli-key-1ff5fbbe"
+
+/** `mimo providers login -p xiaomi` under pipes, MiMo Code 0.1.15. */
+const MIMO_LOGIN = `┌  Add credential\n│\n●  Browser didn't open? Use the url below to sign in:\n│  ${MIMO_URL}\nPaste code here if prompted > `
+
+const AMP_LOGIN =
+  "API key already configured: sgamp_user...\nDo you want to log in again? [(y)es, (n)o]: "
+
+const HERMES_SETUP =
+  "\n⚕ Hermes Setup — Non-interactive mode\n\n" +
+  "  Running in a non-interactive environment (no TTY detected).\n" +
+  "  The interactive wizard cannot be used here.\n"
+
+describe("findAuthUrl", () => {
+  it("pulls the whole PKCE URL out of claude's login output", () => {
+    expect(findAuthUrl(CLAUDE_LOGIN)).toBe(CLAUDE_URL)
+  })
+
+  it("finds cursor's link on its own line", () => {
+    expect(findAuthUrl(CURSOR_LOGIN)).toContain("cursor.com/loginDeepControl")
+  })
+
+  it("ignores non-sign-in links", () => {
+    expect(findAuthUrl("See https://docs.example.com/getting-started")).toBeNull()
+  })
+
+  it("drops the sentence's trailing period", () => {
+    expect(findAuthUrl("Visit https://x.dev/oauth/authorize?a=1.")).toBe(
+      "https://x.dev/oauth/authorize?a=1",
+    )
+  })
+
+  it("refuses a non-web scheme", () => {
+    expect(findAuthUrl("file:///tmp/oauth/authorize")).toBeNull()
+  })
+})
+
+describe("output markers", () => {
+  it("recognises claude's code prompt", () => {
+    expect(CODE_PROMPT.test(CLAUDE_LOGIN)).toBe(true)
+  })
+
+  it("does not ask cursor for a code it never wants", () => {
+    expect(CODE_PROMPT.test(CURSOR_LOGIN)).toBe(false)
+  })
+
+  it("recognises amp's yes/no gate", () => {
+    expect(YES_NO_PROMPT.test(AMP_LOGIN)).toBe(true)
+  })
+
+  it("recognises hermes refusing a pipe", () => {
+    expect(NO_TTY.test(HERMES_SETUP)).toBe(true)
+  })
+
+  it("does not read a normal login as a TTY refusal", () => {
+    expect(NO_TTY.test(CLAUDE_LOGIN)).toBe(false)
+    expect(NO_TTY.test(CURSOR_LOGIN)).toBe(false)
+  })
+
+  it("reads claude's verdicts", () => {
+    expect(LOGIN_SUCCESS.test("Login successful.")).toBe(true)
+    expect(LOGIN_FAILURE.test("Login failed: bad state")).toBe(true)
+    expect(
+      LOGIN_FAILURE.test("Invalid code. Please make sure the full code was copied."),
+    ).toBe(true)
+    expect(LOGIN_SUCCESS.test(CLAUDE_LOGIN)).toBe(false)
+  })
+
+  it("reads mimo's verdicts, and asks again after a code that did not decrypt", () => {
+    expect(LOGIN_SUCCESS.test("●  Login successful")).toBe(true)
+    expect(LOGIN_FAILURE.test("■  Login failed")).toBe(true)
+    expect(LOGIN_FAILURE.test("■  Decryption failed, max retries reached")).toBe(true)
+    const retry = "■  Decryption failed, please retry (2 attempts left)\nPaste code here if prompted > "
+    expect(LOGIN_FAILURE.test(retry)).toBe(false)
+    expect(CODE_PROMPT.test(retry)).toBe(true)
+    expect(findAuthUrl(MIMO_LOGIN)).toBe(MIMO_URL)
+  })
+
+  it("knows when the CLI already opened a browser, so we don't open a second tab", () => {
+    expect(BROWSER_CLAIMED.test(CLAUDE_LOGIN)).toBe(true)
+    expect(BROWSER_CLAIMED.test(CURSOR_LOGIN)).toBe(true)
+    expect(BROWSER_CLAIMED.test("https://x.dev/oauth/authorize")).toBe(false)
+  })
+})
+
+describe("stripAnsi", () => {
+  it("leaves a colorized prompt matchable", () => {
+    const colored = `\u001B[1mPaste code here if prompted > \u001B[0m`
+    expect(stripAnsi(colored)).toBe("Paste code here if prompted > ")
+  })
+
+  it("keeps square brackets that aren't escapes", () => {
+    expect(stripAnsi(AMP_LOGIN)).toContain("[(y)es, (n)o]")
+  })
+})
+
+describe("loginArgs", () => {
+  it("drops the binary token so the absolute path can be spawned instead", () => {
+    expect(loginArgs("claude auth login")).toEqual(["auth", "login"])
+    expect(loginArgs("cursor-agent login")).toEqual(["login"])
+    expect(loginArgs("gemini")).toEqual([])
+  })
+})
+
+describe("needsRealTerminal", () => {
+  it("covers the CLIs that proved they need a TTY", () => {
+    expect(TERMINAL_ONLY_LOGIN.has("hermes")).toBe(true)
+    expect(needsRealTerminal("hermes", "hermes setup")).toBe(true)
+  })
+
+  it("treats a bare binary as a TUI launch, not a login", () => {
+    expect(needsRealTerminal("gemini", "gemini")).toBe(true)
+    // Registry-supplied and unknown to the launcher — still a bare TUI.
+    expect(needsRealTerminal("copilot", "copilot")).toBe(true)
+  })
+
+  it("lets the piped CLIs through", () => {
+    expect(needsRealTerminal("claude", "claude auth login")).toBe(false)
+    expect(needsRealTerminal("cursor", "cursor-agent login")).toBe(false)
+    expect(needsRealTerminal("amp", "amp login")).toBe(false)
+    expect(needsRealTerminal("cline", "cline auth")).toBe(false)
+  })
+})
+
+/**
+ * Starting a sign-in when the launcher cannot resolve the agent's CLI. Every
+ * button in the login card funnels into this one call, so a branch that returns
+ * without doing anything is a button that does nothing — which is how an
+ * antigravity sign-in dead-ended on Windows: "Can't find the antigravity CLI"
+ * was the whole response to "sign in", to "try again", and to "use a terminal"
+ * alike, and only the first of those three is honest.
+ */
+describe("CliLoginManager.start without a resolved binary", () => {
+  const makeDeps = (bin: string | null) => {
+    const events: CliLoginEvent[] = []
+    const terminals: Array<{ cmd: string; type: string }> = []
+    return {
+      events,
+      terminals,
+      deps: {
+        resolveBinary: () => bin,
+        loginCommandFor: () => "agy",
+        childEnv: () => ({}),
+        verifyLogin: async () => false,
+        openExternal: () => {},
+        openTerminal: (cmd: string, type: string) => {
+          terminals.push({ cmd, type })
+        },
+        emit: (ev: CliLoginEvent) => {
+          events.push(ev)
+        },
+      },
+    }
+  }
+
+  it("says the CLI is missing instead of opening a window to prove it", () => {
+    const { deps, events, terminals } = makeDeps(null)
+    const mgr = new CliLoginManager(deps)
+    mgr.start("antigravity")
+    mgr.disposeAll()
+
+    expect(terminals).toHaveLength(0)
+    expect(events.at(-1)?.phase).toBe("failed")
+    expect(events.at(-1)?.message).toMatch(/Can't find the antigravity CLI/)
+  })
+
+  it("still opens the terminal when the user explicitly asks for one", () => {
+    const { deps, events, terminals } = makeDeps(null)
+    const mgr = new CliLoginManager(deps)
+    mgr.start("antigravity", { terminal: true })
+    mgr.disposeAll()
+
+    expect(terminals).toEqual([{ cmd: "agy", type: "antigravity" }])
+    expect(events.at(-1)?.phase).toBe("terminal")
+    // The window may well report an unrecognised command — say so up front
+    // rather than let it look like the sign-in broke.
+    expect(events.at(-1)?.message).toMatch(/couldn't find the antigravity CLI/)
+  })
+
+  it("opens the terminal on request for a CLI that did resolve, as before", () => {
+    const { deps, events, terminals } = makeDeps("C:\\agy\\bin\\agy.exe")
+    const mgr = new CliLoginManager(deps)
+    mgr.start("antigravity", { terminal: true })
+    mgr.disposeAll()
+
+    expect(terminals).toEqual([{ cmd: "agy", type: "antigravity" }])
+    expect(events.at(-1)?.phase).toBe("terminal")
+  })
+})
+
+/**
+ * MiMo's login says "Browser didn't open?" whatever happened and only ever
+ * tries xdg-open, so the launcher opens the printed URL itself and runs the CLI
+ * with CI=1, which stops it trying. Driven through a stand-in CLI that prints
+ * what the real one does and reports its environment.
+ */
+describe("CliLoginManager — mimo opens its sign-in URL through the launcher", () => {
+  it("opens the printed URL once, with CI=1 in the CLI's environment, then takes the code", async () => {
+    const fs = await import("node:fs")
+    const os = await import("node:os")
+    const path = await import("node:path")
+    if (process.platform === "win32") return
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mimo-login-"))
+    const bin = path.join(dir, "mimo")
+    fs.writeFileSync(
+      bin,
+      `#!${process.execPath}\n` +
+        `process.stdout.write(${JSON.stringify(MIMO_LOGIN)})\n` +
+        // Signs in only for the right code, and only if it was told not to
+        // open a browser of its own.
+        `process.stdin.once("data", (d) => { const ok = String(d).trim() === "good" && process.env.CI === "1"; process.stdout.write(ok ? "●  Login successful\\n" : "■  Login failed\\n"); process.exit(0) })\n`,
+    )
+    fs.chmodSync(bin, 0o755)
+
+    const events: CliLoginEvent[] = []
+    const opened: string[] = []
+    const mgr = new CliLoginManager({
+      resolveBinary: () => bin,
+      loginCommandFor: () => "mimo providers login -p xiaomi",
+      childEnv: (extra) => ({ ...process.env, ...extra }),
+      verifyLogin: async () => true,
+      openExternal: (url: string) => {
+        opened.push(url)
+      },
+      openTerminal: () => {},
+      emit: (ev: CliLoginEvent) => {
+        events.push(ev)
+      },
+    })
+    try {
+      mgr.start("mimo-code")
+      const until = async (ok: () => boolean): Promise<void> => {
+        for (let i = 0; i < 100 && !ok(); i++) await new Promise((r) => setTimeout(r, 50))
+      }
+      await until(() => events.some((e) => e.phase === "code"))
+      expect(opened).toEqual([MIMO_URL])
+      expect(events.find((e) => e.phase === "browser")?.url).toBe(MIMO_URL)
+      mgr.submitCode("mimo-code", "good")
+      await until(() => events.some((e) => e.phase === "success"))
+      expect(events.at(-1)?.phase).toBe("success")
+    } finally {
+      mgr.disposeAll()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * MiMo gives up after three bad codes in the language it picks from the time
+ * zone, and exits 0 without writing a credential. Only its success line counts
+ * — however it worded the failure, and whether or not an older sign-in is on
+ * disk for the probe to find.
+ */
+describe("CliLoginManager — a clean mimo exit is not a sign-in by itself", () => {
+  const run = async (verified: boolean): Promise<CliLoginEvent[]> => {
+    const fs = await import("node:fs")
+    const os = await import("node:os")
+    const path = await import("node:path")
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mimo-login-"))
+    const bin = path.join(dir, "mimo")
+    fs.writeFileSync(
+      bin,
+      `#!${process.execPath}\n` +
+        `process.stdout.write(${JSON.stringify(MIMO_LOGIN)})\n` +
+        `process.stdin.once("data", () => { process.stdout.write("\\n■  解密失败，已达最大重试次数\\n"); process.exit(0) })\n`,
+    )
+    fs.chmodSync(bin, 0o755)
+    const events: CliLoginEvent[] = []
+    const mgr = new CliLoginManager({
+      resolveBinary: () => bin,
+      loginCommandFor: () => "mimo providers login -p xiaomi",
+      childEnv: (extra) => ({ ...process.env, ...extra }),
+      verifyLogin: async () => verified,
+      openExternal: () => {},
+      openTerminal: () => {},
+      emit: (ev: CliLoginEvent) => {
+        events.push(ev)
+      },
+    })
+    const until = async (ok: () => boolean): Promise<void> => {
+      for (let i = 0; i < 100 && !ok(); i++) await new Promise((r) => setTimeout(r, 50))
+    }
+    try {
+      mgr.start("mimo-code")
+      await until(() => events.some((e) => e.phase === "code"))
+      mgr.submitCode("mimo-code", "wrong")
+      await until(() => events.some((e) => e.phase === "success" || e.phase === "failed"))
+    } finally {
+      mgr.disposeAll()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+    return events
+  }
+
+  it("fails, quoting the CLI's last word, when nothing was signed in", async () => {
+    if (process.platform === "win32") return
+    const events = await run(false)
+    expect(events.at(-1)?.phase).toBe("failed")
+    expect(events.at(-1)?.message).toBe("解密失败，已达最大重试次数")
+  })
+
+  it("still fails when an earlier sign-in is on disk — the probe proves nothing then", async () => {
+    if (process.platform === "win32") return
+    const events = await run(true)
+    expect(events.at(-1)?.phase).toBe("failed")
+    expect(events.at(-1)?.message).toBe("解密失败，已达最大重试次数")
+  })
+})

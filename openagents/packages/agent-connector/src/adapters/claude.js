@@ -1,0 +1,1707 @@
+/**
+ * Claude Code adapter for OpenAgents workspace.
+ *
+ * Bridges Claude Code to an OpenAgents workspace via:
+ * - Polling loop for incoming messages
+ * - Claude CLI subprocess (stream-json) for task execution
+ * - MCP server for workspace tool access
+ *
+ * Direct port of Python: sdk/src/openagents/adapters/claude.py
+ */
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execSync } = require('child_process');
+// spawn() here is the WSL bridge from ../wsl: same signature as
+// child_process.spawn, and a straight pass-through unless the resolved CLI
+// lives on the other side of the Windows/WSL boundary.
+const { spawn } = require('../wsl');
+
+const BaseAdapter = require('./base');
+const { formatAttachmentsForPrompt, SESSION_DEFAULT_RE, generateSessionTitle, stripCliNoise, CREDIT_EXHAUSTED, REGION_BLOCKED } = require('./utils');
+const { buildClaudeSystemPrompt, buildClaudeSkillMd, buildPinnedSections, workspaceSkillName } = require('./workspace-prompt');
+const { pinnedFingerprint, sampleRecap } = require('./decision-log');
+const { defaultAgentWorkdir, whichBinary, whereBinary } = require('../paths');
+const { isPostinstallStub } = require('../postinstall-stub');
+const { claudeConfigDir, claudeProjectDir, snapshotTranscript } = require('../host-agent');
+const { pendingImport } = require('../session-imports');
+
+const IS_WINDOWS = process.platform === 'win32';
+
+class ClaudeAdapter extends BaseAdapter {
+  /**
+   * The env the spawned `claude` CLI runs with. Pure — takes the agent's env
+   * and returns a new object; nothing here reads `this`.
+   *
+   * Two jobs:
+   *
+   * 1. Strip the CLAUDE_* / AI_AGENT variables that make the child think it is
+   *    running under an SDK harness (it then takes the org-scoped auth path and
+   *    gets a 403). Cloud-provider and model config is kept, and so is the
+   *    subscription token from `claude setup-token` — that one IS the
+   *    credential, and sweeping it up as a stray CLAUDE_* left anyone who
+   *    pasted one authenticating as nobody, silently. CLAUDE_CONFIG_DIR is
+   *    kept too: it is where the user's global CLAUDE.md, settings, skills and
+   *    project memory live, and dropping it started the agent from a blank
+   *    ~/.claude with none of the memory it has outside the workspace.
+   *
+   * 2. Mirror the API key into ANTHROPIC_AUTH_TOKEN for third-party relays. The
+   *    CLI sends ANTHROPIC_API_KEY as `x-api-key`, which most Anthropic-
+   *    compatible relays ignore — they only honor `Authorization: Bearer`, and
+   *    reject everything else as 401 "invalid token / 无效的令牌". The auth token
+   *    is sent as Bearer and outranks the key in Claude Code's precedence. The
+   *    launcher normally sets this when saving env; this is the runtime backstop
+   *    for envs saved by an older launcher or coming from anywhere else. Only
+   *    for a NON-official base — api.anthropic.com wants x-api-key.
+   *
+   * 3. Turn MCP tool search off behind a relay (ENABLE_TOOL_SEARCH=false).
+   *    Claude Code 2.1.304 made it the default behind a custom base URL, and
+   *    the deferred-tool content blocks it sends are rejected by relays whose
+   *    schema predates them (422 "unknown variant `tool_definition`, expected
+   *    `tool_reference`"). Newer CLIs retry without it, but only after the
+   *    rejected request, on every turn. A value the user set is left alone.
+   *
+   * @param {Record<string, string>} baseEnv
+   * @returns {Record<string, string>}
+   */
+  static _buildChildEnv(baseEnv) {
+    const KEEP = new Set([
+      'CLAUDE_CODE_USE_VERTEX',
+      'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_MODEL',
+      'CLAUDE_API_KEY',
+      'CLAUDE_CODE_MAX_TURNS',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CONFIG_DIR',
+    ]);
+    const env = { ...(baseEnv || {}) };
+    for (const k of Object.keys(env)) {
+      if ((k.startsWith('CLAUDE_') && !KEEP.has(k)) || k === 'CLAUDECODE' || k === 'AI_AGENT') {
+        delete env[k];
+      }
+    }
+
+    const base = (env.ANTHROPIC_BASE_URL || '').trim();
+    if (!base) return env;
+    let official = false;
+    try {
+      const host = new URL(base).hostname.toLowerCase();
+      official = host === 'anthropic.com' || host.endsWith('.anthropic.com');
+    } catch { official = false; }
+    if (official) return env;
+
+    const key = (env.ANTHROPIC_API_KEY || '').trim();
+    if (key && !(env.ANTHROPIC_AUTH_TOKEN || '').trim()) env.ANTHROPIC_AUTH_TOKEN = key;
+    if (!(env.ENABLE_TOOL_SEARCH || '').trim()) env.ENABLE_TOOL_SEARCH = 'false';
+    return env;
+  }
+
+  /**
+   * @param {object} opts - BaseAdapter opts plus:
+   * @param {Set} [opts.disabledModules]
+   * @param {string} [opts.workingDir]
+   * @param {{session_id: string, transcript: string}} [opts.seedSession] -
+   *   A Claude Code conversation this agent was created from (`agn join`).
+   *   Each channel's first turn forks it, so the agent starts with what was
+   *   said there without ever writing to it.
+   */
+  constructor(opts) {
+    super(opts);
+    this.disabledModules = opts.disabledModules || new Set();
+    this._seedSession = opts.seedSession && opts.seedSession.session_id && opts.seedSession.transcript
+      ? opts.seedSession : null;
+    /** @type {'mcp' | 'skills'} Tool integration mode */
+    this.toolMode = opts.toolMode || 'skills';
+    this._channelSessions = {}; // channel → Claude CLI session_id
+    this._channelProcesses = {}; // channel → child process
+    this._stoppingChannels = new Set();
+    this._persistentProcs = {}; // channel → { proc, lineBuffer, pendingLines, idleTimer, messageResolve }
+    // Knowledge pinning (glossary) lives in BaseAdapter; this
+    // adapter fetches directly in _handleMessage because the result also
+    // drives the persistent-process staleness check.
+    this._IDLE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
+    this._WATCHDOG_INTERVAL_MS = 15_000; // 15s between checks
+    this._WATCHDOG_MAX_TIMEOUTS = 20;    // 20 * 15s = 5 min of silence → kill
+    this._sessionsFile = path.join(
+      os.homedir(), '.openagents', 'sessions',
+      `${this.workspaceId}_${this.agentName}.json`
+    );
+    this._loadSessions();
+  }
+
+  _loadSessions() {
+    try {
+      if (fs.existsSync(this._sessionsFile)) {
+        const data = JSON.parse(fs.readFileSync(this._sessionsFile, 'utf-8'));
+        if (data && typeof data === 'object') {
+          Object.assign(this._channelSessions, data);
+          this._log(`Loaded ${Object.keys(data).length} session(s)`);
+        }
+      }
+    } catch {
+      this._log('Could not load sessions file, starting fresh');
+    }
+  }
+
+  _saveSessions() {
+    try {
+      const dir = path.dirname(this._sessionsFile);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(this._sessionsFile, JSON.stringify(this._channelSessions));
+    } catch {}
+  }
+
+  async _onControlAction(action, payload) {
+    if (action === 'restart') {
+      const channel = (payload && typeof payload === 'object') ? payload.channel : null;
+      if (channel) {
+        // Kill in-flight subprocess + clear the per-channel session BEFORE
+        // asking the daemon to bounce us. The new adapter spawned after
+        // the bounce loads sessions from disk, so the cleared state must
+        // be persisted first.
+        const proc = this._channelProcesses[channel];
+        if (proc) {
+          try { await this._stopProcess(proc); } catch {}
+          delete this._channelProcesses[channel];
+        }
+        if (this._channelSessions[channel]) {
+          // null, not delete: the channel stays known, so a restart starts
+          // it fresh instead of forking the seed conversation again.
+          this._channelSessions[channel] = null;
+          try { this._saveSessions(); } catch {}
+          this._log(`Restart: cleared session for channel=${channel}`);
+        } else {
+          this._log(`Restart: no session to clear for channel=${channel}`);
+        }
+        // Post the status BEFORE the bounce so the message lands while
+        // we're still online.
+        try {
+          await this.client.sendMessage(this.workspaceId, channel, this.token,
+            'Session restarted — next message starts fresh.',
+            {
+              senderType: 'agent',
+              senderName: this.agentName,
+              messageType: 'status',
+              metadata: { agent_mode: this._mode },
+              sessionId: this._sessionId,
+            });
+        } catch (e) {
+          this._log(`Restart: failed to post status: ${e && e.message ? e.message : e}`);
+        }
+      } else {
+        // Defensive — no channel, clear everything before the bounce.
+        this._channelSessions = {};
+        try { this._saveSessions(); } catch {}
+        await this._stopAllProcesses('Execution stopped by user.');
+        this._log('Restart: cleared all sessions (no channel param)');
+      }
+      // Ask the daemon to bounce just THIS agent — true process-level
+      // restart. Daemon's command-file poller picks up `restart:<name>`
+      // within ~1s, calls restartAgent, our run() loop exits cleanly,
+      // and a fresh adapter is spawned with a new `_startedAt`. Sibling
+      // agents on the same daemon are untouched.
+      try {
+        const path = require('path');
+        const os = require('os');
+        const fs = require('fs');
+        const cmdFile = path.join(os.homedir(), '.openagents', 'daemon.cmd');
+        fs.writeFileSync(cmdFile, `restart:${this.agentName}\n`);
+        this._log(`Restart: requested daemon bounce for agent=${this.agentName}`);
+      } catch (e) {
+        this._log(`Restart: failed to write daemon.cmd: ${e && e.message ? e.message : e}`);
+        // Fallback: reset uptime in-place so the next /status reflects
+        // SOMETHING changed even if the daemon bounce didn't happen.
+        this._startedAt = Date.now();
+      }
+      return;
+    }
+    // Fall through to base for shared actions (status, etc.).
+    await super._onControlAction(action, payload);
+  }
+
+  /**
+   * Override BaseAdapter.stop so daemon shutdown also tears down in-flight
+   * claude subprocesses cleanly. Without this, killing the daemon leaves
+   * the channel's last event as a `status` (e.g. "Bash › ..." mid-tool-call)
+   * forever — the workspace UI then shows the thread as "running" until a
+   * new message arrives. Fire-and-forget; daemon._killAgent gives us up to
+   * 5s to actually finish the cleanup before the parent exits.
+   */
+  stop() {
+    for (const channel of Object.keys(this._persistentProcs)) {
+      this._killPersistentProc(channel);
+    }
+    this._stopAllProcesses(
+      'Task interrupted — daemon restarting. Send another message to continue.'
+    ).catch(() => {});
+    super.stop();
+  }
+
+  async _stopProcess(proc) {
+    if (!proc || proc.exitCode !== null) return;
+    try {
+      if (IS_WINDOWS) {
+        // Give Claude Code a Ctrl+C-like interrupt first so it can cancel
+        // shell/background tasks it manages before the forceful process-tree
+        // cleanup below. Going straight to /F can leave detached tool work
+        // alive even though the Claude CLI process itself is gone.
+        try { proc.kill('SIGINT'); } catch {}
+        const exited = await new Promise((resolve) => {
+          if (proc.exitCode !== null) {
+            resolve(true);
+            return;
+          }
+          const timeout = setTimeout(() => resolve(false), 1500);
+          proc.once('exit', () => { clearTimeout(timeout); resolve(true); });
+        });
+        if (!exited) {
+          try { execSync(`taskkill /F /T /PID ${proc.pid}`, { timeout: 5000 }); } catch {}
+        }
+      } else {
+        try { process.kill(-proc.pid, 'SIGTERM'); } catch {
+          proc.kill('SIGTERM');
+        }
+        await new Promise((resolve) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            resolve();
+          };
+          const timeout = setTimeout(() => {
+            try { process.kill(-proc.pid, 'SIGKILL'); } catch {
+              proc.kill('SIGKILL');
+            }
+            const reapTimeout = setTimeout(finish, 1000);
+            proc.once('exit', () => { clearTimeout(reapTimeout); finish(); });
+          }, 1500);
+          proc.once('exit', () => { clearTimeout(timeout); finish(); });
+        });
+      }
+    } catch {}
+  }
+
+  /**
+   * Build a short transcript of the channel's chat, used to re-seed context
+   * when --resume fails and we have to start a fresh Claude Code session.
+   * Samples both ends of the channel — its opening messages (where the
+   * original requirement usually lives) fetched ascending, and the most
+   * recent ones fetched descending — so a long conversation's early context
+   * is not lost to pure recency. Returns null when there's nothing useful.
+   *
+   * Excludes the user's current message (the caller appends it normally)
+   * and any status/thinking events, which are mostly tool-call noise.
+   * `current` is the triggering message: when given, the trigger itself and
+   * anything posted after it (queued follow-ups) are left out by event, since
+   * `currentMessage` text no longer matches once history is prepended.
+   */
+  async _buildChannelRecap(channelName, currentMessage, current = null) {
+    const before = current?.messageId;
+    const [headMsgs, tailMsgs] = await Promise.all([
+      this.client.getRecentMessages(this.workspaceId, channelName, this.token, 30, { sort: 'asc' }),
+      this.client.getRecentMessages(this.workspaceId, channelName, this.token, 60, before ? { before } : {}),
+    ]);
+    const cutoff = Date.parse(current?.createdAt || '');
+    const priorOnly = (msgs) => (msgs || []).filter((m) => {
+      if (before && m.messageId === before) return false;
+      return !(Number.isFinite(cutoff) && Date.parse(m.createdAt || '') > cutoff);
+    });
+    const lines = sampleRecap(priorOnly(headMsgs), priorOnly(tailMsgs), currentMessage);
+    if (lines.length === 0) return null;
+
+    return (
+      'You previously worked in this channel but your prior session is no ' +
+      'longer available, so here is a recap of the conversation (its opening ' +
+      'messages and the most recent ones):\n\n' +
+      lines.join('\n')
+    );
+  }
+
+  /**
+   * Abandon this turn when a stop landed while it was being prepared. The
+   * stop handler kills whatever process is registered, but a turn still
+   * working through its pre-CLI round trips has none yet — so without this
+   * it goes on to spawn one and the agent resumes seconds after saying it
+   * stopped. Returns true when the caller should give up.
+   */
+  async _bailOnStopDuringTurn(msgChannel) {
+    if (!this._stoppedBeforeStart(msgChannel)) return false;
+    // Deduped: normally the stop handler already announced it.
+    await this._finishUserStop(msgChannel);
+    return true;
+  }
+
+  /**
+   * Stop ONE channel's Claude run (BaseAdapter._handleUserStop drives this).
+   *
+   * `userStopped` goes on before the kill: the turn waiting on this process
+   * must read its exit as a stop, not as a stale session to retry, and the
+   * output parser drops what the process wrote before dying.
+   */
+  async _stopChannelWork(channel) {
+    const pp = this._persistentProcs[channel];
+    if (pp) pp.userStopped = true;
+    const outcome = await super._stopChannelWork(channel);
+    // Those leftover lines are still being parsed on this chain. They post
+    // nothing now, but wait them out so none of their bookkeeping races the
+    // notice BaseAdapter posts next.
+    if (pp) {
+      try { await pp.pendingLines; } catch {}
+    }
+    return outcome;
+  }
+
+  async _stopAllProcesses(completionMessage = 'Execution stopped.') {
+    for (const channel of Object.keys(this._persistentProcs)) {
+      this._killPersistentProc(channel);
+    }
+    const entries = Object.entries(this._channelProcesses);
+    if (!entries.length) return;
+    this._log(`Stopping ${entries.length} running process(es)...`);
+    for (const [channel, proc] of entries) {
+      this._stoppingChannels.add(channel);
+      await this._stopProcess(proc);
+      delete this._channelProcesses[channel];
+      delete this._channelQueues[channel];
+      try {
+        await this.sendResponse(channel, completionMessage);
+      } catch {}
+    }
+  }
+
+  /**
+   * Find the portable Node.js binary.
+   */
+  _findNodeBin() {
+    const home = os.homedir();
+    const candidates = IS_WINDOWS
+      ? [path.join(home, '.openagents', 'nodejs', 'node.exe')]
+      : [path.join(home, '.openagents', 'nodejs', 'node'),
+         path.join(home, '.openagents', 'nodejs', 'bin', 'node')];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+    // Fall back to the node already running this daemon (absolute, always valid).
+    // Bare 'node' can be off-PATH in a packaged daemon or CI runner.
+    return process.execPath;
+  }
+
+  /**
+   * Resolve a binary shim/symlink to [nodeBin, jsEntryPoint].
+   * On Windows: parses .cmd shim to extract the JS path.
+   * On macOS/Linux: follows symlink to the actual .js file.
+   * Returns [nodeBin, jsPath] or null if resolution fails.
+   */
+  _resolveToNodeCmd(binPath) {
+    const nodeBin = this._findNodeBin();
+    if (IS_WINDOWS && binPath.toLowerCase().endsWith('.cmd')) {
+      const cmdDir = path.dirname(path.resolve(binPath));
+      const cmdContent = fs.readFileSync(binPath, 'utf-8');
+      const jsMatch = cmdContent.match(/%dp0%\\([^\s"*?]+\.m?js)/i);
+      if (jsMatch) {
+        return [nodeBin, path.resolve(cmdDir, jsMatch[1])];
+      }
+      // .cmd shims that forward to a native .exe (e.g. Claude Code's
+      // claude.cmd → @anthropic-ai/claude-code/bin/claude.exe). Resolve to the
+      // exe and spawn it directly. Wrapping such a .cmd in `cmd.exe /c` caps the
+      // command line at cmd.exe's 8191-char limit, which truncates the ~14KB
+      // --append-system-prompt and makes the agent hang ("command line too long").
+      const exeMatch = cmdContent.match(/%dp0%\\([^\s"*?]+\.exe)/i);
+      if (exeMatch) {
+        return [path.resolve(cmdDir, exeMatch[1])];
+      }
+    } else {
+      // Unix: symlink → resolve to actual .js file
+      try {
+        let target = binPath;
+        if (fs.lstatSync(binPath).isSymbolicLink()) {
+          target = path.resolve(path.dirname(binPath), fs.readlinkSync(binPath));
+        }
+        if (target.endsWith('.js') || target.endsWith('.mjs')) {
+          return [nodeBin, target];
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  _findClaudeBinary() {
+    const home = os.homedir();
+
+    // Tier 0: Isolated runtime prefix (~/.openagents/runtimes/claude/)
+    const ext = IS_WINDOWS ? '.cmd' : '';
+    const runtimeCandidate = path.join(home, '.openagents', 'runtimes', 'claude', 'node_modules', '.bin', `claude${ext}`);
+    if (fs.existsSync(runtimeCandidate)) return runtimeCandidate;
+
+    // Tier 0b: Legacy portable install at ~/.openagents/nodejs/node_modules/.bin/
+    const portableBin = path.join(home, '.openagents', 'nodejs', 'node_modules', '.bin');
+    const portableCandidate = path.join(portableBin, `claude${ext}`);
+    if (fs.existsSync(portableCandidate)) return portableCandidate;
+
+    // Tier 1: PATH search via a codepage-safe lookup (whereBinary forces UTF-8
+    // output + verifies existence, so a non-ASCII/Chinese username isn't mangled
+    // into an ENOENT). Uses the ENRICHED env so a packaged daemon's minimal PATH
+    // still sees the node-version-manager / homebrew / npm-global dirs the
+    // launcher adds — that's why a bare `which claude` came up empty before.
+    const viaWhere = whereBinary('claude');
+    if (viaWhere) return viaWhere;
+
+    // Tier 2: Next to current Node.js interpreter (npm global)
+    const nodeBinDir = path.dirname(process.execPath);
+    const nearNode = path.join(nodeBinDir, `claude${ext}`);
+    if (fs.existsSync(nearNode)) return nearNode;
+
+    // Tier 3: Common install locations
+    const candidates = IS_WINDOWS ? [
+      path.join(process.env.APPDATA || '', 'npm', 'claude.cmd'),
+    ] : [
+      path.join(home, '.local', 'bin', 'claude'),
+      path.join(home, '.claude', 'local', 'claude'),
+      path.join(home, '.npm-global', 'bin', 'claude'),
+      '/opt/homebrew/bin/claude',
+      '/usr/local/bin/claude',
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+
+    // Tier 4: Deep scan of every known bin dir (nvm/fnm/volta node-global,
+    // homebrew, cargo, pip, …). This is what catches a `claude` installed as a
+    // global npm package under a version-managed Node — the most common setup,
+    // and the one the fixed-PATH tiers above miss.
+    const viaWhich = whichBinary('claude');
+    if (viaWhich) return viaWhich;
+
+    return null;
+  }
+
+  _buildClaudeCmd(prompt, channelName, { skipResume = false, browserEnabled = false, glossary = null } = {}) {
+    const claudeBin = this._findClaudeBinary();
+    if (!claudeBin) {
+      throw new Error('claude CLI not found. Install with: curl -fsSL https://claude.ai/install.sh | bash');
+    }
+    if (isPostinstallStub(claudeBin)) throw new Error(ClaudeAdapter.INSTALL_INCOMPLETE);
+
+    // The builder emits the correct tool-reference block for toolMode directly
+    // (mcp → workspace_* tools, skills → openagents-workspace skill), so there
+    // is no post-hoc string replacement to drift out of sync.
+    const systemPrompt = '\n' + buildClaudeSystemPrompt({
+      agentName: this.agentName,
+      workspaceId: this.workspaceId,
+      channelName,
+      mode: this._mode,
+      model: this.modelLabel(),
+      browserEnabled,
+      toolMode: this.toolMode,
+      glossary,
+    });
+
+    const cmd = [claudeBin, '-p', prompt, '--output-format', 'stream-json', '--verbose'];
+
+    cmd.push('--append-system-prompt', systemPrompt);
+    // Workspace-picked model (agent profile panel). Absent = CLI's own default.
+    if (this.workspaceModel) {
+      cmd.push('--model', this.workspaceModel);
+    }
+    const disallowedTools = ['AskUserQuestion', 'CronCreate', 'CronDelete', 'CronList', 'ScheduleWakeup'];
+    if (browserEnabled) {
+      // Hard-ban the native WebFetch: it can't render JS and bypasses the
+      // workspace fetch chain. Prompt-level bans proved insufficient.
+      // WebSearch stays allowed (pure search, no page fetching).
+      disallowedTools.push('WebFetch');
+    }
+    cmd.push('--disallowedTools', ...disallowedTools);
+
+    // Resume existing conversation (skipped on retry after stale session)
+    const sessionId = this._channelSessions[channelName];
+    let seeded = false;
+    if (sessionId && !skipResume) {
+      cmd.push('--resume', sessionId);
+    } else if (!skipResume && !Object.prototype.hasOwnProperty.call(this._channelSessions, channelName)) {
+      const seed = this._importArgs(channelName) || this._seedArgs();
+      if (seed) { cmd.push(...seed); seeded = true; }
+    }
+
+    // ── Skills mode: write SKILL.md, no MCP server ──
+    if (this.toolMode === 'skills') {
+      return { ...this._buildSkillsCmd(cmd, channelName), seeded };
+    }
+
+    // ── MCP mode (default): spawn MCP server ──
+    return { ...this._buildMcpCmd(cmd, channelName), seeded };
+  }
+
+  /**
+   * `--resume <id> --fork-session` for a channel that is an imported local
+   * Claude Code session (src/session-imports.js), on its first turn, or null.
+   * Same as the seed below, but per channel: the session's transcript is
+   * copied under this agent's working folder (Claude Code resumes only
+   * sessions filed under its cwd) and forked, so the user's own file is never
+   * written to. A transcript that is gone leaves the channel to start fresh
+   * with the imported thread history.
+   */
+  _importArgs(channelName) {
+    // Once per channel: a fork that fails to resume is retried fresh, not re-forked.
+    this._adoptedImports = this._adoptedImports || new Set();
+    if (this._adoptedImports.has(channelName)) return null;
+    const entry = pendingImport(this.workspaceId, this.agentName, channelName, 'claude');
+    if (!entry || !entry.file) return null;
+    this._adoptedImports.add(channelName);
+    try {
+      const workDir = this.workingDir || defaultAgentWorkdir(this.agentName);
+      const destDir = claudeProjectDir(claudeConfigDir(this.agentEnv || process.env), workDir);
+      if (path.resolve(path.dirname(entry.file)) !== path.resolve(destDir)) snapshotTranscript(entry.file, destDir);
+      else if (!fs.existsSync(entry.file)) throw new Error('transcript is gone');
+      return ['--resume', entry.session_id, '--fork-session'];
+    } catch (e) {
+      this._log(`Imported session ${entry.session_id} unavailable for ${channelName} (${e.message}); starting fresh`);
+      return null;
+    }
+  }
+
+  /**
+   * `--resume <seed> --fork-session` for a channel's first turn, or null.
+   * Claude Code resumes only sessions filed under the cwd it runs in, so the
+   * seed's transcript is copied there first (complete lines only: the chat it
+   * came from may still be open and writing). Copied at each use, so a new
+   * channel starts from the conversation as it is now. A transcript that is
+   * gone turns seeding off.
+   */
+  _seedArgs() {
+    const seed = this._seedSession;
+    if (!seed) return null;
+    try {
+      const workDir = this.workingDir || defaultAgentWorkdir(this.agentName);
+      const destDir = claudeProjectDir(claudeConfigDir(this.agentEnv || process.env), workDir);
+      if (path.resolve(path.dirname(seed.transcript)) !== path.resolve(destDir)) {
+        snapshotTranscript(seed.transcript, destDir);
+      } else if (!fs.existsSync(seed.transcript)) {
+        throw new Error('transcript is gone');
+      }
+      return ['--resume', seed.session_id, '--fork-session'];
+    } catch (e) {
+      this._log(`Seed conversation ${seed.session_id} unavailable (${e.message}); new channels start fresh`);
+      this._seedSession = null;
+      return null;
+    }
+  }
+
+  /**
+   * Skills mode: write a SKILL.md file and allow Bash + curl for workspace ops.
+   */
+  _buildSkillsCmd(cmd, channelName) {
+    if (this._mode === 'plan') {
+      cmd.push('--permission-mode', 'plan');
+      cmd.push('--allowedTools', 'Read', 'Glob', 'Grep', 'Bash');
+    } else {
+      cmd.push('--dangerously-skip-permissions');
+      cmd.push('--allowedTools', 'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep');
+    }
+
+    // Write SKILL.md to .claude/skills/ in the working directory. Never use
+    // process.cwd() as the fallback — on a packaged Windows daemon that is
+    // C:\WINDOWS\system32 and mkdir there throws EPERM.
+    const workDir = this.workingDir || defaultAgentWorkdir(this.agentName);
+    const skillsRoot = path.join(workDir, '.claude', 'skills');
+    const skillDir = path.join(skillsRoot, workspaceSkillName(this.agentName));
+    fs.mkdirSync(skillDir, { recursive: true, mode: 0o700 });
+    // Per-agent directory: Claude discovers <name>/SKILL.md, not flat .md files.
+    // Agents sharing a working directory used to clobber
+    // one shared openagents-workspace.md, so uploads carried the identity of
+    // whichever agent wrote the file last. Drop that legacy file so a stale
+    // copy (with another agent's embedded identity) can never be read again.
+    const skillFile = path.join(skillDir, 'SKILL.md');
+    try { fs.unlinkSync(path.join(skillsRoot, 'openagents-workspace.md')); } catch {}
+    try { fs.unlinkSync(path.join(skillsRoot, `${workspaceSkillName(this.agentName)}.md`)); } catch {}
+
+    const skillContent = buildClaudeSkillMd({
+      endpoint: this.endpoint,
+      workspaceId: this.workspaceId,
+      token: this.token,
+      agentName: this.agentName,
+      channelName,
+      disabledModules: this.disabledModules,
+      browserEnabled: this._browserEnabledCache === true,
+    });
+    fs.writeFileSync(skillFile, skillContent, { encoding: 'utf-8', mode: 0o600 });
+    fs.chmodSync(skillFile, 0o600);
+    this._log(`Wrote workspace skill to ${skillFile}`);
+
+    return { cmd, skillFile };
+  }
+
+  /**
+   * MCP mode (default): spawn MCP server subprocess for workspace tools.
+   */
+  _buildMcpCmd(cmd, channelName) {
+    // Mode-dependent permission and tool flags
+    const pfx = 'mcp__openagents-workspace__';
+    const mcpTools = [
+      `${pfx}workspace_get_history`,
+      `${pfx}workspace_get_agents`,
+      `${pfx}workspace_status`,
+    ];
+    const mcpWriteTools = [];
+
+    if (!this.disabledModules.has('files')) {
+      mcpTools.push(`${pfx}workspace_list_files`, `${pfx}workspace_read_file`);
+      mcpWriteTools.push(`${pfx}workspace_write_file`, `${pfx}workspace_delete_file`);
+    }
+    if (!this.disabledModules.has('search')) {
+      mcpTools.push(`${pfx}workspace_image_search`);
+      mcpWriteTools.push(`${pfx}workspace_image_save`);
+    }
+    if (!this.disabledModules.has('knowledge')) {
+      // The glossary protocol instructs these by name — they
+      // must be callable or the pinned knowledge silently stops updating.
+      mcpTools.push(`${pfx}workspace_list_knowledge`, `${pfx}workspace_read_knowledge`);
+      mcpWriteTools.push(`${pfx}workspace_write_knowledge`);
+    }
+    if (!this.disabledModules.has('browser')) {
+      mcpTools.push(
+        `${pfx}workspace_fetch_url`,
+        `${pfx}workspace_browser_list_tabs`,
+        `${pfx}workspace_browser_snapshot`,
+        `${pfx}workspace_browser_screenshot`
+      );
+      mcpWriteTools.push(
+        `${pfx}workspace_browser_open`,
+        `${pfx}workspace_browser_navigate`,
+        `${pfx}workspace_browser_click`,
+        `${pfx}workspace_browser_type`,
+        `${pfx}workspace_browser_close`
+      );
+    }
+    if (!this.disabledModules.has('tunnel')) {
+      mcpTools.push(`${pfx}tunnel_list`);
+      mcpWriteTools.push(`${pfx}tunnel_expose`, `${pfx}tunnel_close`);
+    }
+
+    // Todos, Timers & Routines (always enabled)
+    mcpTools.push(`${pfx}workspace_get_todos`, `${pfx}workspace_list_timers`, `${pfx}workspace_list_routines`);
+    mcpWriteTools.push(`${pfx}workspace_put_todos`, `${pfx}workspace_create_timer`, `${pfx}workspace_cancel_timer`, `${pfx}workspace_create_routine`, `${pfx}workspace_update_routine`, `${pfx}workspace_cancel_routine`);
+
+    if (this._mode === 'plan') {
+      cmd.push('--permission-mode', 'plan');
+      cmd.push('--allowedTools', ...mcpTools, 'Read', 'Glob', 'Grep');
+    } else {
+      cmd.push('--dangerously-skip-permissions');
+      cmd.push('--allowedTools', ...mcpTools, ...mcpWriteTools, 'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep');
+    }
+
+    // MCP config for workspace tools
+    const mcpArgs = [
+      'mcp-server',
+      '--workspace-id', this.workspaceId,
+      '--channel-name', channelName,
+      '--agent-name', this.agentName,
+      '--endpoint', this.endpoint,
+    ];
+    if (this.disabledModules.has('files')) mcpArgs.push('--disable-files');
+    if (this.disabledModules.has('browser')) mcpArgs.push('--disable-browser');
+    if (this.disabledModules.has('knowledge')) mcpArgs.push('--disable-knowledge');
+
+    // Resolve the MCP server entry point
+    let mcpCommand = this._findNodeBin();
+    let mcpFinalArgs = mcpArgs;
+    const siblingBin = path.resolve(__dirname, '..', '..', 'bin', 'agent-connector.js');
+    if (fs.existsSync(siblingBin)) {
+      mcpFinalArgs = [siblingBin, ...mcpArgs];
+    } else {
+      let oaBin = null;
+      const home3 = os.homedir();
+      const oaExt = IS_WINDOWS ? '.cmd' : '';
+      const runtimesRoot = path.join(home3, '.openagents', 'runtimes');
+      try {
+        for (const d of fs.readdirSync(runtimesRoot, { withFileTypes: true })) {
+          if (d.isDirectory()) {
+            const candidate = path.join(runtimesRoot, d.name, 'node_modules', '.bin', `openagents${oaExt}`);
+            if (fs.existsSync(candidate)) { oaBin = candidate; break; }
+          }
+        }
+      } catch {}
+      if (!oaBin) {
+        const oaPortable = path.join(home3, '.openagents', 'nodejs', 'node_modules', '.bin', `openagents${oaExt}`);
+        if (fs.existsSync(oaPortable)) oaBin = oaPortable;
+      }
+      // Codepage-safe lookup so a non-ASCII/Chinese username in the path isn't
+      // mangled into an ENOENT (see whereBinary).
+      if (!oaBin) oaBin = whereBinary('openagents');
+      if (!oaBin) {
+        this._log('Could not find openagents binary — MCP tools may not be available');
+        mcpCommand = 'openagents';
+      } else {
+        const resolved = this._resolveToNodeCmd(oaBin);
+        if (resolved) {
+          mcpCommand = resolved[0];
+          mcpFinalArgs = [...resolved.slice(1), ...mcpArgs];
+        } else {
+          mcpCommand = oaBin;
+        }
+      }
+    }
+
+    const mcpConfig = {
+      mcpServers: {
+        'openagents-workspace': {
+          type: 'stdio',
+          command: mcpCommand,
+          args: mcpFinalArgs,
+          env: {
+            OA_WORKSPACE_TOKEN: this.token,
+            // v1.1: who asked, so escalation tools can address the owner.
+            ...(this.requesterEmailFor && this.requesterEmailFor(channelName)
+              ? { OPENAGENTS_REQUESTER_EMAIL: this.requesterEmailFor(channelName) } : {}),
+          },
+        },
+      },
+    };
+
+    // Write MCP config to temp file (avoids cmd.exe JSON quoting issues)
+    const mcpDir = path.join(os.homedir(), '.openagents', 'mcp-configs');
+    fs.mkdirSync(mcpDir, { recursive: true });
+    const mcpFile = path.join(mcpDir, `mcp-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    fs.writeFileSync(mcpFile, JSON.stringify(mcpConfig));
+    cmd.push('--mcp-config', mcpFile);
+
+    return { cmd, mcpConfigFile: mcpFile };
+  }
+
+  /**
+   * Kill a persistent process for a channel and clean up its idle timer.
+   * Returns a promise that settles once the process has actually exited —
+   * callers that spawn a REPLACEMENT process for the same channel must await
+   * it, or the old process's exit handler races the new registration (and
+   * two live processes could resume the same CLI session concurrently).
+   */
+  _killPersistentProc(channel) {
+    const pp = this._persistentProcs[channel];
+    if (!pp) return Promise.resolve();
+    if (pp.idleTimer) clearTimeout(pp.idleTimer);
+    this._stopWatchdog(pp);
+    delete this._persistentProcs[channel];
+    return this._stopProcess(pp.proc).catch(() => {});
+  }
+
+  /**
+   * Drop a process's channel registrations, but only if they still point at
+   * THIS process. A killed predecessor's late exit event must never unhook
+   * the replacement that was registered after it.
+   */
+  _unregisterProc(channel, pp, proc) {
+    if (this._persistentProcs[channel] === pp) delete this._persistentProcs[channel];
+    if (this._channelProcesses[channel] === proc) delete this._channelProcesses[channel];
+  }
+
+  /**
+   * Reset the idle timer for a persistent process. Kills the process
+   * after _IDLE_TIMEOUT_MS of inactivity.
+   */
+  _resetIdleTimer(channel) {
+    const pp = this._persistentProcs[channel];
+    if (!pp) return;
+    if (pp.idleTimer) clearTimeout(pp.idleTimer);
+    pp.idleTimer = setTimeout(() => {
+      this._log(`Persistent process idle for ${this._IDLE_TIMEOUT_MS / 60000}min, releasing ${channel}`);
+      this._killPersistentProc(channel);
+    }, this._IDLE_TIMEOUT_MS);
+  }
+
+  /**
+   * Start a watchdog that kills the persistent process if stdout goes
+   * silent for too long while a message is in flight.  Pauses during
+   * tool execution (awaitingToolResult) since long-running commands
+   * like builds or sleep produce no stdout legitimately.
+   *
+   * It only stops the process. What the channel is told depends on what
+   * happens next, so the caller says it (see _silenceNotice): it used to post
+   * "became unresponsive and was restarted" itself, and the caller then also
+   * posted "No response generated (exit code unknown)".
+   */
+  _startWatchdog(pp) {
+    this._stopWatchdog(pp);
+    pp.lastStdoutTime = Date.now();
+    let consecutiveTimeouts = 0;
+
+    pp.watchdogTimer = setInterval(async () => {
+      if (!pp.messageResolve) { consecutiveTimeouts = 0; return; }
+      if (pp.awaitingToolResult) { consecutiveTimeouts = 0; return; }
+
+      const elapsed = Date.now() - pp.lastStdoutTime;
+      if (elapsed < this._WATCHDOG_INTERVAL_MS) { consecutiveTimeouts = 0; return; }
+
+      consecutiveTimeouts++;
+      pp.lastStdoutTime = Date.now();
+
+      if (consecutiveTimeouts === 2) {
+        try { await this.sendStatus(pp.msgChannel, 'Still processing...'); } catch {}
+      }
+
+      if (consecutiveTimeouts >= this._WATCHDOG_MAX_TIMEOUTS) {
+        const tail = this._stderrTail(pp);
+        this._log(`Watchdog: process unresponsive for ${consecutiveTimeouts * 15}s on ${pp.msgChannel} — killing`);
+        if (tail) this._log(`stderr: ${tail}`);
+        this._stopWatchdog(pp);
+        if (pp.messageResolve) {
+          const resolve = pp.messageResolve;
+          pp.messageResolve = null;
+          resolve({ exited: true, watchdog: true, stderrTail: tail, error: new Error('watchdog timeout') });
+        }
+        this._killPersistentProc(pp.msgChannel);
+      }
+    }, this._WATCHDOG_INTERVAL_MS);
+  }
+
+  /** How long the watchdog waits, in whole minutes, for the channel. */
+  _watchdogMinutes() {
+    return Math.max(1, Math.round((this._WATCHDOG_INTERVAL_MS * this._WATCHDOG_MAX_TIMEOUTS) / 60_000));
+  }
+
+  /**
+   * What the channel reads when the watchdog stopped a turn for good.
+   *
+   * Tool runs pause the watchdog, so silence this long is Claude waiting on
+   * the model. That is almost always the API or the relay not answering, and
+   * the user can check that; "the agent process became unresponsive" sent
+   * them looking at the agent instead.
+   */
+  _silenceNotice(stderrTail) {
+    return `Claude produced no output for ${this._watchdogMinutes()} minutes, so this turn was stopped. ` +
+      'This usually means the model API (or the relay this agent uses) is not responding. ' +
+      'Check it, then send the message again.' +
+      (stderrTail ? `\n\n\`\`\`\n${stderrTail}\n\`\`\`` : '');
+  }
+
+  /**
+   * A status line for Claude Code's own `api_retry` event, or '' when it
+   * carries nothing to show. Without it the channel saw nothing at all while
+   * the CLI retried a failing request for minutes.
+   */
+  _apiRetryStatus(event) {
+    const attempt = Number(event && event.attempt);
+    if (!attempt) return '';
+    const max = Number(event.max_retries);
+    const why = event.error_status
+      ? `HTTP ${event.error_status}`
+      : this._redact(String(event.error || '')).slice(0, 60).trim();
+    return `Claude's API request failed${why ? ` (${why})` : ''}, retrying (${max ? `${attempt}/${max}` : attempt})…`;
+  }
+
+  _stopWatchdog(pp) {
+    if (pp.watchdogTimer) { clearInterval(pp.watchdogTimer); pp.watchdogTimer = null; }
+  }
+
+  /**
+   * Spawn a persistent Claude process for a channel that accepts messages
+   * via stdin (--input-format stream-json). Returns the persistent proc entry.
+   */
+  _spawnPersistentProc(channel, cmd, cleanEnv) {
+    // Remove -p and its argument from cmd — prompts go via stdin
+    const filteredCmd = [];
+    for (let i = 0; i < cmd.length; i++) {
+      if (cmd[i] === '-p' || cmd[i] === '--print') {
+        // -p in stream-json mode is just a flag (no argument to skip)
+        // but _buildClaudeCmd passes [-p, prompt] — skip both
+        if (i + 1 < cmd.length && !cmd[i + 1].startsWith('-')) {
+          i++; // skip the prompt argument
+        }
+        continue;
+      }
+      filteredCmd.push(cmd[i]);
+    }
+    // Add stdin streaming flags
+    filteredCmd.push('--input-format', 'stream-json');
+    // Ensure -p is present (required for stream-json)
+    if (!filteredCmd.includes('-p') && !filteredCmd.includes('--print')) {
+      filteredCmd.splice(1, 0, '-p');
+    }
+
+    const resolved = this._resolveToNodeCmd(filteredCmd[0]);
+    let finalCmd = filteredCmd;
+    if (resolved) {
+      finalCmd = [...resolved, ...filteredCmd.slice(1)];
+    } else if (IS_WINDOWS && filteredCmd[0].toLowerCase().endsWith('.cmd')) {
+      finalCmd = ['cmd.exe', '/c', ...filteredCmd];
+    }
+
+    const proc = spawn(finalCmd[0], finalCmd.slice(1), {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: cleanEnv,
+      cwd: this.workingDir,
+      detached: !IS_WINDOWS,
+      windowsHide: true,
+    });
+
+    const pp = {
+      proc,
+      lineBuffer: '',
+      pendingLines: Promise.resolve(),
+      idleTimer: null,
+      messageResolve: null,
+      msgChannel: channel,
+      lastResponseText: [],
+      lastErrorText: '',
+      hasToolUseSinceLastText: false,
+      postedThinking: false,
+      everPostedAnything: false,
+      stderrBuf: '',
+      alive: true,
+      lastStdoutTime: Date.now(),
+      watchdogTimer: null,
+      awaitingToolResult: false,
+      userStopped: false,
+      // Background tasks (run_in_background Bash, background sub-agents) the
+      // CLI reports as still running, from its `background_tasks_changed`
+      // events. Killing the process kills them too, and a plan nudge sent
+      // while they run makes the agent re-announce work it is waiting on.
+      backgroundTasks: 0,
+    };
+
+    if (proc.stderr) {
+      proc.stderr.on('data', (chunk) => { pp.stderrBuf += chunk.toString('utf-8'); });
+    }
+
+    const processLine = async (line) => {
+      line = line.trim();
+      if (!line) return;
+      let event;
+      try { event = JSON.parse(line); } catch { return; }
+      const eventType = event.type;
+
+      // The user stopped this process. What it wrote before dying is still
+      // queued here, and posting any of it — a thinking block, a tool status,
+      // even the finished answer — lands after "Execution stopped by user."
+      // and makes the thread read as running again. Keep the session id so
+      // the next message resumes the conversation; drop everything else.
+      if (pp.userStopped) {
+        if (eventType === 'result' && event.session_id) {
+          this._channelSessions[pp.msgChannel] = event.session_id;
+          this._saveSessions();
+        }
+        if (eventType === 'result' && pp.messageResolve) {
+          pp.messageResolve({ resultEvent: event });
+          pp.messageResolve = null;
+        }
+        return;
+      }
+
+      if (eventType === 'assistant') {
+        if (typeof event.message?.model === 'string' && event.message.model.trim()) pp.responseModel = event.message.model.trim();
+        pp.awaitingToolResult = false;
+        const blocks = (event.message || {}).content || [];
+        for (const block of blocks) {
+          if (block.type === 'text' && block.text && block.text.trim()) {
+            if (pp.hasToolUseSinceLastText) {
+              pp.lastResponseText.length = 0;
+              pp.hasToolUseSinceLastText = false;
+            }
+            pp.lastResponseText.push(block.text.trim());
+            pp.postedThinking = true;
+            pp.everPostedAnything = true;
+            try { await this.sendThinking(pp.msgChannel, block.text.trim()); } catch {}
+          } else if (block.type === 'tool_use') {
+            pp.hasToolUseSinceLastText = true;
+            pp.postedThinking = false;
+            pp.lastResponseText.length = 0;
+            pp.awaitingToolResult = true;
+            const toolName = block.name || '';
+            if (toolName === 'TodoWrite' && block.input && block.input.todos) {
+              try {
+                const wsTodos = block.input.todos.map((t) => ({
+                  content: t.content, status: t.status || 'pending', assignee: t.assignee,
+                }));
+                await this.sendTodos(pp.msgChannel, wsTodos);
+              } catch {}
+            }
+            let inputPreview = '';
+            if (block.input && typeof block.input === 'object') {
+              const inp = block.input;
+              if (inp.command) inputPreview = inp.command;
+              else if (inp.file_path || inp.path) inputPreview = inp.file_path || inp.path;
+              else if (inp.pattern) inputPreview = inp.pattern;
+              else if (inp.query) inputPreview = inp.query;
+              else if (inp.url) inputPreview = inp.url;
+              else if (inp.content) inputPreview = inp.content.slice(0, 100);
+              else inputPreview = JSON.stringify(inp).slice(0, 150);
+            } else {
+              inputPreview = String(block.input || '').slice(0, 150);
+            }
+            await this.sendStatus(pp.msgChannel, `${toolName} › ${inputPreview}`);
+            pp.everPostedAnything = true;
+          }
+        }
+      } else if (eventType === 'result') {
+        pp.awaitingToolResult = false;
+        const sessionId = event.session_id;
+        if (sessionId) {
+          this._channelSessions[pp.msgChannel] = sessionId;
+          this._saveSessions();
+        }
+        if (event.is_error) {
+          // Capture the error so _handleMessage can surface it to the user.
+          // Without this, an auth/API failure (e.g. 401 invalid token) is only
+          // logged and the user just sees "No response generated", hiding the
+          // real cause and making it nearly impossible to diagnose.
+          pp.lastErrorText = String(event.result || '').trim();
+          this._log(`Claude error: ${pp.lastErrorText.slice(0, 200)}`);
+        }
+        if (pp.messageResolve) {
+          pp.messageResolve({ resultEvent: event });
+          pp.messageResolve = null;
+        } else {
+          // Background-triggered turn: the CLI produced output on its own after
+          // the user-initiated turn already resolved (e.g. a run_in_background
+          // task finished and fed its result back to the model). That text was
+          // streamed as `thinking` only — with no messageResolve waiting,
+          // _handleMessage never posts it as a `chat`, so the thread visually
+          // hangs on "thinking…/Working…". Finalize the accumulated text as a
+          // real answer so the turn settles on an actual message bubble.
+          const trailing = pp.lastResponseText.join('\n').trim();
+          if (trailing && !event.is_error) {
+            this._resetIdleTimer(pp.msgChannel);
+            try { await this.sendResponse(pp.msgChannel, trailing, { model: pp.responseModel }); } catch {}
+          }
+          pp.lastResponseText.length = 0;
+          // The plan nudge was held back while background work ran (see
+          // _queueTodoNudge); once the last task has reported, pick it up.
+          if (!event.is_error && pp.backgroundTasks === 0) {
+            await this._resumePlanAfterBackground(pp.msgChannel);
+          }
+        }
+      } else if (eventType === 'system') {
+        const subtype = event.subtype || '';
+        const message = event.message || '';
+        if (subtype === 'background_tasks_changed') {
+          pp.backgroundTasks = Array.isArray(event.tasks) ? event.tasks.length : 0;
+          return;
+        }
+        if (subtype === 'api_retry') {
+          const status = this._apiRetryStatus(event);
+          if (status) { try { await this.sendStatus(pp.msgChannel, status); } catch {} }
+          return;
+        }
+        if (subtype.includes('compact') || String(message).toLowerCase().includes('compact')) {
+          await this.sendStatus(pp.msgChannel, String(message) || 'Compacting conversation...');
+        }
+      } else if (eventType === 'rate_limit_event') {
+        this._log(`Rate limited: ${JSON.stringify(event).slice(0, 200)}`);
+      }
+    };
+
+    proc.stdout.on('data', (chunk) => {
+      pp.lineBuffer += chunk.toString('utf-8');
+      pp.lastStdoutTime = Date.now();
+      const lines = pp.lineBuffer.split('\n');
+      pp.lineBuffer = lines.pop();
+      for (const line of lines) {
+        pp.pendingLines = pp.pendingLines.then(() => processLine(line)).catch(() => {});
+      }
+    });
+
+    proc.on('exit', (code) => {
+      this._log(`Persistent process exited: channel=${channel} code=${code}`);
+      const tail = this._stderrTail(pp);
+      if (tail) this._log(`stderr: ${tail}`);
+      pp.alive = false;
+      if (pp.idleTimer) clearTimeout(pp.idleTimer);
+      this._stopWatchdog(pp);
+      if (pp.messageResolve) {
+        pp.messageResolve({ exited: true, code });
+        pp.messageResolve = null;
+      }
+      this._unregisterProc(channel, pp, proc);
+    });
+
+    proc.on('error', (err) => {
+      this._log(`Persistent process error: ${err.message}`);
+      pp.alive = false;
+      this._stopWatchdog(pp);
+      if (pp.messageResolve) {
+        pp.messageResolve({ exited: true, error: err });
+        pp.messageResolve = null;
+      }
+      this._unregisterProc(channel, pp, proc);
+    });
+
+    this._persistentProcs[channel] = pp;
+    this._channelProcesses[channel] = proc;
+    this._resetIdleTimer(channel);
+    return pp;
+  }
+
+  /**
+   * Send a user message to a persistent process via stdin and wait for
+   * the result event. Returns { resultEvent } on success or { exited, code }
+   * if the process dies mid-message.
+   */
+  _sendToPersistentProc(pp, content) {
+    pp.responseModel = null;
+    pp.lastResponseText = [];
+    pp.lastErrorText = '';
+    pp.hasToolUseSinceLastText = false;
+    pp.postedThinking = false;
+    pp.everPostedAnything = false;
+    pp.awaitingToolResult = false;
+
+    const stdinMsg = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: content }],
+      },
+    }) + '\n';
+
+    return new Promise((resolve) => {
+      pp.messageResolve = (result) => {
+        this._stopWatchdog(pp);
+        resolve(result);
+      };
+      pp.lastStdoutTime = Date.now();
+      this._startWatchdog(pp);
+      try {
+        pp.proc.stdin.write(stdinMsg);
+      } catch (e) {
+        this._log(`stdin write failed: ${e.message}`);
+        this._stopWatchdog(pp);
+        pp.messageResolve = null;
+        resolve({ exited: true, error: e });
+      }
+    });
+  }
+
+  /**
+   * What the CLI wrote to stderr this turn, trimmed and redacted, or ''.
+   *
+   * `stderrBuf` was collected and then read by nothing at all: when the process
+   * died before emitting a single JSON event, or hung without emitting one, the
+   * only account of why sat in a string no code path ever looked at. The channel
+   * got "No response generated" and the daemon log got an exit code, so a run
+   * that had the reason in hand reported none. codex, gemini and opencode all
+   * log their stderr on exit; this is that, plus the two paths — watchdog kill
+   * and silent exit — where it is the ONLY thing there is to report.
+   */
+  _stderrTail(pp) {
+    // Without Claude Code's harmless notices (an unknown relay model, the
+    // disabled connectors): posted as "the" error, they hid the real one.
+    const tail = stripCliNoise((pp && pp.stderrBuf) || '').trim();
+    return tail ? this._redact(tail).slice(-800) : '';
+  }
+
+  /**
+   * Turn a raw Claude `result` error into a user-facing message. Auth failures
+   * (401 / invalid token) are the most common real-world cause and are otherwise
+   * invisible — add a concrete hint about which env vars to check.
+   */
+  _formatClaudeError(text) {
+    const raw = String(text || '').trim() || 'Claude returned an error.';
+    // Matched on the raw text — redaction rewrites the very words the pattern
+    // below keys on — but only the redacted text is quoted: a `result` error
+    // is the provider's own message, and providers echo the key they rejected.
+    const msg = this._redact(raw);
+    // Both answer 403, which the auth rule below read as a bad key: a region
+    // the provider does not serve, and a relay account with no balance left
+    // ("403 organization balance exhausted").
+    const lower = raw.toLowerCase();
+    if (REGION_BLOCKED.test(lower)) {
+      return `Claude could not reach the model: ${msg}\n\n` +
+        'The provider refused requests from this device\'s network, usually because it does not serve this region. ' +
+        'The key or sign-in was not the problem: route Claude through a proxy in a supported region (HTTPS_PROXY), or point the agent at a different endpoint.';
+    }
+    if (CREDIT_EXHAUSTED.test(lower)) {
+      return `Claude's provider account is out of credit: ${msg}\n\n` +
+        'Add credit to that account, or switch this agent to a different API key or endpoint in the launcher.';
+    }
+    if (/401|403|authenticate|invalid.*(token|key|api)|无效的?\s*(令牌|密钥|key)/i.test(raw)) {
+      return `Claude authentication failed: ${msg}\n\n` +
+        'Check this agent\'s API key and Base URL in the launcher — the key may be invalid or expired.';
+    }
+    return `Claude error: ${msg}`;
+  }
+
+  /**
+   * Compose the final user-facing response for a finished turn, appending
+   * the newest plan file in plan mode. Shared by the persistent fast-path
+   * and the fresh-spawn path so their behavior can never drift.
+   */
+  _composeFinalResponse(pp) {
+    if (this._mode === 'plan') {
+      try {
+        const planDir = path.join(this.workingDir || defaultAgentWorkdir(this.agentName), '.claude', 'plans');
+        if (fs.existsSync(planDir)) {
+          const planFiles = fs.readdirSync(planDir)
+            .filter((f) => f.endsWith('.md'))
+            .map((f) => ({ name: f, mtime: fs.statSync(path.join(planDir, f)).mtimeMs }))
+            .sort((a, b) => b.mtime - a.mtime);
+          if (planFiles.length > 0) {
+            const planContent = fs.readFileSync(path.join(planDir, planFiles[0].name), 'utf-8').trim();
+            if (planContent) pp.lastResponseText.push('\n\n---\n\n**Plan:**\n\n' + planContent);
+          }
+        }
+      } catch {}
+    }
+    const response = pp.lastResponseText.join('\n').trim();
+    // Consume this turn before posting it. A persistent CLI can emit another
+    // turn when a background task finishes, without a new user message (and
+    // therefore without _sendToPersistentProc resetting the buffer).
+    pp.lastResponseText = [];
+    return response;
+  }
+
+  /** True when the CLI reported the resumed conversation no longer fits. */
+  _isPromptTooLong(pp, finalResponse) {
+    return /prompt is too long/i.test(finalResponse || '') ||
+      /prompt is too long/i.test(pp.lastErrorText || '');
+  }
+
+  /**
+   * Reset a channel's CLI session after its context outgrew the model
+   * window: clear the stored session id, kill the persistent process, and
+   * tell the user. This used to happen silently, which made the follow-up
+   * turn's partial memory look like the agent spontaneously forgot things.
+   */
+  async _resetSessionForPromptTooLong(msgChannel) {
+    this._log('Prompt too long, clearing session and retrying');
+    this._channelSessions[msgChannel] = null;
+    this._saveSessions();
+    await this._killPersistentProc(msgChannel);
+    try {
+      await this.sendStatus(
+        msgChannel,
+        'Claude context reached its limit. Starting a fresh session from the channel recap.'
+      );
+    } catch {}
+  }
+
+  /**
+   * Post the outcome of a finished turn: the final response, or the captured
+   * error, or — when the CLI ended with neither — a session-reset notice so
+   * the UI never hangs on "thinking…".
+   */
+  async _postTurnOutcome(pp, msgChannel, finalResponse) {
+    if (finalResponse) {
+      try { await this.sendResponse(msgChannel, finalResponse, { statusKind: pp.lastErrorText ? 'error' : 'completed', model: pp.responseModel }); } catch {}
+    } else if (pp.lastErrorText) {
+      try { await this.sendError(msgChannel, this._formatClaudeError(pp.lastErrorText)); } catch {}
+    } else if (!pp.everPostedAnything) {
+      if (this._channelSessions[msgChannel]) {
+        delete this._channelSessions[msgChannel];
+        try { this._saveSessions(); } catch {}
+        this._log(`Empty-error result — cleared session for ${msgChannel}`);
+      }
+      try { await this.sendError(msgChannel, 'The agent hit an error and could not respond. The session was reset — please send the message again.'); } catch {}
+    }
+  }
+
+  /** Queue a reminder about unfinished todos (skipped when this turn IS one). */
+  async _queueTodoNudge(msgChannel, msg) {
+    if (msg._todoNudge) return;
+    const nudge = await this._buildTodoNudge(msgChannel);
+    if (!nudge) return;
+    if (!this._channelQueues[msgChannel]) this._channelQueues[msgChannel] = [];
+    if (this._channelQueues[msgChannel].some((m) => m._todoNudge)) return;
+    this._channelQueues[msgChannel].push(nudge);
+  }
+
+  /**
+   * The "you have N remaining tasks" message, or null when there is nothing
+   * to nudge: no unfinished todos, a stop in progress, or background work
+   * still running in this channel's process (the agent has said it is waiting
+   * on it; nudging made it re-announce the plan — and, combined with a
+   * restart, re-launch work that had been killed). The nudge is picked up
+   * again once the background tasks report (_resumePlanAfterBackground).
+   */
+  async _buildTodoNudge(msgChannel) {
+    // A stop ends the plan, it does not pause it. When the stop lands while
+    // this turn is finishing, nudging here is what handed the agent its own
+    // "please continue" right after it announced it had stopped.
+    if (this._stoppingChannels.has(msgChannel)) return null;
+    const pp = this._persistentProcs[msgChannel];
+    if (pp && pp.alive && pp.backgroundTasks > 0) {
+      this._log(`Holding the plan nudge for ${msgChannel} — ${pp.backgroundTasks} background task(s) still running`);
+      return null;
+    }
+    try {
+      // Pending includes work waiting for a human or an earlier step.
+      // Only explicitly active work is eligible for automatic continuation.
+      const remaining = (await this.getRemainingTodos(msgChannel))
+        .filter((todo) => todo.status === 'in_progress');
+      if (remaining.length === 0) return null;
+      const items = remaining.map((t) => `- ${t.content}`).join('\n');
+      return {
+        content: `You have ${remaining.length} remaining task(s) from your plan:\n${items}\n\nPlease continue working on them.`,
+        senderType: 'system', senderName: 'system:todos',
+        sessionId: msgChannel, messageType: 'chat', _todoNudge: true,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Background work finished and the CLI wrapped it up on its own. If the
+   * plan still has open items, continue it now — queued behind a running
+   * turn, or as its own turn when the channel is idle.
+   */
+  async _resumePlanAfterBackground(msgChannel) {
+    const nudge = await this._buildTodoNudge(msgChannel);
+    if (!nudge) return;
+    if (this._channelBusy.has(msgChannel)) {
+      if (!this._channelQueues[msgChannel]) this._channelQueues[msgChannel] = [];
+      if (!this._channelQueues[msgChannel].some((m) => m._todoNudge)) this._channelQueues[msgChannel].push(nudge);
+      return;
+    }
+    this._channelWorker(msgChannel, nudge);
+  }
+
+  /**
+   * The pinned glossary, rendered exactly as in the system
+   * prompt, framed as replacing the copy the running session started with.
+   * Returns '' when nothing is pinned.
+   */
+  _pinnedUpdatePreamble(msgChannel, glossary) {
+    const sections = buildPinnedSections({
+      toolMode: this.toolMode,
+      channelName: msgChannel,
+      mode: this._mode,
+      glossary,
+    }).join('').trim();
+    if (!sections) return '';
+    return '[Pinned knowledge was updated since this session started. The ' +
+      'sections below replace the earlier versions in your instructions — ' +
+      'treat them as current.]\n\n' + sections;
+  }
+
+  /**
+   * Wait for the next `result` on an already-addressed process without
+   * writing anything to it. If the process stays completely silent for
+   * `quietMs` there is no second turn coming; resolve with { quiet: true } so
+   * the caller falls back to the ordinary empty-outcome handling. Once output
+   * starts, the regular watchdog takes over.
+   */
+  _awaitNextTurn(pp, quietMs = 20_000) {
+    const startedAt = Date.now();
+    return new Promise((resolve) => {
+      let quietTimer = null;
+      const finish = (r) => {
+        if (quietTimer) { clearInterval(quietTimer); quietTimer = null; }
+        this._stopWatchdog(pp);
+        resolve(r);
+      };
+      pp.messageResolve = finish;
+      quietTimer = setInterval(() => {
+        if (pp.lastStdoutTime > startedAt) {
+          clearInterval(quietTimer);
+          quietTimer = null;
+          this._startWatchdog(pp);
+        } else if (Date.now() - startedAt >= quietMs) {
+          pp.messageResolve = null;
+          finish({ quiet: true });
+        }
+      }, 500);
+      if (quietTimer.unref) quietTimer.unref();
+    });
+  }
+
+  async _handleMessage(msg) {
+    let content = (msg.content || '').trim();
+    const attachments = msg.attachments || [];
+
+    const attText = formatAttachmentsForPrompt(attachments, this.toolMode);
+    if (attText) {
+      content = content ? content + attText : attText.trim();
+    }
+
+    if (!content) return;
+
+    const msgChannel = msg.sessionId || this.channelName;
+    this._stoppingChannels.delete(msgChannel);
+    const sender = msg.senderName || msg.senderType || 'user';
+    this._log(`Processing message from ${sender} in ${msgChannel}: ${content.slice(0, 80)}...`);
+
+    // Auto-title + resume-from on first encounter
+    if (!this._titledSessions.has(msgChannel)) {
+      this._titledSessions.add(msgChannel);
+      try {
+        const info = await this.client.getSession(this.workspaceId, msgChannel, this.token);
+        const resumeFrom = info.resumeFrom;
+        if (resumeFrom && !this._channelSessions[msgChannel]) {
+          const sourceSession = this._channelSessions[resumeFrom];
+          if (sourceSession) {
+            this._channelSessions[msgChannel] = sourceSession;
+            this._saveSessions();
+            this._log(`Resuming channel ${msgChannel} from ${resumeFrom}`);
+          }
+        }
+        const title = generateSessionTitle(content);
+        if (title && !info.titleManuallySet && SESSION_DEFAULT_RE.test(info.title || '')) {
+          await this.client.updateSession(
+            this.workspaceId, msgChannel, this.token,
+            { title, autoTitle: true }
+          );
+        }
+      } catch {}
+    }
+
+    await this.sendStatus(msgChannel, 'thinking...');
+
+    // Read the channel's pinned knowledge (glossary) up front — the
+    // fast-path staleness check and any (re)spawn below both need it.
+    const glossary = await this._fetchGlossary(msgChannel);
+    // null fingerprint = a fetch failed, current state unknown; never treat
+    // that as a change (it would churn respawns on every workspace hiccup).
+    // The fingerprint covers entry ids AND content — both are pinned into
+    // the prompt, and a recreated entry can change id without changing content.
+    const pinnedHash = glossary.error
+      ? null
+      : pinnedFingerprint([
+        { entryId: glossary.entryId, content: glossary.content },
+      ]);
+    const glossaryOpt = (glossary.available && glossary.state === 'found' && glossary.content)
+      ? { enabled: true, entryId: glossary.entryId, content: glossary.content, scope: glossary.scope || 'channel' }
+      : null;
+
+    // ── Persistent process fast-path ──
+    // If we have a living persistent process for this channel, send via stdin
+    // instead of spawning a new CLI (saves ~2s startup time).
+    const existingPP = this._persistentProcs[msgChannel];
+    if (existingPP && existingPP.alive) {
+      // Everything below was baked into the process at spawn time — the
+      // system prompt AND the CLI permission flags (plan mode is read-only,
+      // execute skips permissions) — so a process from the other mode can
+      // never be reused. This check is deliberately independent of the
+      // pinned fingerprint: a failed knowledge fetch must not keep a
+      // read-only plan process serving execute requests.
+      const modeStale = existingPP.spawnMode !== this._mode;
+      const pinnedStale = pinnedHash !== null && existingPP.pinnedHash !== pinnedHash;
+      const modelStale = (existingPP.spawnModel || null) !== (this.workspaceModel || null);
+      if (modeStale || modelStale) {
+        // Kill it and fall through to a fresh spawn: --resume keeps the
+        // conversation (it lives in the CLI transcript), while the new spawn
+        // carries the current mode / model flags (and the current pins).
+        this._log(modeStale
+          ? `Mode changed to ${this._mode} for ${msgChannel} — respawning with resume`
+          : `Model changed to ${this.workspaceModel || '(default)'} for ${msgChannel} — respawning with resume`);
+        await this._killPersistentProc(msgChannel);
+      } else {
+        // A pinned-knowledge change no longer restarts the process. The
+        // restart killed whatever they had running in the background (a
+        // sub-agent mid-build) and replayed into a false "agent hit an error".
+        // The new version rides in with this message instead and supersedes
+        // the copy baked into the system prompt.
+        let turnContent = content;
+        if (pinnedStale) {
+          const update = this._pinnedUpdatePreamble(msgChannel, glossaryOpt);
+          if (update) turnContent = `${update}\n\n---\n\n${content}`;
+          existingPP.pinnedHash = pinnedHash;
+          this._log(`Pinned knowledge changed for ${msgChannel} — passing the update to the running session`);
+        } else {
+          this._log(`Reusing persistent process for ${msgChannel}`);
+        }
+        if (await this._bailOnStopDuringTurn(msgChannel)) return;
+        this._resetIdleTimer(msgChannel);
+        existingPP.msgChannel = msgChannel;
+        const result = await this._sendToPersistentProc(existingPP, turnContent);
+        if (existingPP.userStopped) {
+          await this._finishUserStop(msgChannel);
+          return;
+        }
+        if (result.resultEvent) {
+          const finalResponse = this._composeFinalResponse(existingPP);
+          if (this._isPromptTooLong(existingPP, finalResponse) && this._channelSessions[msgChannel]) {
+            // Fall through to the fresh-spawn path: the session id is gone,
+            // so it rebuilds context from the channel recap.
+            await this._resetSessionForPromptTooLong(msgChannel);
+          } else {
+            await this._postTurnOutcome(existingPP, msgChannel, finalResponse);
+            this._resetIdleTimer(msgChannel);
+            await this._queueTodoNudge(msgChannel, msg);
+            return;
+          }
+        } else {
+          // Process died mid-message — fall through to spawn a fresh one
+          this._log(`Persistent process died, falling back to fresh spawn for ${msgChannel}`);
+          if (result.watchdog) {
+            // A long-lived process can wedge on its own, so one restart is
+            // worth it. If the fresh one goes silent too, the spawn path below
+            // stops and says why.
+            try {
+              await this.sendStatus(
+                msgChannel,
+                `Claude produced no output for ${this._watchdogMinutes()} minutes. Restarting it and sending your message again.`,
+              );
+            } catch {}
+          }
+        }
+      }
+    }
+
+    let mcpConfigFile = null;
+    let cmd;
+    let seeded = false;
+
+    const cleanEnv = ClaudeAdapter._buildChildEnv(this.agentEnv || process.env);
+
+    // Spawn a persistent process and send the first message via stdin
+    let effectiveContent = content;
+    // The trigger's own text, before thread history was prepended to it.
+    const recapExclude = String(msg.originalContent ?? msg.content ?? '').trim();
+
+    // When starting without a session (no --resume), prepend channel
+    // history so the fresh CLI has conversation context.
+    if (!this._channelSessions[msgChannel]) {
+      try {
+        const recap = await this._buildChannelRecap(msgChannel, recapExclude, msg);
+        if (recap) effectiveContent = `${recap}\n\n---\n\n${content}`;
+      } catch {}
+    }
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (mcpConfigFile) { try { fs.unlinkSync(mcpConfigFile); } catch {} mcpConfigFile = null; }
+
+      if (attempt > 0) {
+        await this._killPersistentProc(msgChannel);
+        // Rebuild recap for retry without resume
+        try {
+          const recap = await this._buildChannelRecap(msgChannel, recapExclude, msg);
+          if (recap) effectiveContent = `${recap}\n\n---\n\n${content}`;
+        } catch {}
+      }
+
+      try {
+        const browserEnabled = await this.getBrowserEnabled();
+        const built = this._buildClaudeCmd(effectiveContent, msgChannel, {
+          skipResume: attempt > 0,
+          browserEnabled,
+          glossary: glossaryOpt,
+        });
+        cmd = built.cmd;
+        mcpConfigFile = built.mcpConfigFile;
+        seeded = !!built.seeded;
+      } catch (e) {
+        await this.sendError(msgChannel, e.message);
+        return;
+      }
+
+      try {
+        if (await this._bailOnStopDuringTurn(msgChannel)) return;
+        const pp = this._spawnPersistentProc(msgChannel, cmd, cleanEnv);
+        // Remember the spawn-time configuration so the fast-path can detect
+        // staleness on later messages — the pinned knowledge and the mode
+        // (which fixes both the system prompt and the permission flags).
+        // When the fetch errored (pinnedHash null) hash what was actually
+        // pinned, so the next successful fetch triggers a re-pin.
+        pp.pinnedHash = pinnedHash !== null ? pinnedHash : pinnedFingerprint([
+          { entryId: glossaryOpt && glossaryOpt.entryId, content: glossaryOpt && glossaryOpt.content },
+        ]);
+        pp.spawnMode = this._mode;
+        pp.spawnModel = this.workspaceModel || null;
+        const resumed = attempt === 0 && (!!this._channelSessions[msgChannel] || seeded);
+        this._log(`Spawned persistent process for ${msgChannel} (attempt ${attempt + 1})`);
+
+        let result = await this._sendToPersistentProc(pp, effectiveContent);
+
+        // A resumed session can first report something left over from before
+        // the restart — typically a background task that died with the old
+        // process — as a turn with no text and no error. That is not this
+        // message's answer: wait for the real turn instead of posting "the
+        // agent hit an error" and throwing the session away.
+        if (resumed && result.resultEvent && !pp.userStopped
+            && !pp.everPostedAnything && !pp.lastErrorText
+            && !this._composeFinalResponse(pp)) {
+          this._log(`Empty leftover result after resume for ${msgChannel} — waiting for the real turn`);
+          result = await this._awaitNextTurn(pp);
+        }
+
+        if (pp.userStopped) {
+          await this._finishUserStop(msgChannel);
+          break;
+        }
+
+        if (result.exited) {
+          this._log(`Process exited during first message (attempt ${attempt + 1})`);
+          if (result.watchdog) {
+            // Silence is not a session that failed to resume. Retrying without
+            // it threw the session away, posted "could not be resumed", and
+            // waited out the same silence again.
+            try { await this.sendError(msgChannel, this._silenceNotice(result.stderrTail)); } catch {}
+            break;
+          }
+          if (attempt === 0 && this._channelSessions[msgChannel]) {
+            this._log(`Stale session detected, retrying without resume`);
+            delete this._channelSessions[msgChannel];
+            this._saveSessions();
+            try {
+              await this.sendStatus(
+                msgChannel,
+                'Claude session could not be resumed. Rebuilding context from the channel recap.'
+              );
+            } catch {}
+            continue;
+          }
+          if (!pp.everPostedAnything) {
+            // stderr is the fallback, not nothing: a CLI that dies before its
+            // first JSON event leaves no `result` to read, and "No response
+            // generated. Please try again." is what turned those into an
+            // unreportable failure.
+            const detail = pp.lastErrorText || this._stderrTail(pp);
+            if (detail) {
+              try { await this.sendError(msgChannel, this._formatClaudeError(detail)); } catch {}
+            } else {
+              try { await this.sendError(msgChannel, `No response generated (exit code ${result.code === undefined ? 'unknown' : result.code}). Please try again.`); } catch {}
+            }
+          }
+          break;
+        }
+
+        // Success — post final response
+        const finalResponse = this._composeFinalResponse(pp);
+        if (this._isPromptTooLong(pp, finalResponse) && this._channelSessions[msgChannel]) {
+          await this._resetSessionForPromptTooLong(msgChannel);
+          continue;
+        }
+
+        await this._postTurnOutcome(pp, msgChannel, finalResponse);
+        this._resetIdleTimer(msgChannel);
+        await this._queueTodoNudge(msgChannel, msg);
+        break;
+      } catch (e) {
+        this._log(`Error handling message: ${e.message}`);
+        // EFTYPE: Windows refused to start the file as a program — in practice
+        // the claude-code package's placeholder claude.exe, left behind when
+        // its install script was skipped. The bare errno named nothing a user
+        // could act on.
+        const reason = (e && e.code === 'EFTYPE') || /\bEFTYPE\b/.test(String(e && e.message))
+          ? ClaudeAdapter.INSTALL_INCOMPLETE
+          : `Error processing message: ${this._redact(e.message)}`;
+        await this.sendError(msgChannel, reason);
+        break;
+      }
+    }
+
+    if (mcpConfigFile) {
+      try { fs.unlinkSync(mcpConfigFile); } catch {}
+    }
+  }
+}
+
+/**
+ * @anthropic-ai/claude-code ships a placeholder where its native binary goes
+ * and swaps the real one in from a postinstall script, copied out of a
+ * per-platform optional dependency. Skip that script (`ignore-scripts=true` in
+ * an npmrc, pnpm, bun) or lose that dependency (npm drops one whose download
+ * fails, or under omit=optional) and the placeholder is what runs: shell text
+ * on macOS/Linux, and on Windows a `claude.exe` the OS will not start (spawn
+ * EFTYPE). Which of the two happened is the installer's to find out; a
+ * reinstall from the launcher handles both (installer.finishNpmInstall).
+ */
+ClaudeAdapter.INSTALL_INCOMPLETE = 'Claude Code is installed, but its setup never finished, so the '
+  + '`claude` command is only a placeholder: either the @anthropic-ai/claude-code package\'s postinstall '
+  + 'script did not run (npm `ignore-scripts`, or a pnpm/bun install), or npm left out the per-platform '
+  + 'package that holds the native binary (its download failed, or optional dependencies are turned off). '
+  + 'Reinstall Claude Code from the launcher — or, for a copy you installed yourself, run '
+  + '`npm install -g @anthropic-ai/claude-code --ignore-scripts=false --include=optional` — then retry.';
+
+module.exports = ClaudeAdapter;

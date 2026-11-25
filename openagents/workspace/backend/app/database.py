@@ -1,0 +1,187 @@
+# -*- coding: utf-8 -*-
+"""
+Database connection and session management.
+
+Uses SQLAlchemy with any PostgreSQL database (not Supabase-specific).
+"""
+
+import os
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from sqlalchemy.pool import NullPool, QueuePool
+
+from app.config import config
+
+# Use NullPool for serverless (Vercel) or SQLite — no persistent connections.
+# Use QueuePool for long-running servers (Docker/uvicorn) with PostgreSQL.
+_is_serverless = os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+_is_sqlite = config.DATABASE_URL.startswith("sqlite")
+
+def install_sqlite_compat() -> None:
+    """Make SQLite behave enough like Postgres to run the app against it.
+
+    Applied for a dev/test SQLite database only. Idempotent — the test suite
+    calls it too, so the suite exercises the same shims the dev server runs
+    with instead of its own private copy.
+    """
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
+    # JSONB/UUID columns have no SQLite equivalent — compile them to types it has.
+    if not hasattr(SQLiteTypeCompiler, "_orig_visit_JSONB"):
+        SQLiteTypeCompiler._orig_visit_JSONB = True
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"
+        SQLiteTypeCompiler.visit_UUID = lambda self, type_, **kw: "TEXT"
+
+    # Make `DateTime(timezone=True)` columns round-trip through SQLite the way
+    # they do through Postgres: stored as UTC, loaded as aware UTC.
+    #
+    # SQLite has no timestamptz. Its storage format has no offset field, so a
+    # tz-aware datetime is written as its bare wall time and comes back NAIVE,
+    # while Postgres returns it aware. The missing tzinfo breaks anything
+    # comparing a loaded value against `datetime.now(timezone.utc)`, and
+    # `.isoformat()` then serializes without the offset, which browsers read
+    # as local time.
+    #
+    # Concretely, on a dev SQLite database no routine ever fired and the UI
+    # showed a freshly created one as overdue. The scheduler's atomic claim is
+    # an ORM-enabled UPDATE, and SQLAlchemy synchronizes the session after one
+    # by re-evaluating its WHERE clause in Python against the rows it already
+    # holds — so `next_fires_at <= now` compared a naive loaded value with an
+    # aware `now` and raised "can't compare offset-naive and offset-aware
+    # datetimes" every cycle. (The claim now skips that synchronization too,
+    # see `_fire_due_in_thread` in app/main.py.)
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    from sqlalchemy.dialects.sqlite.base import DATETIME as SQLiteDATETIME
+
+    if not hasattr(SQLiteDATETIME, "_orig_result_processor"):
+        SQLiteDATETIME._orig_result_processor = SQLiteDATETIME.result_processor
+
+        def _utc_aware_result_processor(self, dialect, coltype):
+            inner = SQLiteDATETIME._orig_result_processor(self, dialect, coltype)
+            if not self.timezone:
+                return inner
+
+            def process(value):
+                dt = inner(value) if inner is not None else value
+                if dt is not None and dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_timezone.utc)
+                return dt
+
+            return process
+
+        SQLiteDATETIME.result_processor = _utc_aware_result_processor
+
+    # The read side above labels every stored value UTC, which is only true if
+    # the write side stored UTC. SQLite's own bind processor drops the tzinfo
+    # without converting, so an aware datetime in any other zone would be
+    # written as its local wall time and read back hours off. Every write in
+    # the app is UTC today; this keeps that from being a precondition.
+    if not hasattr(SQLiteDATETIME, "_orig_bind_processor"):
+        SQLiteDATETIME._orig_bind_processor = SQLiteDATETIME.bind_processor
+
+        def _utc_bind_processor(self, dialect):
+            inner = SQLiteDATETIME._orig_bind_processor(self, dialect)
+            if not self.timezone:
+                return inner
+
+            def process(value):
+                if isinstance(value, _datetime) and value.tzinfo is not None:
+                    value = value.astimezone(_timezone.utc)
+                return inner(value) if inner is not None else value
+
+            return process
+
+        SQLiteDATETIME.bind_processor = _utc_bind_processor
+
+
+if _is_sqlite:
+    install_sqlite_compat()
+
+
+# A PgBouncer pooler in front of Postgres maintains its own backend pool,
+# so app-level pooling is redundant and causes stale-connection failures
+# ("SSL connection has been closed unexpectedly") because pgbouncer may
+# rotate or idle-kill the TCP connection our app still thinks is fresh.
+# Use NullPool in pgbouncer mode: each request opens a short-lived conn
+# that goes straight to pgbouncer (co-located, ~1ms overhead), and pgbouncer
+# multiplexes those onto a small fixed set of real Postgres backends — which
+# lifts the ~100-connection Postgres ceiling that forced the app pool down.
+#
+# Detected by Supabase's pooler port (:6543) OR an explicit DB_PGBOUNCER
+# flag. A self-hosted/Railway pgbouncer listens on a different port (commonly
+# 6432), so the port alone isn't a reliable signal — the flag is.
+_is_pgbouncer = (
+    ":6543/" in config.DATABASE_URL
+    or os.environ.get("DB_PGBOUNCER", "").strip().lower() in ("1", "true", "yes")
+)
+
+_pool_kwargs = (
+    {"poolclass": NullPool}
+    if _is_serverless or _is_sqlite or _is_pgbouncer
+    # Direct-PG mode (port 5432): keep a bounded per-worker pool.
+    # Sized for Railway Postgres max_connections=400 (raised from 200 via
+    # ALTER SYSTEM on 2026-06-12) at 2 replicas × 2 workers
+    # (WEB_CONCURRENCY=2): 2 × 2 × (40 + 8) = 192 max DB conns steady-state,
+    # leaving headroom for a rolling deploy (old + new replicas briefly
+    # coexist → up to 384 conns, under 400 minus the 3 superuser-reserved).
+    # Keep THREADPOOL_TOKENS in app/main.py equal to pool_size+max_overflow
+    # so `def` handlers queue for a thread instead of stampeding the pool.
+    # Blocking DB work must run in the threadpool, including DB phases of
+    # async handlers. A pool wait on the event loop also delays DB cleanup.
+    # Keep pool_timeout short (2s) so exhausted pools don't tie up threads.
+    else {"pool_pre_ping": True, "pool_size": int(os.environ.get("DB_POOL_SIZE", "40")), "max_overflow": int(os.environ.get("DB_MAX_OVERFLOW", "8")), "pool_recycle": 300, "pool_timeout": 2, "poolclass": QueuePool}
+)
+
+# Keep the TCP connection alive to survive NAT / firewall idle timeouts
+# between Railway egress and Supabase. Without these, idle connections
+# get silently FIN/RST'd and we see "SSL connection has been closed
+# unexpectedly" mid-query.
+# keepalives_idle=30: start probing after 30s of idle
+# keepalives_interval=10: probe every 10s
+# keepalives_count=3: drop the conn after 3 failed probes
+_connect_args = {}
+if not _is_sqlite:
+    _connect_args.update({
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+        # TCP-level timeout for the initial connect.
+        "connect_timeout": 10,
+    })
+
+# PgBouncer transaction mode doesn't support prepared statements or the
+# 'options' startup parameter. Disable SQLAlchemy statement caching so
+# no PREPARE/DEALLOCATE is issued.
+_engine_kwargs = {**_pool_kwargs}
+if _connect_args:
+    _engine_kwargs["connect_args"] = _connect_args
+if _is_pgbouncer:
+    _engine_kwargs["execution_options"] = {"no_cache": True}
+
+engine = create_engine(config.DATABASE_URL, **_engine_kwargs)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Bound application transactions, including lock waits in authentication and
+# channel updates. A pool checkout timeout cannot interrupt a query that already
+# owns a connection. Without these limits, one abandoned transaction can fill
+# every worker's pool with blocked requests and take both replicas out of service.
+# SET LOCAL works with transaction poolers and resets at commit/rollback. Apply
+# this to ORM sessions only: Alembic's connection-level DDL is unaffected.
+from app.db_timeouts import apply_transaction_timeouts
+
+event.listen(SessionLocal, "after_begin", apply_transaction_timeouts)
+
+Base = declarative_base()
+
+
+def get_db():
+    """FastAPI dependency that provides a database session."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

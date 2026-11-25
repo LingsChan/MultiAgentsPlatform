@@ -1,0 +1,544 @@
+/**
+ * Pure, side-effect-free helpers for the Kimi Code CLI adapter.
+ *
+ * Everything here is I/O-free and deterministic so it can be unit-tested
+ * without spawning the `kimi` binary or touching the network: the JSONL
+ * stream parser, the message interpreter, secret redaction, error/version
+ * classification, the argument builder, and the env mapping that turns the
+ * launcher's KIMI_* fields into the CLI's KIMI_MODEL_* provider variables.
+ *
+ * Verified against Kimi Code CLI v0.39.1 (`kimi -p --output-format
+ * stream-json`). The stream is JSONL on stdout where each line is a message:
+ *   {role:"assistant", content, tool_calls?:[{type:"function",id,function:{name,arguments}}]}
+ *   {role:"tool", tool_call_id, content}
+ *   {role:"meta", type:"system.version", version}
+ *   {role:"meta", type:"session.resume_hint", session_id, command, content}
+ *   {role:"meta", type:"turn.step.retrying", failed_attempt, next_attempt,
+ *                 max_attempts, delay_ms, error_name, error_message}
+ * Fatal errors arrive on stderr as `error: ...` lines. Exit codes: 0 success,
+ * 1 permanent failure (config/auth/quota), 75 transient (retryable).
+ *
+ * IMPORTANT product distinction: two Moonshot products install a `kimi`
+ * binary. Kimi Code CLI (npm `@moonshot-ai/kimi-code`) versions are 0.x and
+ * 2.x+ (current line); the legacy Python `kimi-cli` (PyPI) is 1.x and has a
+ * DIFFERENT headless interface. A 1.x `kimi --version` therefore means the
+ * WRONG product.
+ */
+
+'use strict';
+
+const crypto = require('crypto');
+
+// ---------------------------------------------------------------------------
+// Version / product classification
+// ---------------------------------------------------------------------------
+
+/** Pull a dotted version (e.g. "0.39.1") out of `kimi --version` output. */
+function parseKimiVersion(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const m = raw.match(/(\d+)\.(\d+)\.(\d+)(?:[-.][0-9A-Za-z.]+)?/);
+  return m ? m[0] : null;
+}
+
+/**
+ * Classify `kimi --version` output into a product identity.
+ * @returns {{version: string|null, product: 'kimi-code'|'legacy'|null}}
+ *   'kimi-code' → the real Kimi Code CLI (0.x, 2.x+) this adapter drives
+ *   'legacy'    → the wound-down Python kimi-cli (1.x) — incompatible
+ *   null        → undetermined (unparseable output); proceed leniently
+ */
+function classifyKimiVersion(rawVersion) {
+  const version = parseKimiVersion(rawVersion);
+  if (!version) return { version: null, product: null };
+  const major = parseInt(version.split('.')[0], 10);
+  return { version, product: major === 1 ? 'legacy' : 'kimi-code' };
+}
+
+// ---------------------------------------------------------------------------
+// Secret redaction (same patterns as the other CLI adapters)
+// ---------------------------------------------------------------------------
+
+const SECRET_PATTERNS = [
+  /\bsk-[A-Za-z0-9._-]{8,}\b/g,
+  /\b(?:or|rk|gsk|ghp|gho|ghu|ghs|github_pat)[-_][A-Za-z0-9._-]{12,}\b/g,
+  /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+];
+
+/** Redact obvious secret material from a free-text string. */
+function redactSecrets(text) {
+  if (text == null) return text;
+  let out = String(text);
+  for (const re of SECRET_PATTERNS) out = out.replace(re, '«redacted»');
+  return out;
+}
+
+/** Redact an argv array for logging. The prompt (arg after -p) is elided. */
+function redactArgs(args) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-p' || a === '--prompt') {
+      out.push(a, '«prompt»');
+      i++;
+      continue;
+    }
+    out.push(redactSecrets(a));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// JSONL stream parser
+// ---------------------------------------------------------------------------
+
+/** Line-buffered JSONL parser. push() returns complete parsed messages. */
+class KimiStreamParser {
+  constructor() {
+    this._buf = '';
+  }
+
+  /** @param {Buffer|string} chunk @returns {object[]} parsed messages */
+  push(chunk) {
+    this._buf += chunk.toString('utf-8');
+    const lines = this._buf.split('\n');
+    this._buf = lines.pop();
+    return parseLines(lines);
+  }
+
+  /** Flush any trailing partial line. */
+  flush() {
+    const rest = this._buf;
+    this._buf = '';
+    return parseLines([rest]);
+  }
+}
+
+function parseLines(lines) {
+  const out = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t || t[0] !== '{') continue;
+    try {
+      const obj = JSON.parse(t);
+      if (obj && typeof obj === 'object') out.push(obj);
+    } catch {
+      // Partial or non-JSON diagnostic line — skip.
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Message interpretation
+// ---------------------------------------------------------------------------
+
+/** Flatten a message `content` (string or array of text blocks) to a string. */
+function contentText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => (b && typeof b === 'object' && typeof b.text === 'string' ? b.text : ''))
+      .join('');
+  }
+  return '';
+}
+
+// Argument keys worth surfacing in a tool-status preview, best first.
+const PREVIEW_KEYS = ['command', 'path', 'file_path', 'pattern', 'url', 'query', 'prompt', 'description'];
+
+/** A short, redacted human preview for a tool call's JSON arguments. */
+function toolPreview(argsJson) {
+  let args;
+  try {
+    args = JSON.parse(argsJson);
+  } catch {
+    return '';
+  }
+  if (!args || typeof args !== 'object') return '';
+  for (const key of PREVIEW_KEYS) {
+    const v = args[key];
+    if (typeof v === 'string' && v.trim()) {
+      const one = redactSecrets(v.replace(/\s+/g, ' ').trim());
+      return one.length > 80 ? one.slice(0, 80) + '…' : one;
+    }
+  }
+  return '';
+}
+
+/**
+ * Map one parsed stream message to zero or more adapter events:
+ *   {kind:'text', text}                       assistant prose
+ *   {kind:'tool_start', name, preview}        a tool call was issued
+ *   {kind:'tool_result', id, text}            a tool finished
+ *   {kind:'session', sessionId}               resume hint (inline session id)
+ *   {kind:'retrying', attempt, maxAttempts, message}  provider retry
+ *   {kind:'version', version}                 stream preamble
+ */
+function interpretKimiMessage(msg) {
+  if (!msg || typeof msg !== 'object') return [];
+  const events = [];
+
+  if (msg.role === 'assistant') {
+    const text = contentText(msg.content).trim();
+    if (text) events.push({ kind: 'text', text });
+    if (Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        const fn = tc && typeof tc === 'object' ? tc.function : null;
+        const name = fn && typeof fn.name === 'string' ? fn.name : 'tool';
+        events.push({ kind: 'tool_start', name, preview: toolPreview(fn && fn.arguments) });
+      }
+    }
+    return events;
+  }
+
+  if (msg.role === 'tool') {
+    events.push({
+      kind: 'tool_result',
+      id: typeof msg.tool_call_id === 'string' ? msg.tool_call_id : '',
+      text: contentText(msg.content),
+    });
+    return events;
+  }
+
+  if (msg.role === 'meta') {
+    if (msg.type === 'session.resume_hint' && typeof msg.session_id === 'string' && msg.session_id) {
+      events.push({ kind: 'session', sessionId: msg.session_id });
+    } else if (msg.type === 'turn.step.retrying') {
+      events.push({
+        kind: 'retrying',
+        attempt: typeof msg.failed_attempt === 'number' ? msg.failed_attempt : 0,
+        maxAttempts: typeof msg.max_attempts === 'number' ? msg.max_attempts : 0,
+        message: typeof msg.error_message === 'string' ? redactSecrets(msg.error_message) : '',
+      });
+    } else if (msg.type === 'system.version') {
+      events.push({ kind: 'version', version: typeof msg.version === 'string' ? msg.version : '' });
+    }
+    return events;
+  }
+
+  return events;
+}
+
+// ---------------------------------------------------------------------------
+// Argument + environment builders
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the argv for one non-interactive run. Print mode (`-p`) already
+ * auto-approves tools — the CLI REJECTS combining it with --yolo/--auto/--plan
+ * (verified v0.39.1), so permission/plan flags must never be added here.
+ */
+function buildKimiArgs({ prompt, sessionId }) {
+  const args = [];
+  if (sessionId) args.push('-S', sessionId);
+  args.push('-p', prompt, '--output-format', 'stream-json');
+  return args;
+}
+
+const DEFAULT_KIMI_MODEL = 'kimi-k2.6';
+// The CLI defaults max_completion_tokens to the model's full context size
+// (262144), which OpenAI-compatible gateways reject (input+output > context).
+// A fixed, generous output budget works against both Moonshot and gateways.
+const DEFAULT_MAX_COMPLETION_TOKENS = '32768';
+
+/**
+ * Map the launcher's saved KIMI_* fields onto the env-var provider contract of
+ * Kimi Code CLI: setting KIMI_MODEL_NAME synthesizes an in-memory provider
+ * from KIMI_MODEL_API_KEY (required) + KIMI_MODEL_BASE_URL +
+ * KIMI_MODEL_PROVIDER_TYPE, bypassing `kimi login`.
+ *
+ * With no API key configured, the env is passed through untouched so the
+ * CLI's own `kimi login` credentials / config.toml apply.
+ *
+ * @returns {{env: object, viaEnvProvider: boolean}}
+ */
+function buildKimiEnv(agentEnv) {
+  const env = { ...(agentEnv || {}) };
+  const apiKey =
+    env.KIMI_MODEL_API_KEY ||
+    env.KIMI_API_KEY ||
+    env.MOONSHOT_API_KEY ||
+    '';
+  if (!apiKey) return { env, viaEnvProvider: false };
+
+  env.KIMI_MODEL_API_KEY = apiKey;
+  if (!env.KIMI_MODEL_NAME) env.KIMI_MODEL_NAME = env.KIMI_MODEL || DEFAULT_KIMI_MODEL;
+  const baseUrl = env.KIMI_MODEL_BASE_URL || env.KIMI_BASE_URL;
+  if (baseUrl) env.KIMI_MODEL_BASE_URL = baseUrl.replace(/\/$/, '');
+  if (!env.KIMI_MODEL_PROVIDER_TYPE) env.KIMI_MODEL_PROVIDER_TYPE = 'kimi';
+  if (!env.KIMI_MODEL_MAX_COMPLETION_TOKENS) {
+    env.KIMI_MODEL_MAX_COMPLETION_TOKENS = DEFAULT_MAX_COMPLETION_TOKENS;
+  }
+  return { env, viaEnvProvider: true };
+}
+
+// ---------------------------------------------------------------------------
+// Session journal location
+// ---------------------------------------------------------------------------
+
+/**
+ * The directory Kimi Code CLI files a working directory's sessions under:
+ * `<KIMI_CODE_HOME>/sessions/<key>/<session id>/`. Mirrors the CLI's own
+ * `encodeWorkDirKey` (v0.42.0): `wd_` + a slug of the last path segment + `_` +
+ * the first 12 hex of sha256 over the path with `\` turned into `/` and no
+ * trailing slash. Case is kept, so `C:\Users\86177` → `wd_86177_5d6fa4a9b53d`.
+ */
+function encodeKimiWorkDirKey(workDir) {
+  const normalized = String(workDir).replace(/\\/g, '/').replace(/\/+$/, '');
+  let slug = (normalized.split('/').pop() ?? normalized)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40)
+    .replace(/^-+|-+$/g, '');
+  if (slug === '' || slug === '.' || slug === '..') slug = 'workspace';
+  const hash = crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+  return `wd_${slug}_${hash}`;
+}
+
+// ---------------------------------------------------------------------------
+// What a session journal says is still running
+// ---------------------------------------------------------------------------
+
+/**
+ * Follows a session journal (`agents/main/wire.jsonl`) as it grows and keeps
+ * the tool calls and background tasks it shows as started but not finished.
+ *
+ * Print mode says nothing while a tool runs — not even the tool call, which
+ * only comes out with its result — but the journal records each step as it
+ * happens (verified v2.5.2):
+ *   {type:"context.append_loop_event", event:{type:"step.begin"}}              a model step starts
+ *   {type:"context.append_loop_event", event:{type:"tool.call", toolCallId}}    a tool starts
+ *   {type:"context.append_loop_event", event:{type:"tool.result", toolCallId}}  it ends
+ *   {type:"task.started", info:{taskId}} / {type:"task.terminated", info:{taskId}}
+ *     a background task (Bash run_in_background), which the run waits on
+ * Every record carries `time`, ms since the epoch. Kimi bounds both itself: a
+ * foreground command at 300s, a task at its timeoutMs.
+ *
+ * A record from before `since` (the run's start) opens nothing: it belongs to
+ * an earlier run, maybe one that was stopped mid-tool. A step begins only
+ * after the previous step's tools have returned, so `step.begin` closes any
+ * call still open — as does `turn.ended`; a task outlives both. Lines it does
+ * not know are skipped. A journal whose shape changed reads as "nothing
+ * running", or — if starts are still recognized and ends are not — as a
+ * tool running until the next step: never as a reason to stop a run earlier.
+ */
+class KimiWireTracker {
+  constructor({ since = 0 } = {}) {
+    this._since = since;
+    this._partial = '';
+    this.toolCalls = new Set();
+    this.tasks = new Set();
+  }
+
+  /** Feed the next chunk of the file. */
+  push(chunk) {
+    const lines = (this._partial + chunk).split('\n');
+    this._partial = lines.pop();
+    for (const line of lines) {
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (!e || typeof e !== 'object') continue;
+      const current = !(typeof e.time === 'number' && e.time < this._since);
+      const ev = e.event && typeof e.event === 'object' ? e.event : null;
+      if (e.type === 'context.append_loop_event' && ev && ev.type === 'step.begin') {
+        this.toolCalls.clear();
+      } else if (e.type === 'context.append_loop_event' && ev && typeof ev.toolCallId === 'string') {
+        if (ev.type === 'tool.call' && current) this.toolCalls.add(ev.toolCallId);
+        else if (ev.type === 'tool.result') this.toolCalls.delete(ev.toolCallId);
+      } else if ((e.type === 'task.started' || e.type === 'task.terminated') && e.info && typeof e.info.taskId === 'string') {
+        if (e.type === 'task.started') { if (current) this.tasks.add(e.info.taskId); }
+        else this.tasks.delete(e.info.taskId);
+      } else if (e.type === 'turn.ended') {
+        this.toolCalls.clear();
+      }
+    }
+  }
+
+  /** Whether a tool call or a background task is still running. */
+  get busy() {
+    return this.toolCalls.size > 0 || this.tasks.size > 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+
+// Kimi Code CLI's documented exit codes.
+const EXIT_PERMANENT = 1;
+const EXIT_TRANSIENT = 75;
+
+/** Extract the message from `error: ...` lines on stderr (last one wins). */
+function extractStderrError(stderrText) {
+  if (!stderrText) return '';
+  let last = '';
+  for (const line of String(stderrText).split('\n')) {
+    const m = line.match(/^\s*error:\s*(.+)$/i);
+    if (m) last = m[1].trim();
+  }
+  // Strip the CLI's wrapper prefix so the user sees the actual cause.
+  return redactSecrets(last.replace(/^failed to run prompt:\s*/i, ''));
+}
+
+/**
+ * Classify a failed run into a user-facing message.
+ * @param {{code: number|null, signal: string|null, stderrText: string, retryMessage: string, timedOutMs?: number, timedOutInTool?: boolean}} info
+ *   `timedOutMs` is set when the adapter's idle watchdog stopped the run after
+ *   that long without any sign of progress; `timedOutInTool` when a tool call
+ *   or background task was still running then (see KimiWireTracker).
+ * @returns {{kind: string, userMessage: string}}
+ */
+function classifyKimiError(info) {
+  const { code, signal, stderrText, retryMessage, timedOutMs, timedOutInTool } = info || {};
+  const detail = extractStderrError(stderrText) || redactSecrets(retryMessage || '');
+
+  // The watchdog's own stop wins: the signal it leaves behind (SIGINT on
+  // Windows) explains nothing, and stderr by then holds whatever tools printed.
+  // "No progress" read as a hang; in print mode Kimi says nothing while the
+  // model works on a step, so the message says what was actually seen.
+  if (timedOutMs) {
+    const minutes = Math.max(1, Math.round(timedOutMs / 60000));
+    return {
+      kind: 'timeout',
+      userMessage:
+        (timedOutInTool
+          ? `A command or task Kimi started was still running after about ${minutes} min with no output, so Kimi was stopped. ` +
+            'Send the request again, or ask Kimi to split the long command into smaller parts.'
+          : `Kimi printed nothing for about ${minutes} min and was stopped. Kimi prints nothing while the model ` +
+            'works on a step, so a very long step looks the same as a stuck one. ' +
+            'Send the request again, or break a long task into smaller steps.') +
+        (detail ? `\n\nDetails: ${detail}` : ''),
+    };
+  }
+
+  // Bounded: a bare 401 matched request ids, and `invalid.{0,20}token` turned
+  // "Invalid value for max_tokens" into a bad key and a `kimi login` hint.
+  if (/auth_error|\b401\b|unauthorized|invalid[\s_-]*(api[\s_-]?key|token|authentication)\b|credential/i.test(detail)) {
+    return {
+      kind: 'auth',
+      userMessage:
+        'Kimi authentication failed. Check KIMI_API_KEY in the launcher, or run `kimi login` in a terminal.' +
+        (detail ? `\n\nDetails: ${detail}` : ''),
+    };
+  }
+  if (/no model configured|llm not set|kimi_model_api_key is missing/i.test(detail)) {
+    return {
+      kind: 'config',
+      userMessage:
+        'Kimi Code CLI is not configured. Set KIMI_API_KEY (plus optional KIMI_BASE_URL / KIMI_MODEL) ' +
+        'in the launcher, or run `kimi login` in a terminal.',
+    };
+  }
+  if (/rate.?limit|429|quota|insufficient.{0,20}balance/i.test(detail)) {
+    return {
+      kind: 'rate_limit',
+      userMessage: `Kimi hit a rate/quota limit. Please retry shortly.${detail ? `\n\nDetails: ${detail}` : ''}`,
+    };
+  }
+  if (/context length|maximum context|too many tokens/i.test(detail)) {
+    return {
+      kind: 'context',
+      userMessage: `The request exceeded the model's context limits.${detail ? `\n\nDetails: ${detail}` : ''}`,
+    };
+  }
+  if (code === EXIT_TRANSIENT) {
+    return {
+      kind: 'transient',
+      userMessage: `Kimi hit a temporary provider error — please try again.${detail ? `\n\nDetails: ${detail}` : ''}`,
+    };
+  }
+  if (detail) {
+    return { kind: 'error', userMessage: `Kimi failed: ${detail}` };
+  }
+  const why = signal ? `terminated by signal ${signal}` : `exited with code ${code}`;
+  return { kind: 'error', userMessage: `Kimi Code CLI ${why}.` };
+}
+
+// ---------------------------------------------------------------------------
+// Workspace tools (MCP) through a private Kimi home
+// ---------------------------------------------------------------------------
+
+/**
+ * Kimi Code has no flag for an MCP config and ignores a project-level
+ * `.kimi-code/mcp.json`; it reads MCP servers from `$KIMI_CODE_HOME/mcp.json`
+ * (2.4.1). Each agent therefore runs with its own Kimi home under
+ * ~/.openagents, so the workspace server can be added without editing the
+ * user's ~/.kimi-code. Kimi passes its whole environment to stdio MCP
+ * servers, so the file names only the command: the token, workspace and
+ * channel of each run travel in the environment (see buildKimiWorkspaceEnv).
+ */
+const KIMI_MCP_SERVER_NAME = 'openagents-workspace';
+
+/**
+ * Entries of the user's Kimi home a private home links back to: the
+ * `kimi login` credentials (a directory, so token refreshes land in the
+ * user's home) and config.toml (providers and default model for the
+ * no-API-key route).
+ */
+const KIMI_HOME_LINKS = [
+  { name: 'credentials', dir: true },
+  { name: 'config.toml', dir: false },
+];
+
+/** Directory name of an agent's private Kimi home: readable, unique per workspace+agent. */
+function kimiHomeName(workspaceId, agentName) {
+  const raw = `${workspaceId == null ? '' : workspaceId}\u0000${agentName == null ? '' : agentName}`;
+  const hash = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 8);
+  const slug = (v) => String(v == null ? '' : v).toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'agent';
+  return `${slug(workspaceId)}_${slug(agentName)}-${hash}`;
+}
+
+/**
+ * The private home's mcp.json: the user's own MCP servers (so a private home
+ * loses nothing the user configured) plus the workspace server, which always
+ * wins its name. An unreadable user file contributes nothing.
+ */
+function buildKimiMcpConfig(userConfig, server) {
+  const base = userConfig && typeof userConfig === 'object' && !Array.isArray(userConfig) ? userConfig : {};
+  const servers = base.mcpServers && typeof base.mcpServers === 'object' && !Array.isArray(base.mcpServers)
+    ? { ...base.mcpServers }
+    : {};
+  servers[KIMI_MCP_SERVER_NAME] = server;
+  return { ...base, mcpServers: servers };
+}
+
+/** What the workspace MCP server reads from its environment (cli.js `mcp-server`). */
+function buildKimiWorkspaceEnv({ token, workspaceId, channel, agentName, endpoint }) {
+  const env = {
+    OPENAGENTS_WORKSPACE_ID: String(workspaceId || ''),
+    OPENAGENTS_CHANNEL_NAME: String(channel || 'general'),
+    OPENAGENTS_AGENT_NAME: String(agentName || 'agent'),
+  };
+  if (endpoint) env.OPENAGENTS_ENDPOINT = String(endpoint);
+  if (token) env.OA_WORKSPACE_TOKEN = String(token);
+  return env;
+}
+
+module.exports = {
+  parseKimiVersion,
+  classifyKimiVersion,
+  redactSecrets,
+  redactArgs,
+  KimiStreamParser,
+  interpretKimiMessage,
+  contentText,
+  toolPreview,
+  buildKimiArgs,
+  buildKimiEnv,
+  encodeKimiWorkDirKey,
+  KimiWireTracker,
+  extractStderrError,
+  classifyKimiError,
+  DEFAULT_KIMI_MODEL,
+  DEFAULT_MAX_COMPLETION_TOKENS,
+  EXIT_PERMANENT,
+  EXIT_TRANSIENT,
+  KIMI_MCP_SERVER_NAME,
+  KIMI_HOME_LINKS,
+  kimiHomeName,
+  buildKimiMcpConfig,
+  buildKimiWorkspaceEnv,
+};

@@ -1,0 +1,151 @@
+import React from "react"
+import { Bell } from "lucide-react"
+import { useShallow } from "zustand/react/shallow"
+import { useTranslation } from "react-i18next"
+
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@renderer/components/ui/popover"
+import { Button } from "@renderer/components/ui/button"
+import { useNotificationsStore } from "@renderer/store/notifications"
+import {
+  canRouteNotification,
+  routeNotification,
+} from "@renderer/hooks/useNotificationRouting"
+import { cn } from "@renderer/lib/utils"
+import { HeaderTooltip } from "./header-tooltip"
+import type { NotifRecord } from "@renderer/types"
+
+/** Beyond this the list is history nobody scrolls to; keeps the popover cheap. */
+const MAX_VISIBLE = 30
+
+export function NotificationBell({
+  className,
+}: {
+  className?: string
+}): React.JSX.Element {
+  const { t } = useTranslation()
+  const { items, unread, markRead, markAllRead, clear } = useNotificationsStore(
+    useShallow((s) => ({
+      items: s.items,
+      unread: s.unread,
+      markRead: s.markRead,
+      markAllRead: s.markAllRead,
+      clear: s.clear,
+    })),
+  )
+  const [open, setOpen] = React.useState(false)
+
+  // Routing lives in `useNotificationRouting`, not here. This list used to read
+  // `payload.tab` and nothing else, which is a strict subset of what the
+  // payloads carry: it sent "amp has an update" to the marketplace list instead
+  // of to amp, and did nothing whatsoever for the launcher's own update, whose
+  // payload names a Settings section rather than a tab.
+  const openNotification = (record: NotifRecord): void => {
+    if (!record.read) void markRead(record.id)
+    if (routeNotification(record)) setOpen(false)
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <HeaderTooltip label={t("nav.notifications.tooltip")}>
+        <PopoverTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label={t("nav.notifications.tooltip")}
+            className={cn(
+              "relative size-8 text-muted-foreground hover:text-foreground",
+              className,
+            )}
+          >
+            <Bell className="size-4" />
+            {unread > 0 && (
+              // Inside the button's own box: hanging off its corner, the count ran
+              // into the window's edge at the end of the header.
+              <span className="absolute top-0.5 right-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-destructive px-1 text-xs leading-none font-semibold text-white ring-2 ring-background">
+                {unread > 99 ? "99+" : unread}
+              </span>
+            )}
+          </Button>
+        </PopoverTrigger>
+      </HeaderTooltip>
+
+      {/* The bell sits at the right of the header, so the list drops below
+          it, aligned to its right edge, capped at the room below. */}
+      <PopoverContent
+        align="end"
+        side="bottom"
+        data-panel="notifications"
+        className="flex max-h-[min(32rem,var(--radix-popover-content-available-height))] w-85 flex-col p-0"
+      >
+        <div className="flex shrink-0 items-center justify-between border-b px-3 py-2.5">
+          <div className="text-sm font-semibold">
+            {t("nav.notifications.title")}
+            {unread > 0 && (
+              <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+                {t("nav.notifications.unread", { count: unread })}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1">
+            {unread > 0 && (
+              <Button variant="ghost" size="sm" className="h-auto px-1.5 py-0.5 text-xs" onClick={() => markAllRead()}>
+                {t("nav.notifications.markAllRead")}
+              </Button>
+            )}
+            {items.length > 0 && (
+              <Button
+                variant="destructive"
+                size="sm"
+                className="h-auto px-1.5 py-0.5 text-xs"
+                onClick={() => clear()}
+              >
+                {t("nav.notifications.clear")}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {items.length === 0 ? (
+          <p className="px-4 py-8 text-center text-xs text-muted-foreground">
+            {t("nav.notifications.empty")}
+          </p>
+        ) : (
+          // The list scrolls, the header stays. A ScrollArea capped with
+          // max-height never clipped: its viewport grew with the list.
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <ul className="m-0 list-none p-0">
+              {items.slice(0, MAX_VISIBLE).map((r) => {
+                // Only the rows that lead somewhere look like they do. An
+                // informational entry still marks itself read on click, it just
+                // does not advertise a destination it does not have.
+                const routable = canRouteNotification(r)
+                return (
+                  <li
+                    key={r.id}
+                    onClick={() => openNotification(r)}
+                    className={cn(
+                      "border-b px-3 py-2 last:border-b-0",
+                      routable
+                        ? "cursor-pointer hover:bg-accent"
+                        : "cursor-default",
+                      !r.read && "bg-accent/60",
+                    )}
+                  >
+                    <div className="truncate text-xs font-medium">{r.title}</div>
+                    <div className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
+                      {r.body}
+                    </div>
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        )}
+      </PopoverContent>
+    </Popover>
+  )
+}

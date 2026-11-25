@@ -1,0 +1,297 @@
+import React, { useState } from "react"
+import { useTranslation } from "react-i18next"
+import { Plus, RefreshCw } from "lucide-react"
+
+import { PageHeader } from "@renderer/components/layout/page-header"
+import { Button } from "@renderer/components/ui/button"
+import { Spinner } from "@renderer/components/ui/spinner"
+import { ItemGroup } from "@renderer/components/ui/item"
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+} from "@renderer/components/ui/empty"
+import { WorkspaceCard } from "@renderer/components/workspaces/workspace-card"
+import { WorkspaceQuickConnect } from "@renderer/components/workspaces/WorkspaceQuickConnect"
+import { WorkspaceRemoveDialog } from "@renderer/components/workspaces/WorkspaceRemoveDialog"
+import { WorkspaceRevokedNotice } from "@renderer/components/workspaces/WorkspaceRevokedNotice"
+import { WorkspaceRenameDialog } from "@renderer/components/workspaces/WorkspaceRenameDialog"
+import { useConnectionsStore } from "@renderer/store/connections"
+import { useUiStore } from "@renderer/store/ui"
+import { useWorkspacePrefs } from "@renderer/store/workspace-prefs"
+import { workspaceUrl } from "@renderer/lib/workspace-urls"
+import type { Workspace } from "@renderer/types"
+import { cn } from "@renderer/lib/utils"
+import type { ToastType } from "@renderer/hooks/useToast"
+import {
+  useWorkspacesData,
+  type WorkspaceFilter,
+  type WorkspaceSort,
+} from "./use-workspaces-data"
+import { useWorkspaceOpening } from "./use-workspace-opening"
+import { WorkspacesToolbar } from "./components/workspaces-toolbar"
+import { WorkspacesEmpty } from "./components/workspaces-empty"
+
+/**
+ * Search, filters and sort earn their row only past this many workspaces. A
+ * device usually joins one to three, and a toolbar of four filters over a
+ * single card was most of the page.
+ */
+const TOOLBAR_MIN = 6
+
+interface Props {
+  showToast: (msg: string, type?: ToastType) => void
+}
+
+export default function Workspaces({ showToast }: Props): React.JSX.Element {
+  const { t } = useTranslation()
+  const refreshConnections = useConnectionsStore((s) => s.refresh)
+  const markUsed = useWorkspacePrefs((s) => s.markUsed)
+  const pendingCreate = useUiStore((s) => s.pendingCreate)
+  const clearPendingCreate = useUiStore((s) => s.clearPendingCreate)
+  const [search, setSearch] = useState("")
+  const [filter, setFilter] = useState<WorkspaceFilter>("all")
+  const [sort, setSort] = useState<WorkspaceSort>("recent")
+  const [quickOpen, setQuickOpen] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  // The card's own view of the pairing rides along: a workspace that already
+  // dropped this device gets a different prompt, and by then the local pairing
+  // record is gone, so the workspace object alone can no longer tell us.
+  const [removeTarget, setRemoveTarget] = useState<{
+    ws: Workspace
+    revoked: boolean
+  } | null>(null)
+  const [removing, setRemoving] = useState(false)
+  const [renameTarget, setRenameTarget] = useState<Workspace | null>(null)
+
+  const {
+    workspaces,
+    aliases,
+    setAliases,
+    filtered,
+    stats,
+    loading,
+    reload,
+    notices,
+  } = useWorkspacesData(search, filter, sort)
+
+  const openQuick = (): void => setQuickOpen(true)
+
+  const runRefresh = (): void => {
+    setRefreshing(true)
+    void reload().finally(() => setRefreshing(false))
+  }
+
+  React.useEffect(() => {
+    refreshConnections()
+  }, [refreshConnections])
+
+  // "Add workspace" from anywhere else — the dashboard, the command palette —
+  // lands here with the dialog requested. Clearing the flag keeps a later tab
+  // click from re-opening it.
+  React.useEffect(() => {
+    if (pendingCreate !== "workspace") return
+    openQuick()
+    clearPendingCreate()
+  }, [pendingCreate, clearPendingCreate])
+
+  const copyUrl = async (ws: Workspace): Promise<void> => {
+    markUsed(ws.id)
+    try {
+      await navigator.clipboard.writeText(workspaceUrl(ws))
+      showToast(t("workspaces.toast.urlCopied"), "success")
+    } catch {
+      showToast(t("workspaces.toast.copyFailed"), "error")
+    }
+  }
+
+  const { canOpenInApp, browserOnlyReason, openWorkspace, openInBrowser } =
+    useWorkspaceOpening(markUsed)
+
+  const performRemove = async (deleteRemote: boolean): Promise<void> => {
+    if (!removeTarget) return
+    const { ws, revoked } = removeTarget
+    // Same display name the confirm dialog shows.
+    const name = aliases[ws.id] || ws.name || ws.slug || ws.id
+    setRemoving(true)
+    try {
+      // No "removing…" progress toast — a single toast (below) is the only
+      // feedback, so a quick remove doesn't stack two notifications.
+      const res = await window.api.removeWorkspace(ws.slug || ws.id, {
+        deleteRemote,
+      })
+      await reload()
+      // The local half always went through; a warning means the server did not
+      // hear about it (offline), so the device may linger in the workspace's
+      // node list until it times out. Worth saying, not worth an error.
+      if (res.warning) {
+        showToast(
+          t("workspaces.toast.removedWarning", { name, message: res.warning }),
+          "warning",
+        )
+      } else {
+        showToast(
+          t(
+            deleteRemote
+              ? "workspaces.toast.deleted"
+              : revoked
+                ? "workspaces.toast.cleared"
+                : "workspaces.toast.removed",
+            { name },
+          ),
+          "success",
+        )
+      }
+      setRemoveTarget(null)
+    } catch (err) {
+      showToast(t("workspaces.toast.error", { message: (err as Error).message }), "error")
+    } finally {
+      setRemoving(false)
+    }
+  }
+
+  return (
+    <section className="flex h-full flex-col">
+      <PageHeader
+        title={t("workspaces.title")}
+        subtitle={t("workspaces.subtitle")}
+        // The page's one way to join, at the header's right where every other
+        // page keeps its action. Joins, never creates: the dialog takes a
+        // pairing code for a workspace that already exists, and a device can
+        // hold several at once, so it stays however many are listed.
+        // Refresh beside it, labelled like every other page-level refresh, so
+        // it stays in reach while the toolbar is hidden.
+        actions={
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              disabled={refreshing}
+              onClick={runRefresh}
+            >
+              <RefreshCw
+                data-icon="inline-start"
+                className={cn(refreshing && "animate-spin")}
+              />
+              {t("workspaces.refresh")}
+            </Button>
+            <Button data-testid="workspace-join-open" onClick={openQuick}>
+              <Plus data-icon="inline-start" />
+              {t("workspaces.join")}
+            </Button>
+          </div>
+        }
+      />
+
+      {/* No stats row and no device line: each card says its own state, the
+          toolbar chips count them once there are enough to filter, and the
+          sidebar already names this computer. */}
+      <div className="scroll-edge flex-1 overflow-y-auto px-9 pt-5 pb-6">
+        {workspaces.length >= TOOLBAR_MIN && (
+          <WorkspacesToolbar
+            search={search}
+            onSearch={setSearch}
+            filter={filter}
+            onFilter={setFilter}
+            stats={stats}
+            sort={sort}
+            onSort={setSort}
+          />
+        )}
+
+        <WorkspaceRevokedNotice
+          notices={notices}
+          onRejoin={openQuick}
+          onDismiss={(id) => {
+            void window.api.dismissNodeRevocation(id).then(() => reload())
+          }}
+        />
+
+        {loading ? (
+          <Empty>
+            <EmptyHeader>
+              <EmptyMedia>
+                <Spinner />
+              </EmptyMedia>
+              <EmptyDescription>{t("workspaces.loading")}</EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        ) : filtered.length === 0 ? (
+          <WorkspacesEmpty
+            hasAny={workspaces.length > 0}
+            search={search}
+            onClearSearch={() => setSearch("")}
+            onShowAll={() => setFilter("all")}
+          />
+        ) : (
+          <ItemGroup className="gap-3">
+            {filtered.map((c) => (
+              <WorkspaceCard
+                key={c.ws.id}
+                data={c}
+                onCopyUrl={() => copyUrl(c.ws)}
+                opensInApp={canOpenInApp(c.ws)}
+                browserOnlyReason={browserOnlyReason(c.ws)}
+                onOpen={() => openWorkspace(c.ws)}
+                onOpenInBrowser={() => openInBrowser(c.ws)}
+                onRename={() => setRenameTarget(c.ws)}
+                onRemove={() =>
+                  setRemoveTarget({
+                    ws: c.ws,
+                    revoked: c.health === "revoked",
+                  })
+                }
+                onRepair={openQuick}
+              />
+            ))}
+          </ItemGroup>
+        )}
+      </div>
+
+      <WorkspaceQuickConnect
+        open={quickOpen}
+        onClose={() => setQuickOpen(false)}
+        onCreated={reload}
+        showToast={showToast}
+      />
+
+      <WorkspaceRenameDialog
+        open={!!renameTarget}
+        workspace={renameTarget}
+        onClose={() => setRenameTarget(null)}
+        onSaved={(id, name, scope) => {
+          if (scope === "local") {
+            setAliases((a) => ({ ...a, [id]: name }))
+            showToast(t("workspaces.toast.renamed"), "success")
+            return
+          }
+          // Renamed on the server: the alias was cleared with it, and the
+          // local network record now carries the real name — reload to show it.
+          setAliases((a) => {
+            const next = { ...a }
+            delete next[id]
+            return next
+          })
+          void reload()
+          showToast(t("workspaces.toast.renamedWorkspace", { name }), "success")
+        }}
+      />
+
+      <WorkspaceRemoveDialog
+        workspace={removeTarget?.ws ?? null}
+        displayName={
+          removeTarget
+            ? aliases[removeTarget.ws.id] ||
+              removeTarget.ws.name ||
+              removeTarget.ws.slug ||
+              removeTarget.ws.id
+            : ""
+        }
+        revoked={removeTarget?.revoked}
+        busy={removing}
+        onConfirm={(deleteRemote) => void performRemove(deleteRemote)}
+        onCancel={() => setRemoveTarget(null)}
+      />
+    </section>
+  )
+}

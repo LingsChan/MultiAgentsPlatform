@@ -1,0 +1,1432 @@
+/**
+ * Codex adapter for OpenAgents workspace.
+ *
+ * Bridges OpenAI Codex CLI to an OpenAgents workspace via:
+ * - Codex CLI subprocess (exec --json --full-auto) as primary mode
+ * - Direct HTTP mode for OpenAI-compatible LLM APIs as fallback
+ *
+ * Similar to ClaudeAdapter: spawns the CLI per message, processes
+ * structured JSON events, maintains session/thread IDs per channel,
+ * and sends real-time status updates.
+ */
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execSync } = require('child_process');
+// spawn() here is the WSL bridge from ../wsl: same signature as
+// child_process.spawn, and a straight pass-through unless the resolved CLI
+// lives on the other side of the Windows/WSL boundary.
+const { codexPlanRefusedModel, codexPlanFallback } = require('../cli-models');
+const { spawn, resolveWslBinary } = require('../wsl');
+const http = require('http');
+const https = require('https');
+
+const { whereBinary } = require('../paths');
+const BaseAdapter = require('./base');
+const { pendingImport } = require('../session-imports');
+const { redactSecrets, formatAttachmentsForPrompt, decodeConsoleOutput, BENIGN_CLI_OUTPUT, networkErrorText } = require('./utils');
+const { buildOpenclawSystemPrompt } = require('./workspace-prompt');
+
+const IS_WINDOWS = process.platform === 'win32';
+const MAX_HISTORY_ENTRIES = 50;
+// Direct API mode has no tools, so an attached file reaches the model only as
+// text inside the message. This caps how much goes in: a spec fits, and a log
+// dump doesn't push the rest of the conversation out of the context window.
+const MAX_INLINE_ATTACHMENT_CHARS = 50000;
+// A completions request needs its own deadlines. Node's `timeout` option only
+// emits an event, it never aborts, so a relay that accepted the request and
+// then went quiet left the run hanging forever with nothing in the log.
+// Overridable per instance (_directIdleTimeoutMs / _directTotalTimeoutMs).
+const DIRECT_IDLE_TIMEOUT_MS = 120000;
+// The overall deadline is checked, not enforced, while the model is still
+// producing: a reasoning model thinking for minutes (22k streamed events in one
+// report) was cut off at 300s and everything it had sent was thrown away. Each
+// time it comes due with new text or reasoning since the last check it moves
+// on by the same step, up to the hard ceiling below; a stream that only sends
+// keep-alives, or nothing new, still ends there. What reply text there is at
+// that point is posted, marked as cut off.
+const DIRECT_TOTAL_TIMEOUT_MS = 300000;
+const DIRECT_HARD_TIMEOUT_MS = 900000;
+const TEXT_FILE_RE = /\.(md|markdown|txt|text|csv|tsv|json|jsonl|ya?ml|toml|ini|xml|html?|log|sql|sh|py|js|mjs|cjs|ts|tsx|jsx|java|go|rs|rb|php|c|h|cc|cpp|hpp|cs|swift|kt)$/i;
+
+// How much of a failure's own words reach the channel.
+const FAILURE_DETAIL_CAP = 500;
+// `codex exec -` prints this first on every run, failed or not. It led every
+// failure message, and when it was all stderr held the user read
+// "Codex failed to complete this run. > Reading prompt from stdin..." and
+// nothing else.
+const CODEX_STDIN_BANNER = /^Reading (?:prompt|additional input) from stdin\.\.\.$/i;
+// codex's own log records: timestamp, level, module, message. The timestamp
+// and module took half the quote.
+const CODEX_LOG_RECORD = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z?\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(?:[\w:]+:\s+)?(.*)$/;
+// Things codex says beside a run rather than about it, such as a config key
+// it skipped. Quoted only when nothing else was said.
+const CODEX_SIDE_NOTE = /^warning:/i;
+// ERROR records codex logs beside a run, not about it: a skill file it could
+// not parse (it skips that skill and answers anyway, verified with codex-cli
+// 0.167), and its own ChatGPT connector (rmcp) losing a side connection. In
+// the field they came first in stderr and were quoted as the reason a run
+// failed. Quoted only when nothing else was logged.
+const CODEX_SIDE_ERROR = /\brmcp::|failed to load skill\b/;
+// A Node exception from Codex's npm launcher (bin/codex.js), thrown before the
+// native binary ever ran: its headline ("Error: Missing optional dependency
+// @openai/codex-win32-x64. Reinstall Codex: …") and then a stack. The last
+// five lines of that were all stack frames, so the channel read "> at
+// file:///…/codex.js:113:20 at ModuleJob.run" on every message of one user's
+// agents (daily errors dashboard, 2026-11-25). With a stack present, the
+// headline is the reason.
+const NODE_STACK_FRAME = /^at\s+(?:async\s+)?(?:\S+\s+\()?(?:file:|node:|[A-Za-z]:\\|\/)\S*:\d+:\d+\)?$/;
+const NODE_ERROR_HEADLINE = /^(?:[A-Z][\w$]*)?Error(?: \[[A-Z0-9_]+\])?: \S/;
+// Codex's wording when the model service could not be reached or the stream
+// dropped. Seen in the field from devices that cannot reach OpenAI, and
+// reproduced against codex-cli 0.160 behind a dead proxy: the run then fails
+// with only "workspace routing discovery failed" (or "timed out"), and the
+// connection errors are in stderr.
+const CODEX_CONNECTION_FAILURE = /error sending request|Connection failed|failed to connect to websocket: IO error|tls handshake|dns error|failed to lookup address|stream disconnected before completion|workspace routing discovery (?:failed|timed out)|request timed out/i;
+// codex retrying a failed connection by itself: "Reconnecting... 2/5 (why)".
+const CODEX_RECONNECTING = /^Reconnecting\.\.\.\s*\d+\/\d+\s*(?:\((.*)\))?\s*$/i;
+// An endpoint refusing a field of the request. Codex sends the same fields
+// (client_metadata among them) on every turn and has no setting to drop one,
+// so on a custom Responses provider this fails every run.
+const PARAM_REFUSED = /unsupported .{0,40}parameter|unsupported_parameter|unknown parameter|unrecognized request argument|unrecognized (key|field)|additional properties|extra (inputs|fields) are not permitted/i;
+// OpenAI's own "Unsupported parameter: 'reasoning.effort' is not supported with
+// this model" is about the model chosen, which the user can change.
+const MODEL_CAPABILITY_REFUSAL = /with this model|reasoning[._]/i;
+// The service answered and said no: a key, a plan, a quota, or a model it
+// will not serve. Network advice would send the user the wrong way. The
+// terms of _serviceRefused, less "error sending request" (that one is a
+// connection failure), plus a 400 and a rejected model.
+const SERVICE_REFUSAL = /\b(400|401|402|403|429)\b|too many requests|rate.?limit|usage limit|quota|credits|unauthori[sz]ed|forbidden|model_not_found|model\b[^\n]{0,80}?\b(?:not supported|does not exist|not available)/i;
+// How many of stderr's last lines count as evidence of a lost connection.
+// codex logs `WARN … failed to refresh available models: request timed out`
+// on runs that then fail for another reason (a quota, a model), and the
+// whole of stderr read as a network failure.
+const CONNECTION_EVIDENCE_LINES = 5;
+
+class CodexAdapter extends BaseAdapter {
+  /**
+   * @param {object} opts - BaseAdapter opts plus:
+   * @param {Set} [opts.disabledModules]
+   */
+  constructor(opts) {
+    super(opts);
+    this.disabledModules = opts.disabledModules || new Set();
+    // Pin the channel's glossary into the system prompt.
+    this._usesPinnedContext = true;
+
+    const env = this.agentEnv || process.env;
+    this._directApiKey = env.OPENAI_API_KEY || '';
+    this._directBaseUrl = (env.OPENAI_BASE_URL || '').replace(/\/+$/, '');
+    this._directModel = env.CODEX_MODEL || env.OPENCLAW_MODEL || '';
+
+    // Per-channel thread tracking (like Claude's session IDs)
+    this._channelThreads = {};
+    this._channelProcesses = {};
+    this._sessionsFile = path.join(
+      os.homedir(), '.openagents', 'sessions',
+      `${this.workspaceId}_${this.agentName}_codex.json`
+    );
+    this._loadSessions();
+
+    // Determine mode:
+    // - CLI mode: works with OpenAI's native Responses API (api.openai.com)
+    //   OR with subscription-based auth via 'codex login'
+    // - Direct API mode: works with any OpenAI-compatible chat completions endpoint
+    this._codexBin = this._findCodexBinary();
+    this._directMode = false;
+    this._useCliMode = false;
+
+    // Check if base URL is OpenAI's native API (CLI requires Responses API)
+    const isOpenAiNative = !this._directBaseUrl ||
+      this._directBaseUrl.includes('api.openai.com');
+
+    // A third-party endpoint that speaks the Responses API can drive the
+    // real CLI (tools, sandbox, resume) instead of the tool-less direct
+    // mode. Opt in with CODEX_WIRE_API=responses; the provider is passed to
+    // codex as `-c` overrides, so nothing is written to ~/.codex/config.toml.
+    this._customProvider = null;
+    if (this._codexBin && !isOpenAiNative && this._directApiKey &&
+        String(env.CODEX_WIRE_API || '').toLowerCase() === 'responses') {
+      this._customProvider = {
+        baseUrl: this._directBaseUrl,
+        reasoningEffort: String(env.CODEX_REASONING_EFFORT || '').toLowerCase() || null,
+      };
+    }
+
+    if (this._codexBin && (isOpenAiNative || !this._directApiKey || this._customProvider)) {
+      // CLI mode: OpenAI native API, subscription auth (no API key), or a
+      // Responses-compatible custom provider.
+      this._useCliMode = true;
+      const how = this._customProvider
+        ? ` (custom Responses provider ${this._customProvider.baseUrl})`
+        : (!this._directApiKey ? ' (subscription auth)' : '');
+      this._log(`CLI mode: ${this._codexBin}${how}`);
+    } else if (this._directApiKey && this._directBaseUrl) {
+      this._directMode = true;
+      if (this._codexBin) {
+        this._log(`Direct LLM mode (non-OpenAI endpoint, CLI requires Responses API): ${this._directBaseUrl} model=${this._directModel || 'gpt-4o'}`);
+      } else {
+        this._log(`Direct LLM mode: ${this._directBaseUrl} model=${this._directModel || 'gpt-4o'}`);
+      }
+    } else if (this._codexBin) {
+      // CLI binary found, no custom base URL — assume OpenAI or subscription auth
+      this._useCliMode = true;
+      this._log(`CLI mode: ${this._codexBin}`);
+    } else {
+      this._log('Warning: No codex CLI binary found and no direct API configured');
+    }
+
+    // Conversation history (direct API mode only)
+    this._conversationHistory = [];
+  }
+
+  // ------------------------------------------------------------------
+  // Session persistence (per-channel thread IDs)
+  // ------------------------------------------------------------------
+
+  _loadSessions() {
+    try {
+      if (fs.existsSync(this._sessionsFile)) {
+        const data = JSON.parse(fs.readFileSync(this._sessionsFile, 'utf-8'));
+        if (data && typeof data === 'object') {
+          Object.assign(this._channelThreads, data);
+          this._log(`Loaded ${Object.keys(data).length} thread(s)`);
+        }
+      }
+    } catch {
+      this._log('Could not load sessions file, starting fresh');
+    }
+  }
+
+  _saveSessions() {
+    try {
+      const dir = path.dirname(this._sessionsFile);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(this._sessionsFile, JSON.stringify(this._channelThreads));
+    } catch {}
+  }
+
+  /**
+   * A channel that is an imported local Codex session (src/session-imports.js)
+   * continues it from its first turn. `codex exec resume <id>` appends to the
+   * rollout it resumes, so the user's own file is copied first under a new id
+   * (the id rewritten in its name and records) into the CODEX_HOME this agent
+   * runs with, and the copy is what the channel resumes. A rollout that is
+   * gone leaves the channel to start fresh with the imported thread history.
+   */
+  _adoptImportedThread(msgChannel) {
+    if (Object.prototype.hasOwnProperty.call(this._channelThreads, msgChannel)) return;
+    // Once per channel: a copy that later fails to resume is dropped like any
+    // stale thread, and the channel goes on fresh rather than re-importing.
+    this._adoptedImports = this._adoptedImports || new Set();
+    if (this._adoptedImports.has(msgChannel)) return;
+    const entry = pendingImport(this.workspaceId, this.agentName, msgChannel, 'codex');
+    if (!entry || !entry.file) return;
+    this._adoptedImports.add(msgChannel);
+    try {
+      const env = this.agentEnv || process.env;
+      const home = env.CODEX_HOME || path.join(os.homedir(), '.codex');
+      const text = fs.readFileSync(entry.file, 'utf-8');
+      const complete = text.slice(0, text.lastIndexOf('\n') + 1);
+      const newId = require('crypto').randomUUID();
+      const now = new Date();
+      const pad = (v) => String(v).padStart(2, '0');
+      const dir = path.join(home, 'sessions', String(now.getFullYear()), pad(now.getMonth() + 1), pad(now.getDate()));
+      const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(dir, `rollout-${stamp}-${newId}.jsonl`), complete.split(entry.session_id).join(newId), { mode: 0o600 });
+      this._channelThreads[msgChannel] = newId;
+      try { require('../session-imports').recordCopy(newId); } catch { /* only hides it from the import picker */ }
+      this._saveSessions();
+      this._log(`Channel ${msgChannel} continues imported Codex session ${entry.session_id} as ${newId}`);
+    } catch (e) {
+      this._log(`Imported session ${entry.session_id} unavailable for ${msgChannel} (${e.message}); starting fresh`);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Find codex binary (multi-tier, like Claude adapter)
+  // ------------------------------------------------------------------
+
+  _findCodexBinary() {
+    const home = os.homedir();
+    const ext = IS_WINDOWS ? '.cmd' : '';
+
+    // Tier 0: Isolated runtime prefix (~/.openagents/runtimes/codex/)
+    const runtimeCandidate = path.join(home, '.openagents', 'runtimes', 'codex', 'node_modules', '.bin', `codex${ext}`);
+    if (fs.existsSync(runtimeCandidate)) return runtimeCandidate;
+
+    // Tier 0b: Legacy portable install
+    const portableCandidate = path.join(home, '.openagents', 'nodejs', 'node_modules', '.bin', `codex${ext}`);
+    if (fs.existsSync(portableCandidate)) return portableCandidate;
+
+    // Tier 1: PATH search via a codepage-safe lookup (whereBinary forces UTF-8
+    // output + verifies existence so a non-ASCII/Chinese username isn't mangled
+    // into an ENOENT; it also no longer returns an empty string on a miss, which
+    // used to short-circuit the Node-derived fallback tiers below).
+    const viaWhere = whereBinary('codex');
+    if (viaWhere) return viaWhere;
+
+    // Tier 2: Next to current Node.js interpreter (npm global)
+    const nodeBinDir = path.dirname(process.execPath);
+    const nearNode = path.join(nodeBinDir, `codex${ext}`);
+    if (fs.existsSync(nearNode)) return nearNode;
+
+    // Tier 3: npm global prefix (handles custom npm prefix like D:\node\node_global)
+    try {
+      const npmPrefix = execSync('npm config get prefix', {
+        encoding: 'utf-8', timeout: 5000, windowsHide: true,
+      }).trim();
+      if (npmPrefix) {
+        const prefixCandidate = path.join(npmPrefix, `codex${ext}`);
+        if (fs.existsSync(prefixCandidate)) return prefixCandidate;
+      }
+    } catch {}
+
+    // Tier 4: Common install locations
+    const candidates = IS_WINDOWS ? [
+      path.join(process.env.APPDATA || '', 'npm', 'codex.cmd'),
+    ] : [
+      path.join(home, '.local', 'bin', 'codex'),
+      path.join(home, '.npm-global', 'bin', 'codex'),
+      '/opt/homebrew/bin/codex',
+      '/usr/local/bin/codex',
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+
+    // Nothing native anywhere. Last of all, look inside WSL: a CLI the user
+    // installed in their distro is a real install, and the marked path it comes
+    // back as is what the spawn bridge in ../wsl turns into a wsl.exe run.
+    return resolveWslBinary('codex');
+  }
+
+  /**
+   * How to spawn `bin`: `{ file, args, shell }`, with `args` going before the
+   * codex arguments. On Windows an npm `.cmd` shim is resolved to
+   * `[node, <entry>.js]` (or the native `.exe` it forwards to) and spawned
+   * without a shell. Handing the shim to cmd.exe instead joined everything
+   * into one unquoted command line, so a profile folder with a space in it
+   * (`C:\Users\Windows 用户\…`) was cut at the space and the run died with
+   * "'C:\Users\Windows' 不是内部或外部命令".
+   */
+  _resolveExec(bin, isWindows = IS_WINDOWS) {
+    const lower = String(bin).toLowerCase();
+    if (/\.[cm]?js$/.test(lower)) return { file: this._findNodeBin(), args: [bin], shell: false };
+    if (!isWindows || !/\.(cmd|bat)$/.test(lower)) return { file: bin, args: [], shell: false };
+    try {
+      const content = fs.readFileSync(bin, 'utf-8');
+      // Both npm shim styles: `"%dp0%\x.js"` and the older `"%~dp0\x.js"`.
+      const js = content.match(/%~?dp0%?\\([^\s"*?]+\.[cm]?js)/i);
+      if (js) {
+        return { file: this._findNodeBin(), args: [path.resolve(path.dirname(bin), js[1])], shell: false };
+      }
+      const exe = content.match(/%~?dp0%?\\([^\s"*?]+\.exe)/i);
+      if (exe) return { file: path.resolve(path.dirname(bin), exe[1]), args: [], shell: false };
+    } catch {}
+    // A shim we can't read through still has to run under cmd.exe. Build that
+    // command line here (see _spawnArgv): `shell: true` would join the
+    // arguments unquoted, cutting a working dir or relay flag at a space.
+    return { file: process.env.ComSpec || 'cmd.exe', args: [], shell: false, cmdShim: bin };
+  }
+
+  /**
+   * argv + spawn options for `exec` running `rest`. A `cmdShim` goes through
+   * `cmd /d /s /c "<line>"` with every part quoted (`/s` strips only the
+   * outer pair), passed verbatim so Node adds no quoting of its own.
+   */
+  _spawnArgv(exec, rest) {
+    if (!exec.cmdShim) return { argv: [...exec.args, ...rest], windowsVerbatimArguments: false };
+    const quote = (a) => `"${String(a).replace(/"/g, '""')}"`;
+    const line = [exec.cmdShim, ...rest].map(quote).join(' ');
+    return { argv: ['/d', '/s', '/c', `"${line}"`], windowsVerbatimArguments: true };
+  }
+
+  _findNodeBin() {
+    const home = os.homedir();
+    const candidates = IS_WINDOWS
+      ? [path.join(home, '.openagents', 'nodejs', 'node.exe')]
+      : [path.join(home, '.openagents', 'nodejs', 'bin', 'node'),
+         path.join(home, '.openagents', 'nodejs', 'node')];
+    for (const c of candidates) { try { if (fs.existsSync(c)) return c; } catch {} }
+    return process.execPath || 'node';
+  }
+
+  static _dirExists(p) {
+    try { return fs.statSync(p).isDirectory(); } catch { return false; }
+  }
+
+  /**
+   * Decode CLI output. Codex writes UTF-8, but text that came from Windows
+   * itself (cmd.exe, a system error) is in the console code page, which on a
+   * Chinese system is GBK and showed up in chat as rows of "�". Fall back to
+   * GB18030 only when UTF-8 fails and GB18030 reads the bytes cleanly.
+   */
+  static _decodeOutput(buf, isWindows = IS_WINDOWS) {
+    return decodeConsoleOutput(buf, isWindows);
+  }
+
+  _buildSystemContext(channelName) {
+    const base = buildOpenclawSystemPrompt({
+      agentName: this.agentName,
+      workspaceId: this.workspaceId,
+      channelName,
+      endpoint: this.endpoint,
+      token: this.token,
+      mode: this._mode,
+      model: this.modelLabel(),
+      disabledModules: this.disabledModules,
+      ...this.pinnedPromptOpts(channelName),
+    });
+    const skillsSection = this._buildInstalledSkillsSection();
+    return skillsSection ? `${base}\n\n${skillsSection}` : base;
+  }
+
+  /**
+   * Codex has no native skills-directory discovery (unlike Claude Code), so
+   * we inject installed Skill Hub skills directly into its context. Each
+   * skill's SKILL.md lives at <workingDir>/.codex/skills/<id>/SKILL.md and
+   * Codex (running with cwd=workingDir, full file access) can read it.
+   */
+  _buildInstalledSkillsSection() {
+    let skills = [];
+    try {
+      const installer = require('../skill-installer');
+      skills = installer.listInstalledSkills({
+        agentType: this.agentType || 'codex',
+        workingDir: this.workingDir,
+      });
+    } catch {
+      return '';
+    }
+    if (!skills.length) return '';
+    const lines = skills.map((s) => {
+      const desc = s.description ? ` — ${s.description}` : '';
+      return `- **${s.name}** (\`${s.id}\`)${desc}\n  Read its instructions: \`cat ${s.skillMd}\``;
+    });
+    return (
+      '## Installed Skills\n' +
+      'You have the following skills installed. When a task matches a skill, ' +
+      'read its `SKILL.md` (via the `cat` command shown) and follow it:\n' +
+      lines.join('\n')
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Process management
+  // ------------------------------------------------------------------
+
+  async _stopProcess(proc) {
+    if (!proc || proc.exitCode !== null) return;
+    try {
+      if (IS_WINDOWS) {
+        try { execSync(`taskkill /F /T /PID ${proc.pid}`, { timeout: 5000 }); } catch {}
+      } else {
+        try { process.kill(-proc.pid, 'SIGTERM'); } catch {
+          proc.kill('SIGTERM');
+        }
+        await new Promise((resolve) => {
+          const timeout = setTimeout(() => {
+            try { process.kill(-proc.pid, 'SIGKILL'); } catch {
+              proc.kill('SIGKILL');
+            }
+            resolve();
+          }, 5000);
+          proc.on('exit', () => { clearTimeout(timeout); resolve(); });
+        });
+      }
+    } catch {}
+  }
+
+  // ------------------------------------------------------------------
+  // Message handler
+  // ------------------------------------------------------------------
+
+  async _handleMessage(msg) {
+    const content = (msg.content || '').trim();
+    const attachments = msg.attachments || [];
+    // A file sent with no text is still a message. The web UI fills content
+    // with the filename, but a task or API caller may leave it empty.
+    if (!content && attachments.length === 0) return;
+
+    const msgChannel = msg.sessionId || this.channelName;
+    const sender = msg.senderName || msg.senderType || 'user';
+    const summary = content || attachments.map((a) => a.filename).join(', ');
+    this._log(`Processing message from ${sender} in ${msgChannel}: ${summary.slice(0, 80)}...`);
+
+    await this._autoTitleChannel(msgChannel, summary);
+    await this.sendStatus(msgChannel, 'thinking...');
+
+    if (this._useCliMode) {
+      // Another agent's message, not a workflow step handed on to this one.
+      const fromAgent = msg.senderType === 'agent' && !this._isWorkflowHandoff(msg);
+      await this._handleViaSubprocess(content, msgChannel, attachments, { fromAgent });
+    } else if (this._directMode) {
+      await this._handleViaDirectApi(content, msgChannel, attachments);
+    } else {
+      await this.sendError(msgChannel, 'codex CLI not found. Install with: npm install -g @openai/codex\n\nOr configure OPENAI_API_KEY + OPENAI_BASE_URL for direct API mode.');
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // CLI subprocess mode (primary)
+  // ------------------------------------------------------------------
+
+  /** The workspace picker can change the model while this adapter is running. */
+  _effectiveModel() {
+    const workspaceModel = String(this.workspaceModel || '').trim();
+    return workspaceModel || String(this._directModel || '').trim();
+  }
+
+  async _handleViaSubprocess(content, msgChannel, attachments = [], { fromAgent = false } = {}) {
+    // A missing cwd fails the spawn itself, and Node blames the shell for it
+    // ("spawn C:\Windows\system32\cmd.exe ENOENT"), which names nothing the
+    // user can fix. A configured folder that was never made (or was cleaned
+    // up) is simply created; only one that cannot be is named instead.
+    if (this.workingDir && !CodexAdapter._dirExists(this.workingDir)) {
+      try { fs.mkdirSync(this.workingDir, { recursive: true }); } catch {}
+    }
+    if (this.workingDir && !CodexAdapter._dirExists(this.workingDir)) {
+      await this.sendError(msgChannel, `Working directory does not exist: ${this.workingDir}`);
+      return;
+    }
+
+    const env = { ...(this.agentEnv || process.env) };
+    // No model chosen: Codex's own default, unless the account's plan already
+    // refused that once and a model it does list was picked instead.
+    let effectiveModel = this._effectiveModel() || this._planFallbackModel || '';
+    let planRetried = false;
+
+    // Set model via env if configured
+    if (effectiveModel) env.CODEX_MODEL = effectiveModel;
+    if (this._directApiKey) env.OPENAI_API_KEY = this._directApiKey;
+    if (this._directBaseUrl) env.OPENAI_BASE_URL = this._directBaseUrl;
+
+    const context = this._buildSystemContext(msgChannel);
+    const fullPrompt = `${context}\n\n---\n\nUser message:\n${content}${this._attachmentInstructions(attachments)}`;
+
+    this._adoptImportedThread(msgChannel);
+
+    // Run up to 2 attempts: first with resume, then fresh if stale
+    let relocated = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const cmd = [this._codexBin, 'exec'];
+
+      cmd.push('--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check');
+
+      // Model override
+      if (effectiveModel) {
+        cmd.push('-m', effectiveModel);
+      }
+
+      // Custom Responses-API provider (see constructor). TOML values for
+      // `-c` must be quoted; the key itself travels in env (env_key), never
+      // on the command line.
+      if (this._customProvider) {
+        const q = (v) => JSON.stringify(String(v));
+        cmd.push(
+          '-c', 'model_provider=openagents',
+          '-c', `model_providers.openagents.name=${q('openagents')}`,
+          '-c', `model_providers.openagents.base_url=${q(this._customProvider.baseUrl)}`,
+          '-c', `model_providers.openagents.env_key=${q('OPENAI_API_KEY')}`,
+          '-c', `model_providers.openagents.wire_api=${q('responses')}`,
+        );
+        if (this._customProvider.reasoningEffort) {
+          cmd.push('-c', `model_reasoning_effort=${q(this._customProvider.reasoningEffort)}`);
+        }
+      }
+
+      // Working directory
+      if (this.workingDir) {
+        cmd.push('-C', this.workingDir);
+      }
+
+      // Resume goes LAST, after the exec options. `codex exec resume` takes
+      // -m, --json, --skip-git-repo-check and the bypass flags, but not -C,
+      // so the old order died with "unexpected argument '-C'" on every
+      // follow-up. That read as a stale thread, the id was dropped and the
+      // turn reran fresh, which is why a CLI-mode agent never remembered
+      // anything past its first message. Verified against codex-cli 0.154.0.
+      const threadId = this._channelThreads[msgChannel];
+      if (threadId && attempt === 0) {
+        cmd.push('resume', threadId);
+      }
+
+      this._log(`Spawning: codex ${cmd.slice(1).join(' ')}`);
+
+      try {
+        const result = await this._spawnCodex(cmd, env, msgChannel, fullPrompt);
+        if (result.stopped) return;
+
+        if (result.responseText) {
+          await this.sendResponse(msgChannel, result.responseText, {
+            statusKind: CodexAdapter._endedEarly(result) ? 'error' : 'completed',
+          });
+          // A run that said something and then died (turn.failed, non-zero
+          // exit) used to post only that opening line as the finished reply,
+          // so it read as "Codex says one sentence and stops" with the real
+          // error left in daemon.log. Say it stopped, and why.
+          if (CodexAdapter._endedEarly(result)) {
+            await this._sendRunFailure(msgChannel, result, { partial: true });
+            // Failed after some text (an auto-compaction refused mid-turn):
+            // the reply is posted, so no rerun, but the next message must not
+            // resume the same thread and fail again.
+            const unusable = threadId ? CodexAdapter._unusableThread(result) : null;
+            if (unusable) await this._dropThread(msgChannel, unusable);
+          }
+          return;
+        } else if (!planRetried && !this._effectiveModel() && !this._customProvider
+          && codexPlanRefusedModel(`${result.errorMessage || ''}\n${result.stderr || ''}`)) {
+          // No model was chosen, so Codex ran its default, and the ChatGPT
+          // plan refused it ("The 'gpt-6.1-sol' model is not supported when
+          // using Codex with a ChatGPT account"). Every message failed the
+          // same way. Run the first model the account itself lists instead,
+          // and keep it for this agent's later messages.
+          planRetried = true;
+          const refused = codexPlanRefusedModel(`${result.errorMessage || ''}\n${result.stderr || ''}`);
+          let fallback = null;
+          try { fallback = await codexPlanFallback(this._codexBin, env, refused); } catch {}
+          if (!fallback) {
+            await this._sendRunFailure(msgChannel, result);
+            return;
+          }
+          this._log(`ChatGPT plan refused ${refused}; running ${fallback}, the first model the account lists`);
+          this._planFallbackModel = fallback;
+          effectiveModel = fallback;
+          env.CODEX_MODEL = fallback;
+          try {
+            await this.sendStatus(msgChannel, `Codex's default model (${refused}) isn't included in this ChatGPT plan, `
+              + `so this agent now runs ${fallback}. To use another model, pick one in the agent's settings.`);
+          } catch {}
+          attempt--;
+          continue;
+        } else if (threadId && attempt === 0 && CodexAdapter._unusableThread(result)) {
+          // The thread holds something the service will no longer take (an
+          // item over an API limit, or reasoning sealed for another account),
+          // and codex resends the whole thread with every turn, so every later
+          // message in this channel failed the same way. Only a new thread
+          // runs again.
+          await this._dropThread(msgChannel, CodexAdapter._unusableThread(result));
+          continue;
+        } else if (result.exitCode !== 0 && threadId && attempt === 0 && !result.turnStarted && !CodexAdapter._serviceRefused(result)) {
+          // Stale thread — clear and retry fresh. Only when the turn never
+          // started: a thread codex cannot resume fails at once with nothing
+          // on stdout ("no rollout found for thread id"). A resumed turn
+          // that then failed (no network, a quota) was taken for a stale
+          // thread too, so the channel's thread was thrown away and the
+          // whole failing run waited out a second time.
+          this._log(`Stale thread detected for ${msgChannel}, clearing and retrying`);
+          delete this._channelThreads[msgChannel];
+          this._saveSessions();
+          continue;
+        } else if (fromAgent && !result.ranTools && CodexAdapter._finishedQuietly(result)) {
+          // Another agent wrote ("received", "noted") and codex ended its
+          // turn with nothing to add, as the prompt tells it to. Posting
+          // "Codex couldn't run" for that read as a failure: the daily errors
+          // dashboard of 2026-11-17 had one agent post it 14 times in two
+          // minutes while two agents acknowledged each other. A status says
+          // so and wakes nobody. A person's message still gets the error, and
+          // so does a turn that ran commands or edited files and then said
+          // nothing: that was a task, and whoever asked for it has to hear
+          // that no answer came.
+          this._log(`Turn from another agent in ${msgChannel} ended with no reply; not posting one`);
+          try { await this.sendStatus(msgChannel, 'Nothing to add, so no reply was posted.'); } catch {}
+          return;
+        } else {
+          // Surface the actual reason (turn.failed message, stderr, exit code)
+          // instead of a generic "no response" — mirrors the OpenCode adapter
+          // so auth/model/network problems are actionable from the chat.
+          await this._sendRunFailure(msgChannel, result);
+          return;
+        }
+      } catch (e) {
+        // The binary was looked up once, when the adapter started. A reinstall
+        // or update since then can move or remove it, and every turn failed
+        // with "spawn …/.bin/codex ENOENT" until the agent was restarted.
+        // Look again and rerun this attempt once.
+        if (e && e.code === 'ENOENT' && !relocated) {
+          relocated = true;
+          const found = this._findCodexBinary();
+          if (found) {
+            this._log(`Codex binary moved: ${this._codexBin} → ${found}`);
+            this._codexBin = found;
+            attempt--;
+            continue;
+          }
+          await this.sendError(msgChannel, "⚠️ **Codex couldn't run** — the Codex CLI is no longer installed on this device. Reinstall it from OpenAgents Launcher (Agents → Codex), then try again.");
+          return;
+        }
+        this._log(`Error in subprocess: ${e.message}`);
+        await this.sendError(msgChannel, `⚠️ **Codex couldn't run** — ${CodexAdapter._redact(e.message)}`);
+        return;
+      }
+    }
+  }
+
+  async _spawnCodex(cmd, env, msgChannel, prompt) {
+    // Stopped while this turn was being prepared: start nothing (no tokens).
+    if (this._stoppedBeforeStart(msgChannel)) return { stopped: true, responseText: '', exitCode: null };
+    return new Promise((resolve, reject) => {
+      const exec = this._resolveExec(cmd[0]);
+      const { argv, windowsVerbatimArguments } = this._spawnArgv(exec, cmd.slice(1));
+      const proc = spawn(exec.file, argv, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env,
+        cwd: this.workingDir,
+        detached: !IS_WINDOWS,
+        windowsHide: true,
+        shell: exec.shell,
+        windowsVerbatimArguments,
+      });
+      this._channelProcesses[msgChannel] = proc;
+
+      const responseTexts = [];
+      let hasToolUseSinceLastText = false;
+      let lineBuffer = '';
+      const stderrChunks = [];
+      let lastErrorMessage = '';
+      let turnFailed = false;
+      let turnStarted = false;
+      let ranTools = false;
+      let reconnectNoted = false;
+      let _pendingLines = Promise.resolve();
+
+      if (proc.stderr) {
+        proc.stderr.on('data', (chunk) => { stderrChunks.push(chunk); });
+      }
+
+      if (proc.stdin) {
+        proc.stdin.write(prompt || '', 'utf-8');
+        proc.stdin.end();
+      }
+
+      const processLine = async (line) => {
+        line = line.trim();
+        if (!line) return;
+
+        let event;
+        try { event = JSON.parse(line); } catch { return; }
+
+        const eventType = event.type;
+
+        if (eventType === 'thread.started') {
+          if (event.thread_id) {
+            this._channelThreads[msgChannel] = event.thread_id;
+            this._saveSessions();
+            this._log(`Thread started: ${event.thread_id}`);
+          }
+        } else if (eventType === 'turn.started') {
+          turnStarted = true;
+        } else if (eventType === 'item.completed') {
+          const item = event.item || {};
+          if (item.type === 'agent_message' && item.text) {
+            if (hasToolUseSinceLastText) {
+              responseTexts.length = 0;
+              hasToolUseSinceLastText = false;
+            }
+            responseTexts.push(item.text);
+            // Stream as thinking (like Claude adapter)
+            try { await this.sendThinking(msgChannel, item.text); } catch {}
+          } else if (item.type === 'command_execution') {
+            hasToolUseSinceLastText = true;
+            ranTools = true;
+            const cmdText = (item.command || '').slice(0, 200);
+            const exitCode = item.exit_code;
+            const output = (item.output || '').slice(0, 500);
+            let status = `**Running:** \`${cmdText}\``;
+            if (exitCode !== undefined && exitCode !== null) {
+              status += ` (exit ${exitCode})`;
+            }
+            try { await this.sendStatus(msgChannel, status); } catch {}
+            this._log(`Command: ${cmdText} → exit ${exitCode}`);
+          } else if (item.type === 'file_change') {
+            hasToolUseSinceLastText = true;
+            ranTools = true;
+            // codex reports the edited files in `changes`; `filename` is the
+            // legacy shape and was always empty on current CLIs.
+            const filename = Array.isArray(item.changes) && item.changes.length
+              ? item.changes.map((c) => c && c.path).filter(Boolean).join(', ')
+              : (item.filename || '');
+            try { await this.sendStatus(msgChannel, `**Editing:** \`${filename}\``); } catch {}
+            this._log(`File change: ${filename}`);
+          }
+        } else if (eventType === 'turn.failed') {
+          const error = event.error || {};
+          const errMsg = error.message || JSON.stringify(error);
+          lastErrorMessage = errMsg;
+          turnFailed = true;
+          this._log(`Turn failed: ${errMsg}`);
+        } else if (eventType === 'error') {
+          const errMsg = event.message || JSON.stringify(event);
+          lastErrorMessage = errMsg;
+          this._log(`Error event: ${errMsg}`);
+          // codex retries a failing connection by itself and says nothing
+          // else while it does, so the channel just showed "thinking". Say
+          // so once per run; the retries come in bursts of five.
+          const status = reconnectNoted ? '' : CodexAdapter._reconnectStatus(errMsg);
+          if (status) {
+            reconnectNoted = true;
+            try { await this.sendStatus(msgChannel, status); } catch {}
+          }
+        }
+      };
+
+      proc.stdout.on('data', (chunk) => {
+        lineBuffer += chunk.toString('utf-8');
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop();
+        for (const line of lines) {
+          _pendingLines = _pendingLines.then(() => processLine(line)).catch(() => {});
+        }
+      });
+
+      proc.on('exit', async (code, signal) => {
+        // Wait for all in-flight processLine calls
+        try { await _pendingLines; } catch {}
+
+        // Process remaining buffer
+        for (const line of lineBuffer.split('\n')) {
+          try { await processLine(line); } catch {}
+        }
+
+        delete this._channelProcesses[msgChannel];
+
+        const stderrBuf = CodexAdapter._decodeOutput(Buffer.concat(stderrChunks));
+        if (code !== 0) {
+          this._log(`Codex CLI exited with code ${code}${signal ? ` (${signal})` : ''}`);
+          if (stderrBuf.trim()) {
+            this._log(`stderr: ${stderrBuf.trim().slice(0, 500)}`);
+          }
+        }
+
+        resolve({
+          responseText: responseTexts.join('\n').trim(),
+          exitCode: code,
+          signal,
+          stderr: stderrBuf,
+          errorMessage: lastErrorMessage,
+          turnFailed,
+          turnStarted,
+          ranTools,
+        });
+      });
+
+      proc.on('error', (err) => {
+        delete this._channelProcesses[msgChannel];
+        reject(err);
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Attachments
+  // ------------------------------------------------------------------
+
+  /**
+   * How the CLI fetches each attached file. Without this it saw only the
+   * filename and went looking for it on local disk.
+   *
+   * The curl form, not the MCP one: Codex runs with no MCP config, so
+   * `workspace_read_file` names a tool it doesn't have. The token goes in
+   * literally, as it already does in the system prompt, because `$TOKEN` is
+   * unset in Codex's shell and every download would 401. The URL is rebuilt
+   * from this agent's endpoint: the one the browser attached points at the
+   * browser's API origin and carries the viewer's token.
+   */
+  _attachmentInstructions(attachments) {
+    const forAgent = (attachments || []).map((att) => ({ ...att, url: undefined }));
+    return formatAttachmentsForPrompt(forAgent, 'skills', IS_WINDOWS, {
+      tokenExpr: this.token, endpoint: this.endpoint,
+    }) || '';
+  }
+
+  /**
+   * Direct API mode has no tools, so a file reaches the model only if its text
+   * is in the message. Text files are inlined up to MAX_INLINE_ATTACHMENT_CHARS.
+   * Anything else is named, so the model says it can't open the file rather
+   * than answering as if it had read it.
+   */
+  async _inlineAttachments(attachments) {
+    if (!attachments || attachments.length === 0) return '';
+    const parts = [];
+    let budget = MAX_INLINE_ATTACHMENT_CHARS;
+    for (const att of attachments) {
+      const name = att.filename || att.fileId || 'file';
+      if (!CodexAdapter._looksLikeText(att)) {
+        parts.push(`[Attached file: ${name} (${att.contentType || 'unknown type'}) — its contents can't be read in this mode]`);
+        continue;
+      }
+      if (budget <= 0) {
+        parts.push(`[Attached file: ${name} — left out, the attachments already reached the size limit]`);
+        continue;
+      }
+      let buf;
+      try {
+        buf = await this.client.readFile(this.workspaceId, this.token, att.fileId);
+      } catch (e) {
+        parts.push(`[Attached file: ${name} — download failed: ${CodexAdapter._redact(e.message).slice(0, 200)}]`);
+        continue;
+      }
+      if (buf.includes(0)) {
+        parts.push(`[Attached file: ${name} — binary content, can't be read in this mode]`);
+        continue;
+      }
+      const text = buf.toString('utf-8');
+      const body = text.slice(0, budget);
+      budget -= body.length;
+      const note = body.length < text.length ? ` — only the first ${body.length} characters` : '';
+      parts.push(`[Attached file: ${name}${note}]\n${body}\n[End of ${name}]`);
+    }
+    return `\n\n${parts.join('\n\n')}`;
+  }
+
+  /** Whether an attachment is worth decoding as text. Browsers upload .md as octet-stream. */
+  static _looksLikeText({ contentType, filename } = {}) {
+    const type = String(contentType || '').split(';')[0].trim().toLowerCase();
+    if (type.startsWith('text/')) return true;
+    if (/^application\/(json|xml|yaml|x-yaml|toml|javascript|x-sh|sql)$/.test(type)) return true;
+    return TEXT_FILE_RE.test(String(filename || ''));
+  }
+
+  // ------------------------------------------------------------------
+  // Failure reporting
+  // ------------------------------------------------------------------
+
+  /**
+   * Post a user-visible failure carrying the actual reason a run produced no
+   * reply, instead of a generic "No response generated".
+   */
+  async _sendRunFailure(msgChannel, result, { partial = false } = {}) {
+    const detail = CodexAdapter._failureDetail(result, {
+      customProvider: this._customProvider,
+      // What _effectiveModel() reads, plus a plan fallback already picked.
+      modelChosen: Boolean(String(this.workspaceModel || this._directModel || this._planFallbackModel || '').trim()),
+    });
+    if (partial) {
+      const body = detail
+        ? `It stopped before finishing this task.\n\n> ${detail}`
+        : 'It stopped before finishing this task. Please try again.';
+      await this.sendError(msgChannel, `⚠️ **Codex stopped partway** — ${body}`);
+      return;
+    }
+    const body = detail
+      ? `Codex failed to complete this run.\n\n> ${detail}`
+      : 'Codex finished without producing a reply. Please try again.';
+    await this.sendError(msgChannel, `⚠️ **Codex couldn't run** — ${body}`);
+  }
+
+  /**
+   * True when a run that produced some text did not actually finish. Only a
+   * turn.failed or a non-zero exit counts: codex also emits `error` events
+   * for retries it recovers from ("Reconnecting... 2/5"), and a run that
+   * reconnected and then completed is fine.
+   */
+  static _endedEarly({ exitCode, turnFailed } = {}) {
+    return Boolean(turnFailed) || (exitCode !== 0 && exitCode !== undefined);
+  }
+
+  /**
+   * True when codex ended its turn normally and simply wrote no reply: exit
+   * 0, no signal, no turn.failed and no error event. Anything else is a run
+   * that failed, whoever sent the message.
+   */
+  static _finishedQuietly({ exitCode, signal, turnFailed, errorMessage, responseText } = {}) {
+    return exitCode === 0 && !signal && !turnFailed
+      && !String(errorMessage || '').trim() && !String(responseText || '').trim();
+  }
+
+  /**
+   * True when the API refused the thread itself as too big. Seen as
+   * `[ArrayParam] [input[77].content] [array_above_max_length] Invalid
+   * 'input[77].content': array too long` on every message of one channel: an
+   * item in the history has more content parts than the API allows, and codex
+   * resends it each turn. The run's error, else what its stderr gives as the
+   * reason (_stderrReason), never a line of its log further up.
+   */
+  static _threadTooLarge({ errorMessage, stderr } = {}) {
+    const reason = String(errorMessage || '').trim() || CodexAdapter._stderrReason(stderr);
+    return /array_above_max_length|context_length_exceeded/i.test(reason);
+  }
+
+  /**
+   * Why the channel's thread can no longer be resumed, as `{ log, status }`
+   * (what the daemon log and the channel are told), or null when it can.
+   */
+  static _unusableThread(result) {
+    if (CodexAdapter._threadTooLarge(result)) {
+      return {
+        log: 'exceeds an API limit',
+        status: 'This Codex conversation grew past what the model API accepts, so it continues in a new one. '
+          + 'Earlier context in this thread is not carried over.',
+      };
+    }
+    if (CodexAdapter._threadUnverifiable(result)) {
+      return {
+        log: 'holds content this account cannot verify',
+        status: 'Codex could no longer read back this conversation\'s earlier turns (this happens after Codex is '
+          + 'signed in to a different account), so it continues in a new one. Earlier context in this thread is not '
+          + 'carried over.',
+      };
+    }
+    return null;
+  }
+
+  /** Forget the channel's thread, and say why in the log and the channel. */
+  async _dropThread(msgChannel, { log, status }) {
+    this._log(`Thread ${this._channelThreads[msgChannel]} for ${msgChannel} ${log}; starting a new one`);
+    delete this._channelThreads[msgChannel];
+    this._saveSessions();
+    try { await this.sendStatus(msgChannel, status); } catch {}
+  }
+
+  /**
+   * True when the service could not verify the thread's encrypted reasoning.
+   * Seen as `Error running remote compact task: {"error":{"message":"The
+   * encrypted content for item rs_… could not be verified. Reason: Encrypted
+   * content item_id did not match the target item id.", "code":
+   * "invalid_encrypted_content"}}` on every message of two agents, after their
+   * user signed Codex in to another ChatGPT account: the items were sealed for
+   * the old one, and codex resends them each turn. The run's error, else what
+   * its stderr gives as the reason (_stderrReason), as for _threadTooLarge.
+   */
+  static _threadUnverifiable({ errorMessage, stderr } = {}) {
+    const reason = String(errorMessage || '').trim() || CodexAdapter._stderrReason(stderr);
+    return /invalid_encrypted_content|encrypted content\b.{0,120}\bcould not be (?:verified|decrypted)/i.test(reason);
+  }
+
+  /**
+   * True when the model service turned the run away (rate limit, quota,
+   * credentials, network) — nothing to do with the thread being resumed. Such
+   * a run was read as a stale thread: the thread was dropped, losing the
+   * conversation, and the same refused request was sent a second time.
+   */
+  static _serviceRefused({ errorMessage, stderr } = {}) {
+    const refused = /\b(401|402|403|429)\b|too many requests|rate.?limit|usage limit|quota|credits|unauthorized|forbidden|error sending request/i;
+    if (refused.test(String(errorMessage || ''))) return true;
+    // Only the end of stderr, where the reason the run died is: a stale
+    // thread whose earlier log mentioned a quota was kept, and every later
+    // message in that channel failed until restart.
+    const lastLines = String(stderr || '').split(/\r?\n/).filter((l) => l.trim()).slice(-5).join('\n');
+    return refused.test(lastLines);
+  }
+
+  /**
+   * Pick the most informative failure detail from a run result:
+   * turn.failed / error event message → stderr tail → signal → exit code.
+   * Redacted.
+   *
+   * The cap applies to the quoted reason, before the advice is added, so a
+   * long stderr cannot push the advice out of the message.
+   */
+  static _failureDetail({ errorMessage, stderr, exitCode, signal } = {}, { customProvider = null, modelChosen = true } = {}) {
+    // A clean exit with no turn.failed and no error event is codex saying the
+    // turn finished; it just wrote no reply. Whatever stderr holds then is not
+    // why (a skill it skipped, its ChatGPT connector), and quoting it read as
+    // "failed to complete this run > failed to load skill …" for a run that
+    // had not failed.
+    const finished = exitCode === 0 && !signal;
+    const raw = String(errorMessage || '').trim()
+      || (finished ? '' : CodexAdapter._stderrReason(stderr))
+      || (signal ? `codex was terminated by ${signal}` : '')
+      || (exitCode ? `codex exited with code ${exitCode}` : '');
+    const full = CodexAdapter._redact(CodexAdapter._unwrap(raw));
+    const reason = full.slice(0, FAILURE_DETAIL_CAP).trim();
+    return reason ? CodexAdapter._explain(reason, stderr, { customProvider, modelChosen, full }) : '';
+  }
+
+  /**
+   * One status line for codex retrying a connection, or '' for any other
+   * error event. A retry it recovers from is not a failure, so this says it
+   * is retrying, not that it failed.
+   */
+  static _reconnectStatus(message) {
+    const m = CODEX_RECONNECTING.exec(String(message || '').trim());
+    if (!m) return '';
+    const why = CodexAdapter._redact(m[1] || '').slice(0, 120).trim();
+    return `Codex is having trouble reaching the model service and is retrying${why ? ` (${why})` : ''}…`;
+  }
+
+  /**
+   * The part of codex's stderr that says why the run failed.
+   *
+   * codex logs through `tracing` on stderr — `2026-10-27T04:08:56.500Z  WARN
+   * codex_skills::interface: …` — and echoes "Reading prompt from stdin..."
+   * (or "Reading additional input from stdin...") on every run. A plain tail
+   * of the last lines was mostly that noise. So, in order: lines the CLI
+   * printed for a person; failing those, its ERROR records with timestamp and
+   * module stripped; failing those, its warnings and the ERROR records it logs
+   * beside a run (CODEX_SIDE_ERROR). The banner and known-harmless
+   * lines are never a reason: a clean exit with only the banner reads as "no
+   * reply", not as "> Reading prompt from stdin...".
+   *
+   * The cut is taken from the END: codex's own "Error: …" line comes last, and
+   * keeping the first 500 characters cut it in half behind long log lines.
+   */
+  static _stderrReason(stderr) {
+    const said = [];
+    const errors = [];
+    const notes = [];
+    for (const raw of String(stderr || '').split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || CODEX_STDIN_BANNER.test(line)) continue;
+      const record = CODEX_LOG_RECORD.exec(line);
+      if (record) {
+        const [, level, message] = record;
+        const side = level === 'WARN' || (level === 'ERROR' && CODEX_SIDE_ERROR.test(line));
+        const bucket = side ? notes : level === 'ERROR' ? errors : null;
+        if (bucket && message && !bucket.includes(message)) bucket.push(message);
+      } else if (!BENIGN_CLI_OUTPUT.test(line)) {
+        (CODEX_SIDE_NOTE.test(line) ? notes : said).push(line);
+      }
+    }
+    const headlines = said.some((l) => NODE_STACK_FRAME.test(l))
+      ? said.filter((l) => NODE_ERROR_HEADLINE.test(l)) : [];
+    const picked = headlines.length ? headlines : said.length ? said : errors.length ? errors : notes;
+    const text = picked.slice(-5).join('\n');
+    return text.length > FAILURE_DETAIL_CAP ? `…${text.slice(-(FAILURE_DETAIL_CAP - 1))}` : text;
+  }
+
+  /**
+   * Unwrap the API's JSON error envelope so the user reads the sentence, not
+   * the transport. The backend rejects a run with a body like
+   * `{"detail":"The 'gpt-5.6-sol' model requires a newer version of Codex."}`
+   * and it was surfaced verbatim, braces and all (#649).
+   */
+  static _unwrap(raw) {
+    const text = String(raw || '').trim();
+    if (!text.startsWith('{') && !text.startsWith('[')) return text;
+    try {
+      const parsed = JSON.parse(text);
+      for (const key of ['detail', 'message', 'error']) {
+        const v = parsed && parsed[key];
+        if (typeof v === 'string' && v.trim()) return v.trim();
+        // OpenAI also nests as { error: { message } }. Its `param` names the
+        // field a 400 is about — "Unsupported Responses request parameter."
+        // alone did not say which.
+        if (v && typeof v.message === 'string' && v.message.trim()) {
+          const message = v.message.trim();
+          const param = typeof v.param === 'string' ? v.param.trim() : '';
+          return param && !message.includes(param) ? `${message} (parameter: ${param})` : message;
+        }
+      }
+    } catch {}
+    return text;
+  }
+
+  /**
+   * Add the missing half of a backend rejection: what to actually do about it.
+   *
+   * "Please upgrade to the latest app or CLI" is true but unactionable inside a
+   * workspace chat — the user is not at a terminal and does not necessarily
+   * know the CLI is theirs to update. Name where the update button lives. The
+   * match is on the backend's own wording, so an unrelated failure is passed
+   * through untouched.
+   */
+  static _explain(detail, stderr = '', { customProvider = null, modelChosen = true, full = '' } = {}) {
+    // An endpoint that serves other models than the one Codex sent. Seen as
+    // "The supported API model names are deepseek-flash, deepseek-v4-pro, but
+    // you passed gpt-6.1-sol" on every message of an agent pointed at a
+    // DeepSeek-compatible endpoint with no model set: Codex then sends its
+    // own default, which only OpenAI serves. Read from the whole reason: a
+    // long list of names can push "but you passed" past the quoted cap.
+    const served = /supported (?:API )?model names are (.+?),? but you passed ['"`]?([^'"`\s(,]+)/i.exec(full || detail);
+    if (served) {
+      const names = served[1].length > 300 ? `${served[1].slice(0, 300)}…` : served[1];
+      const passed = served[2].replace(/\.+$/, '');
+      const why = modelChosen ? ''
+        : `No model is set for this agent, so Codex sent its own default (${passed}). `;
+      return `${detail}\n\nThis endpoint serves ${names.trim()}. ${why}` +
+        'Pick one of those models for this agent (the model menu in the thread, or the agent\'s settings).';
+    }
+    // A custom Responses endpoint refusing a field Codex always sends. Nothing
+    // the user retries changes that; which endpoint to use, or the chat-only
+    // mode, does.
+    if (customProvider && PARAM_REFUSED.test(detail) && !MODEL_CAPABILITY_REFUSAL.test(detail)) {
+      let host = '';
+      try { host = new URL(customProvider.baseUrl).host; } catch {}
+      const m = /\(parameter: ([^)]+)\)/.exec(detail) || /parameter:?\s*'([\w.[\]]+)'/i.exec(detail);
+      return `${detail}\n\nThe endpoint this agent is set to${host ? ` (${host})` : ''} takes Responses API requests ` +
+        `but refuses ${m ? `the "${m[1]}" field` : 'a field'} that the Codex CLI sends with every one of them, ` +
+        'and Codex has no setting to leave it out — so every run here will fail the same way. Point the agent ' +
+        'at an endpoint that supports the full Responses API, or edit the agent and set Agent capabilities to ' +
+        '"Chat only · Chat Completions API" (it then answers without running tools on this device).';
+    }
+    // The base URL answers, but has nothing at /responses: an endpoint that
+    // only serves Chat Completions (or a base URL missing its path prefix).
+    // Seen as `unexpected status 404 Not Found: 404 page not found, url:
+    // http://host:port/v1/responses` on every message, read as "Codex failed
+    // to complete this run" with no hint that the setting is the cause.
+    if (/\b404\b/.test(detail) && /\/responses\b/i.test(detail)) {
+      const m = /url:\s*(\S+)/i.exec(detail);
+      let host = '';
+      try { host = new URL(m ? m[1] : (customProvider && customProvider.baseUrl) || '').host; } catch {}
+      return `${detail}\n\nThe endpoint this agent is set to${host ? ` (${host})` : ''} has no Responses API ` +
+        '(/v1/responses), which the Codex CLI sends every request to — so every run here will fail the same way. ' +
+        'Check the base URL (it usually ends in /v1), or, if that service only offers Chat Completions, edit the ' +
+        'agent and set Agent capabilities to "Chat only · Chat Completions API" (it then answers without running ' +
+        'tools on this device).';
+    }
+    // A model the user's ChatGPT plan doesn't include for Codex. Seen in the
+    // field with several model names picked in the workspace; every run
+    // fails the same way until another model is chosen.
+    if (/not supported when using Codex with a ChatGPT account/i.test(detail)) {
+      return `${detail}\n\nThis model is not available to Codex on your ChatGPT plan. ` +
+        'Pick another model for this agent (the model menu in the thread, or the agent\'s settings), ' +
+        'or leave the model empty to use the account default.';
+    }
+    // Ahead of the network check: a model that needs a newer Codex can
+    // arrive with connection warnings in stderr, and the upgrade is the fix.
+    if (/requires a newer version|upgrade to the latest (app|version)/i.test(detail)) {
+      return `${detail}\n\nUpdate the Codex CLI from OpenAgents Launcher ` +
+        '(Agents → Codex → Update), or run `npm install -g @openai/codex@latest`, ' +
+        'then try again. Picking an older model also works around it for now.';
+    }
+    // The other half of a connection failure: it is this device's network,
+    // not Codex and not the agent's settings. Without it the user saw log
+    // lines about websockets and a model list. The reason quoted can be as
+    // bare as "workspace routing discovery failed", so the end of stderr
+    // counts as evidence too, and a refusal in either rules it out.
+    // Only the last few lines, and not codex's warnings: it warns of a timed
+    // out model refresh on runs that then fail for a quota or a model.
+    // Not the lines of codex's own ChatGPT MCP connector: they report its
+    // sign-in to a side service, and an "AuthRequired" there says nothing
+    // about why the run failed.
+    const logged = String(stderr || '').split(/\r?\n/)
+      .filter((l) => {
+        if (!l.trim() || /rmcp::/.test(l)) return false;
+        const record = CODEX_LOG_RECORD.exec(l.trim());
+        return !record || record[1] === 'ERROR';
+      })
+      .slice(-CONNECTION_EVIDENCE_LINES)
+      .join('\n');
+    const evidence = `${detail}\n${logged}`;
+    if (CODEX_CONNECTION_FAILURE.test(evidence) && !SERVICE_REFUSAL.test(evidence)) {
+      return `${detail}\n\nCodex lost its connection to the model service (OpenAI, or the base URL ` +
+        "this agent is set to). Check this device's network, proxy or firewall, then try again.";
+    }
+    return detail;
+  }
+
+  /** Redact secrets (keys, tokens, bearer/authorization, query secrets) from diagnostics. */
+  static _redact(s) {
+    return redactSecrets(s);
+  }
+
+  // ------------------------------------------------------------------
+  // Direct HTTP mode (fallback when CLI not available)
+  // ------------------------------------------------------------------
+
+  async _handleViaDirectApi(content, msgChannel, attachments = []) {
+    try {
+      const userMessage = (content + await this._inlineAttachments(attachments)).trim();
+      // Resolves with text or rejects with the reason there is none.
+      const responseText = await this._callCompletionApi(userMessage, msgChannel);
+      // The file text stays in history so a follow-up question about it still has it.
+      this._conversationHistory.push({ role: 'user', content: userMessage });
+      this._conversationHistory.push({ role: 'assistant', content: responseText });
+      if (this._conversationHistory.length > MAX_HISTORY_ENTRIES * 2) {
+        this._conversationHistory = this._conversationHistory.slice(-MAX_HISTORY_ENTRIES * 2);
+      }
+      await this.sendResponse(msgChannel, responseText);
+    } catch (e) {
+      this._log(`Error in direct API: ${e.message}`);
+      await this._sendRunFailure(msgChannel, { errorMessage: e.message });
+    }
+  }
+
+  async _callCompletionApi(userMessage, channel) {
+    const systemPrompt = this._buildSystemContext(channel);
+    const messages = [{ role: 'system', content: systemPrompt }];
+    messages.push(...this._conversationHistory);
+    messages.push({ role: 'user', content: userMessage });
+
+    const url = `${this._directBaseUrl}/chat/completions`;
+    const payload = JSON.stringify({
+      model: this._effectiveModel() || 'gpt-4o',
+      messages,
+      stream: true,
+    });
+
+    return new Promise((resolve, reject) => {
+      const parsed = new URL(url);
+      const mod = parsed.protocol === 'https:' ? https : http;
+      const idleMs = this._directIdleTimeoutMs || DIRECT_IDLE_TIMEOUT_MS;
+      const totalMs = this._directTotalTimeoutMs || DIRECT_TOTAL_TIMEOUT_MS;
+      const hardMs = Math.max(totalMs, this._directHardTimeoutMs || DIRECT_HARD_TIMEOUT_MS);
+      const started = Date.now();
+      // What arrived before things stopped, so a stalled relay can be told
+      // apart from one that answered in a shape we don't read.
+      const progress = { status: 0, bytes: 0, events: 0 };
+      let reply = null; // what the stream has carried so far, once it is one
+      const seconds = () => Math.round((Date.now() - started) / 1000);
+      const contentChars = () => (reply ? reply.text.length + reply.reasoning.length + reply.toolArgs.length : 0);
+      // Text and reasoning counted apart: "still thinking" and "a relay
+      // sending empty events" looked the same as bytes and events alone.
+      const note = () => {
+        const content = reply && contentChars()
+          ? `, ${reply.text.length} reply chars, ${reply.reasoning.length} reasoning chars`
+          : '';
+        return `HTTP ${progress.status || 'no response'}, ${progress.bytes} bytes, `
+          + `${progress.events} events${content}, ${seconds()}s`;
+      };
+
+      let settled = false;
+      let deadline = null;
+      const finish = (err, text) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        if (!err) { resolve(text); return; }
+        this._log(`Direct API failed after ${seconds()}s, ${err.message}`);
+        reject(err);
+      };
+
+      this._log(`Direct API request started, model ${this._directModel || 'gpt-4o'} to ${parsed.host}${parsed.pathname}`);
+      const req = mod.request(parsed, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this._directApiKey}`,
+          'Content-Length': Buffer.byteLength(payload),
+        },
+        timeout: idleMs,
+      }, (res) => {
+        progress.status = res.statusCode;
+        this._log(`Direct API response ${res.statusCode} after ${seconds()}s`);
+        // Decode across chunk boundaries: a CJK character split between two
+        // chunks came out as replacement characters when each was decoded alone.
+        res.setEncoding('utf8');
+        if (res.statusCode !== 200) {
+          let body = '';
+          res.on('data', (d) => { body += d; });
+          res.on('end', () => finish(new Error(`LLM API returned ${res.statusCode}: ${body.slice(0, 300)}`)));
+          return;
+        }
+
+        reply = { text: '', reasoning: '', toolArgs: '', error: '', finishReason: '' };
+        let streamed = false;
+        let body = ''; // the raw response, kept until it turns out to be an SSE stream
+        let buffer = '';
+        const takeLine = (line) => {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) return;
+          streamed = true;
+          progress.events += 1;
+          const data = trimmed.slice(5).trim();
+          if (!data || data === '[DONE]') return;
+          try { CodexAdapter._collectCompletion(reply, JSON.parse(data), 'delta'); } catch {}
+        };
+        res.on('data', (chunk) => {
+          progress.bytes += chunk.length;
+          if (!streamed) body += chunk;
+          buffer += chunk;
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (const line of lines) takeLine(line);
+        });
+        res.on('end', () => {
+          takeLine(buffer); // a stream whose last event has no trailing newline
+          if (!streamed) {
+            // Some relays ignore stream:true and answer with one JSON body.
+            try { CodexAdapter._collectCompletion(reply, JSON.parse(body), 'message'); } catch {}
+          }
+          const text = CodexAdapter._completionText(reply);
+          if (text) finish(null, text);
+          else finish(new Error(CodexAdapter._emptyCompletionReason(reply, { streamed, body })));
+        });
+        res.on('aborted', () => finish(new Error(
+          `The LLM API closed the connection mid-response (${note()})`)));
+        res.on('error', (err) => finish(new Error(
+          `The LLM API connection failed, ${err.message} (${note()})`)));
+      });
+
+      // Settle first, then destroy: the abort that follows would otherwise
+      // report itself as a dropped connection and hide the real reason.
+      req.on('timeout', () => {
+        finish(new Error(
+          `The LLM API stopped responding, no data for ${Math.round(idleMs / 1000)}s (${note()})`));
+        req.destroy();
+      });
+      let charsAtCheck = 0;
+      const onDeadline = () => {
+        const elapsed = Date.now() - started;
+        const chars = contentChars();
+        if (chars > charsAtCheck && elapsed < hardMs) {
+          charsAtCheck = chars;
+          deadline = setTimeout(onDeadline, Math.min(totalMs, hardMs - elapsed));
+          if (deadline.unref) deadline.unref();
+          return;
+        }
+        const partial = reply ? CodexAdapter._completionText(reply) : '';
+        if (partial) {
+          this._log(`Direct API reply cut off at ${seconds()}s (${note()})`);
+          finish(null, `${partial}\n\n_(Cut off: the model was still writing after ${seconds()}s.)_`);
+        } else {
+          const what = reply && reply.reasoning ? 'still thinking, no reply text yet' : 'no usable reply';
+          finish(new Error(`The LLM API request went past ${seconds()}s with ${what} (${note()})`));
+        }
+        req.destroy();
+      };
+      deadline = setTimeout(onDeadline, totalMs);
+      if (deadline.unref) deadline.unref();
+
+      req.on('error', (err) => finish(err && err.message ? err : new Error(networkErrorText(err))));
+      req.write(payload);
+      req.end();
+    });
+  }
+
+  /** Fold one streamed chunk (`delta`) or one whole response (`message`) into `reply`. */
+  static _collectCompletion(reply, parsed, key) {
+    if (!parsed || typeof parsed !== 'object') return;
+    if (parsed.error) reply.error = CodexAdapter._unwrap(JSON.stringify(parsed));
+    const choice = Array.isArray(parsed.choices) ? parsed.choices[0] : null;
+    if (!choice) return;
+    const part = choice[key] || {};
+    if (typeof part.content === 'string') reply.text += part.content;
+    const reasoning = part.reasoning_content || part.reasoning;
+    if (typeof reasoning === 'string') reply.reasoning += reasoning;
+    for (const tc of part.tool_calls || []) {
+      if (tc.function && tc.function.arguments) reply.toolArgs += tc.function.arguments;
+    }
+    if (choice.finish_reason) reply.finishReason = choice.finish_reason;
+  }
+
+  /** The reply text, falling back to a tool call's arguments when the model answered with one. */
+  static _completionText({ text, toolArgs }) {
+    if (text.trim()) return text.trim();
+    if (!toolArgs) return '';
+    try {
+      const args = JSON.parse(toolArgs);
+      return String(args.command || args.input || args.content || args.text || toolArgs).trim();
+    } catch {
+      return toolArgs.trim();
+    }
+  }
+
+  /**
+   * Why a 200 from the completions endpoint carried no reply. Each of these
+   * used to resolve to '' and reach the user as "finished without producing a
+   * reply", which is what a relay's in-band error looked like.
+   */
+  static _emptyCompletionReason({ error, reasoning, finishReason }, { streamed, body } = {}) {
+    if (error) return error;
+    if (reasoning) {
+      return finishReason === 'length'
+        ? 'The model ran out of output tokens while still reasoning, before it wrote an answer.'
+        : 'The model returned reasoning but no answer.';
+    }
+    if (finishReason) return `The model returned no text (finish_reason: ${finishReason}).`;
+    if (streamed) return 'The LLM API stream ended without any reply text.';
+    const snippet = String(body || '').trim().slice(0, 200);
+    return snippet
+      ? `The LLM API response had no reply in it: ${snippet}`
+      : 'The LLM API returned an empty response.';
+  }
+}
+
+module.exports = CodexAdapter;

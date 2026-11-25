@@ -1,0 +1,291 @@
+'use client';
+
+/**
+ * Permission model v1.1 — "Share…" for an owned artifact (file or knowledge
+ * entry): pick people / agents / groups, see what the grant unlocks, grant;
+ * list and revoke existing grants; and, for whoever can manage it, flip the
+ * item between Private / Public (/ Inherit from thread for files).
+ *
+ * Exposed as a body (`ArtifactShareContent`), a popover with its own trigger
+ * (`ArtifactSharePopover`, for headers) and a controlled dialog
+ * (`ArtifactShareDialog`, for list-row menus where a popover has no anchor).
+ */
+
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Bot, Globe, Lock, MessagesSquare, Share2, User, Users, X } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
+import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import { Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/responsive-dialog';
+import { Item, ItemActions, ItemContent, ItemGroup, ItemMedia, ItemTitle } from '@/components/ui/item';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { WithTooltip } from '@/components/ui/with-tooltip';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { GranteePicker } from '@/components/sharing/grantee-picker';
+import { workspaceApi } from '@/lib/api';
+import type { Grantee, GranteeKind, GrantPreviewItem, ResourceGrant } from '@/lib/types';
+import { useFormatters, useT } from '@/lib/i18n';
+import type { ArtifactVisibility } from '@/lib/types';
+import { visibilityBadgeFor, type ArtifactKind } from '@/lib/artifact-access';
+import { ArtifactVisibilityBadge } from './artifact-access-badge';
+import { PublicLinkSection } from './public-link-section';
+import { WEB_PROJECT_TYPE } from '@/lib/web-projects';
+import { destructiveIconClass } from '@/lib/destructive-icon';
+
+/** Pages that render on the separate share domain rather than as a preview. */
+export function isWebPage(contentType: string | undefined, name: string): boolean {
+  return contentType === WEB_PROJECT_TYPE || /html/.test(contentType || '') || /\.html?$/i.test(name);
+}
+
+export interface ArtifactShareProps {
+  kind: ArtifactKind;
+  id: string;
+  name: string;
+  visibility: ArtifactVisibility | null | undefined;
+  effectiveVisibility?: ArtifactVisibility | null;
+  /** Owner / admin / `share` right — shows the visibility switcher. */
+  canManage: boolean;
+  /** Files attached to a thread may also inherit (visibility null). */
+  canInherit?: boolean;
+  onVisibilityChange?: (visibility: ArtifactVisibility | null) => Promise<void> | void;
+  /** Files only: lets the public-link section say how web pages are shown. */
+  contentType?: string;
+}
+
+function GranteeIcon({ kind }: { kind: GranteeKind }) {
+  const Icon = kind === 'agent' ? Bot : kind === 'group' ? Users : User;
+  return <Icon className="size-3.5 shrink-0 text-muted-foreground" />;
+}
+
+export function ArtifactShareContent({
+  kind, id, name, visibility, effectiveVisibility, canManage, canInherit = false, onVisibilityChange, contentType,
+}: ArtifactShareProps) {
+  const t = useT();
+  const { formatDate } = useFormatters();
+
+  // ── existing grants ──
+  const [grants, setGrants] = useState<ResourceGrant[] | null>(null);
+  const loadGrants = useCallback(async () => {
+    if (!canManage) { setGrants([]); return; }
+    try {
+      setGrants(await workspaceApi.listGrants(kind, id));
+    } catch {
+      setGrants([]);
+      toast.error(t('artifactAccess.grantsLoadFailed'));
+    }
+  }, [kind, id, t, canManage]);
+  useEffect(() => { loadGrants(); }, [loadGrants]);
+
+  const revoke = async (grant: ResourceGrant) => {
+    setGrants((prev) => prev?.filter((g) => g.id !== grant.id) ?? prev);
+    try {
+      await workspaceApi.revokeGrant(grant.id);
+      toast.success(t('artifactAccess.revoked'));
+    } catch {
+      toast.error(t('artifactAccess.revokeFailed'));
+      loadGrants();
+    }
+  };
+
+  // ── new grants ──
+  const [picked, setPicked] = useState<Grantee[]>([]);
+  const [sharing, setSharing] = useState(false);
+  const [preview, setPreview] = useState<{ for: string; items: GrantPreviewItem[] } | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  // Preview follows the most recently picked grantee — enough to answer
+  // "what does this unlock" without a request per chip.
+  const last = picked[picked.length - 1];
+  useEffect(() => {
+    if (!last) { setPreview(null); return; }
+    const key = `${last.kind}:${last.id}`;
+    let cancelled = false;
+    setPreviewLoading(true);
+    workspaceApi.previewGrant(kind, id, last.kind, last.id)
+      .then((p) => { if (!cancelled) setPreview({ for: key, items: p.items }); })
+      .catch(() => { if (!cancelled) setPreview({ for: key, items: [] }); })
+      .finally(() => { if (!cancelled) setPreviewLoading(false); });
+    return () => { cancelled = true; };
+  }, [kind, id, last?.kind, last?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const exclude = useMemo(() => (grants ?? []).map((g) => g.grantee_id), [grants]);
+
+  const share = async () => {
+    if (!canManage || picked.length === 0 || sharing) return;
+    setSharing(true);
+    let done = 0;
+    for (const g of picked) {
+      try {
+        await workspaceApi.createGrant({
+          resource_kind: kind,
+          resource_id: id,
+          grantee_kind: g.kind,
+          grantee_id: g.id,
+          rights: ['read'],
+        });
+        done += 1;
+      } catch {
+        toast.error(t('artifactAccess.shareFailed', { grantee: g.label }));
+      }
+    }
+    setSharing(false);
+    if (done > 0) {
+      toast.success(t('artifactAccess.shared', { count: done }));
+      setPicked([]);
+      await loadGrants();
+    }
+  };
+
+  // ── visibility ──
+  const [switching, setSwitching] = useState(false);
+  const current = visibilityBadgeFor(kind, visibility, effectiveVisibility);
+  const setVisibility = async (next: ArtifactVisibility | null) => {
+    if (!onVisibilityChange || switching) return;
+    setSwitching(true);
+    try {
+      await onVisibilityChange(next);
+      toast.success(t('artifactAccess.visibilityUpdated'));
+    } catch {
+      toast.error(t('artifactAccess.visibilityUpdateFailed'));
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  const visOption = (badge: 'private' | 'public' | 'inherit', label: string, Icon: typeof Lock) => (
+    <ToggleGroupItem key={badge} value={badge} className="flex-1 text-xs">
+      <Icon data-icon="inline-start" />
+      {label}
+    </ToggleGroupItem>
+  );
+
+  return (
+    <div className="flex flex-col gap-4 text-sm">
+      {/* Anyone with the link — the one way to reach people outside the workspace */}
+      <PublicLinkSection kind={kind} id={id} webPage={isWebPage(contentType, name)} />
+      {/* Visibility */}
+      <section className="flex flex-col gap-2">
+        <div className="flex items-center justify-between gap-2">
+          <h4 className="text-sm font-medium">{t('artifactAccess.visibility')}</h4>
+          <ArtifactVisibilityBadge kind={kind} visibility={visibility} effectiveVisibility={effectiveVisibility} />
+        </div>
+        {canManage && onVisibilityChange && (
+          <ToggleGroup type="single" variant="outline" size="sm" className="w-full" disabled={switching} aria-label={t('artifactAccess.visibility')}
+            value={current} onValueChange={(next) => { if (next) void setVisibility(next === 'inherit' ? null : next as ArtifactVisibility); }}>
+            {visOption('private', t('artifactAccess.makePrivate'), Lock)}
+            {visOption('public', t('artifactAccess.makePublic'), Globe)}
+            {canInherit && visOption('inherit', t('artifactAccess.inheritFromThread'), MessagesSquare)}
+          </ToggleGroup>
+        )}
+      </section>
+
+      {!canManage && <p className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">{t('artifactAccess.ownerMustShare')}</p>}
+      {/* Share with… */}
+      {canManage && <section className="flex flex-col gap-2">
+        <h4 className="text-sm font-medium">{t('artifactAccess.shareWith')}</h4>
+        <GranteePicker value={picked} onChange={setPicked} exclude={exclude} />
+        {picked.length > 0 && (
+          <div className="rounded-md border bg-muted/30 px-2.5 py-2 text-xs text-muted-foreground">
+            {previewLoading ? (
+              <span className="inline-flex items-center gap-1.5"><Spinner className="size-3" />{t('artifactAccess.previewLoading')}</span>
+            ) : (
+              <>
+                <p className="font-medium text-foreground/80">{t('artifactAccess.previewTitle')}</p>
+                {preview && preview.items.length > 0 ? (
+                  <ul className="mt-1 flex flex-col gap-0.5">
+                    {preview.items.slice(0, 5).map((item) => (
+                      <li key={`${item.kind}:${item.id}`} className="truncate">· {item.title || item.id}</li>
+                    ))}
+                    {preview.items.length > 5 && <li>· +{preview.items.length - 5}</li>}
+                  </ul>
+                ) : (
+                  <p className="mt-0.5">{t('artifactAccess.previewNone')}</p>
+                )}
+              </>
+            )}
+          </div>
+        )}
+        {/* Only once someone is picked: a permanently greyed-out "Share" read as broken. */}
+        {picked.length > 0 && (
+          <Button size="sm" onClick={share} disabled={sharing} className="w-full">
+            {sharing ? <Spinner className="size-3.5" /> : <Share2 className="size-3.5" />}
+            {sharing ? t('artifactAccess.sharing') : t('artifactAccess.shareAction')}
+          </Button>
+        )}
+      </section>}
+
+      {/* Who has access */}
+      {canManage && <section className="flex flex-col gap-1.5">
+        <h4 className="text-sm font-medium">{t('artifactAccess.grantsTitle')}</h4>
+        {grants === null ? (
+          <p className="text-xs text-muted-foreground">{t('artifactAccess.grantsLoading')}</p>
+        ) : grants.length === 0 ? (
+          <p className="text-xs text-muted-foreground">{t('artifactAccess.grantsEmpty')}</p>
+        ) : (
+          <ItemGroup className="no-scrollbar max-h-48 gap-0.5 overflow-y-auto">
+            {grants.map((g) => (
+              <Item key={g.id} role="listitem" size="xs" className="flex-nowrap px-1.5 py-1 hover:bg-muted/50">
+                <ItemMedia><GranteeIcon kind={g.grantee_kind} /></ItemMedia>
+                <ItemContent className="min-w-0"><ItemTitle className="w-full truncate text-xs font-normal">{g.grantee_label || g.grantee_id}</ItemTitle></ItemContent>
+                {g.expires_at && (
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {t('agentAccess.expiresOn', { date: formatDate(g.expires_at) })}
+                  </span>
+                )}
+                {canManage && (
+                  <ItemActions>
+                    <WithTooltip label={t('artifactAccess.revoke')}>
+                      <Button variant="ghost" size="icon-xs" className={destructiveIconClass} onClick={() => revoke(g)} aria-label={t('artifactAccess.revoke')}>
+                        <X />
+                      </Button>
+                    </WithTooltip>
+                  </ItemActions>
+                )}
+              </Item>
+            ))}
+          </ItemGroup>
+        )}
+      </section>}
+      <span className="sr-only">{t('artifactAccess.shareTitle', { name })}</span>
+    </div>
+  );
+}
+
+/** Header-side share: a button that opens the share body in a popover. */
+export function ArtifactSharePopover({ trigger, align = 'end', ...props }: ArtifactShareProps & { trigger?: ReactNode; align?: 'start' | 'center' | 'end' }) {
+  const t = useT();
+  return (
+    <Popover>
+      {trigger ? <PopoverTrigger asChild>{trigger}</PopoverTrigger> : (
+        <WithTooltip label={t('artifactAccess.share')}>
+          <PopoverTrigger asChild>
+            <Button variant="ghost" size="sm" className="text-muted-foreground" aria-label={t('artifactAccess.share')}>
+              <Share2 data-icon="inline-start" />
+              <span className="hidden sm:inline">{t('artifactAccess.share')}</span>
+            </Button>
+          </PopoverTrigger>
+        </WithTooltip>
+      )}
+      <PopoverContent align={align} className="w-80 p-3" onClick={(e) => e.stopPropagation()}>
+        <ArtifactShareContent {...props} />
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/** Menu-launched share: controlled dialog for list rows and grid tiles. */
+export function ArtifactShareDialog({ open, onOpenChange, ...props }: ArtifactShareProps & { open: boolean; onOpenChange: (open: boolean) => void }) {
+  const t = useT();
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-sm" onClick={(e) => e.stopPropagation()}>
+        <DialogHeader>
+          <DialogTitle className="truncate">{t('artifactAccess.shareTitle', { name: props.name })}</DialogTitle>
+        </DialogHeader>
+        <DialogBody>
+          <ArtifactShareContent {...props} />
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
+  );
+}

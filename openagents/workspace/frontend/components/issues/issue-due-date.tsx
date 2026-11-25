@@ -1,0 +1,61 @@
+'use client';
+
+import { useState } from 'react';
+import { CalendarDays, ChevronDown } from 'lucide-react';
+import { useI18n, useT } from '@/lib/i18n';
+import { format, parseISO } from 'date-fns';
+import { enUS, zhCN } from 'react-day-picker/locale';
+import type { WorkspaceIssue } from '@/lib/types';
+import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Calendar } from '@/components/ui/calendar';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { WithTooltip } from '@/components/ui/with-tooltip';
+
+export function IssueDueDate({ issue, busy, canEdit, update }: {
+  issue: Pick<WorkspaceIssue, 'id' | 'due_date'>;
+  busy: boolean;
+  canEdit: boolean;
+  update: (values: { due_date: string | null }) => void;
+}) {
+  const t = useT();
+  const { locale } = useI18n();
+  const [open, setOpen] = useState(false);
+  const save = (value: string | null) => {
+    if (busy || !canEdit) return;
+    if (value !== (issue.due_date || null)) update({ due_date: value });
+    setOpen(false);
+  };
+  // Keep this a calendar date throughout; UTC conversion can move a deadline
+  // to the previous day for people west of Greenwich.
+  const label = issue.due_date || t('issues.noDueDate');
+  return <section className="flex min-w-0 items-center gap-2">
+    <h3 id={`issue-due-date-heading-${issue.id}`} className="shrink-0 text-xs font-medium text-muted-foreground">{t('issues.dueDate')}</h3>
+    {canEdit ? <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button variant="ghost" size="sm" disabled={busy} aria-label={`${t('issues.dueDate')}: ${label}`} className="min-w-0 flex-1 justify-start gap-2.5 px-1.5 text-xs">
+          <CalendarDays data-icon="inline-start" className="size-4 text-muted-foreground" />
+          <span className={cn('flex-1 text-left', issue.due_date ? 'font-medium' : 'font-normal text-muted-foreground')}>{label}</span>
+          <ChevronDown data-icon="inline-end" className="text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-auto p-0">
+        <Calendar
+          mode="single"
+          required
+          autoFocus
+          locale={locale === 'zh-CN' ? zhCN : enUS}
+          selected={issue.due_date ? parseISO(issue.due_date) : undefined}
+          defaultMonth={issue.due_date ? parseISO(issue.due_date) : undefined}
+          disabled={busy}
+          onSelect={date => { if (date) save(format(date, 'yyyy-MM-dd')); }}
+        />
+        {issue.due_date && <div className="border-t p-2">
+          <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => save(null)} className="w-full">{t('issues.clearDueDate')}</Button>
+        </div>}
+      </PopoverContent>
+    </Popover> : <WithTooltip label={t('issues.dueDateOwnerOnly')}><div aria-labelledby={`issue-due-date-heading-${issue.id}`} className="flex min-h-8 min-w-0 flex-1 items-center gap-2.5 px-1.5 text-xs text-muted-foreground">
+      <CalendarDays className="size-4 shrink-0" />{issue.due_date ? <time dateTime={issue.due_date}>{label}</time> : label}
+    </div></WithTooltip>}
+  </section>;
+}

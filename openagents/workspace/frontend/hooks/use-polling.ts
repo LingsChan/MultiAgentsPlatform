@@ -1,0 +1,509 @@
+'use client';
+
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { workspaceApi } from '@/lib/api';
+import { eventToMessage } from '@/lib/types';
+import { compareMessages, mergeMessages } from '@/lib/message-merge';
+import { useLiveStream } from '@/lib/live-stream-context';
+import type { ONMEvent, WorkspaceMessage } from '@/lib/types';
+
+interface UsePollingOptions {
+  sessionId: string | null;
+  enabled?: boolean;
+  /** Pre-loaded messages to display immediately (avoids loading state). */
+  initialMessages?: WorkspaceMessage[];
+}
+
+/** Parse a DM session ID like "dm:agentA,agentB" into agent addresses. */
+function parseDMSession(sessionId: string | null): [string, string] | null {
+  if (!sessionId?.startsWith('dm:')) return null;
+  const parts = sessionId.slice(3).split(',', 2);
+  if (parts.length === 2) return [parts[0], parts[1]];
+  return null;
+}
+
+function normalizeAgentAddress(address: string): string {
+  return address.replace(/^openagents:/, '');
+}
+
+function messageBelongsToSession(
+  msg: WorkspaceMessage,
+  sessionId: string,
+  dmPair: [string, string] | null,
+): boolean {
+  if (!dmPair) return msg.sessionId === sessionId;
+  return (
+    msg.sessionId === sessionId ||
+    dmPair.includes(msg.sessionId) ||
+    dmPair.map(normalizeAgentAddress).includes(normalizeAgentAddress(msg.sessionId))
+  );
+}
+
+function scopeMessageToSession(
+  msg: WorkspaceMessage,
+  sessionId: string,
+  dmPair: [string, string] | null,
+): WorkspaceMessage | null {
+  if (!messageBelongsToSession(msg, sessionId, dmPair)) return null;
+  return dmPair ? { ...msg, sessionId } : msg;
+}
+
+function scopeMessagesToSession(
+  msgs: WorkspaceMessage[],
+  sessionId: string,
+  dmPair: [string, string] | null,
+): WorkspaceMessage[] {
+  return msgs.flatMap((msg) => {
+    const scoped = scopeMessageToSession(msg, sessionId, dmPair);
+    return scoped ? [scoped] : [];
+  });
+}
+
+function eventsToScopedMessages(
+  events: ONMEvent[],
+  sessionId: string,
+  dmPair: [string, string] | null,
+): WorkspaceMessage[] {
+  return scopeMessagesToSession(events.map(eventToMessage), sessionId, dmPair);
+}
+
+export function useMessagePolling({ sessionId, enabled = true, initialMessages }: UsePollingOptions) {
+  const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasOlder, setHasOlder] = useState(false);
+  // Increments when messages are bulk-replaced (backfill/session switch) to signal scroll-to-bottom
+  const [generation, setGeneration] = useState(0);
+  // Visibility changes tear down background transports and reconnect on return.
+  const [reconnectNonce, setReconnectNonce] = useState(0);
+
+  // Refs for cursor tracking
+  const newestIdRef = useRef<string | null>(null);
+  // Newest known message, kept alongside newestIdRef so the cursor can only
+  // advance chronologically — a late catch-up batch must not roll it back
+  // behind a message the SSE stream already delivered.
+  const newestMsgRef = useRef<WorkspaceMessage | null>(null);
+  const oldestIdRef = useRef<string | null>(null);
+  const lastActivityRef = useRef<number>(Date.now());
+  const historyLoadedRef = useRef(false);
+  // Track current session to discard stale responses
+  const currentSessionRef = useRef<string | null>(sessionId);
+  // True while the newest message is an agent step (status/thinking) — i.e. an
+  // agent is mid-work. Drives fast polling in the fallback path so the final
+  // answer lands quickly even when the user is idle (common while waiting).
+  const agentWorkingRef = useRef(false);
+  const pollInFlightRef = useRef<{ sessionId: string } | null>(null);
+
+  // Switch the displayed data before the browser paints the newly selected
+  // thread. A passive effect leaves one frame of the previous/empty thread,
+  // followed by another frame of the loading spinner on a cache miss.
+  //
+  // <Activity> re-runs this when a kept-alive thread view is shown again with
+  // the same session. Its messages are still on screen and the reconnecting
+  // stream backfills anything missed (see onopen below), so only a real
+  // session change resets — resetting on reveal blanked the thread to a
+  // spinner and reloaded its whole history on every switch back.
+  const seededSessionRef = useRef<string | null | undefined>(undefined);
+  useLayoutEffect(() => {
+    currentSessionRef.current = sessionId;
+    if (seededSessionRef.current === sessionId) return;
+    seededSessionRef.current = sessionId;
+    const nextDMPair = parseDMSession(sessionId);
+    const scopedInitialMessages = sessionId && initialMessages
+      ? scopeMessagesToSession(initialMessages, sessionId, nextDMPair)
+      : [];
+
+    if (scopedInitialMessages.length > 0) {
+      // Seed with cached messages for instant display
+      setMessages(scopedInitialMessages);
+      newestMsgRef.current = scopedInitialMessages[scopedInitialMessages.length - 1];
+      newestIdRef.current = newestMsgRef.current.messageId;
+      oldestIdRef.current = scopedInitialMessages[0].messageId;
+      historyLoadedRef.current = true;
+      setHasOlder(true); // assume there may be older until proven otherwise
+      setLoading(false);
+    } else {
+      setMessages([]);
+      newestIdRef.current = null;
+      newestMsgRef.current = null;
+      oldestIdRef.current = null;
+      historyLoadedRef.current = false;
+      setHasOlder(false);
+      setLoading(!!sessionId);
+    }
+  }, [sessionId]); // intentionally omit initialMessages — only seed on session change
+
+  // Advance the newest-message cursor, but only forward in time.
+  const bumpNewest = useCallback((msg: WorkspaceMessage) => {
+    if (!newestMsgRef.current || compareMessages(msg, newestMsgRef.current) > 0) {
+      newestMsgRef.current = msg;
+      newestIdRef.current = msg.messageId;
+    }
+  }, []);
+
+  // Keep agentWorkingRef in sync with the newest message.
+  useEffect(() => {
+    const last = messages[messages.length - 1];
+    agentWorkingRef.current = !!last && last.senderType !== 'human' &&
+      (last.messageType === 'status' || last.messageType === 'thinking');
+  }, [messages]);
+
+  // Track user activity for adaptive polling
+  useEffect(() => {
+    const onActivity = () => {
+      lastActivityRef.current = Date.now();
+    };
+    window.addEventListener('keydown', onActivity);
+    window.addEventListener('click', onActivity);
+    return () => {
+      window.removeEventListener('keydown', onActivity);
+      window.removeEventListener('click', onActivity);
+    };
+  }, []);
+
+  // Load recent history (newest messages first, then reverse for display)
+  const dmPair = useMemo(() => parseDMSession(sessionId), [sessionId]);
+  const live = useLiveStream();
+
+  const loadHistory = useCallback(async (): Promise<boolean> => {
+    if (!sessionId) return false;
+
+    setLoading(true);
+    try {
+      const result = dmPair
+        ? await workspaceApi.pollConversation(dmPair[0], dmPair[1], {
+            sort: 'desc',
+            limit: 50,
+            excludeMessageTypes: ['thinking', 'status', 'todos'],
+          })
+        : await workspaceApi.loadMessageHistory(sessionId, { limit: 50 });
+
+      // Discard if session changed
+      if (sessionId !== currentSessionRef.current) return false;
+
+      // Events come newest-first from sort=desc, reverse for chronological display.
+      // Guard on the SCOPED result, not result.events: a page can be non-empty
+      // yet scope down to zero messages, in which case historicMessages[-1] /
+      // [0] would be undefined and crash on .messageId.
+      const historicMessages = result.events.length > 0
+        ? eventsToScopedMessages(result.events, sessionId, dmPair).reverse()
+        : [];
+      if (historicMessages.length > 0) {
+        // Merge rather than replace — the SSE stream opens alongside the
+        // history request and may already have delivered newer messages;
+        // replacing would drop them and roll the cursor back, and a failed
+        // catch-up would never get them again (SSE does not replay).
+        setMessages((prev) => mergeMessages(prev, historicMessages));
+        bumpNewest(historicMessages[historicMessages.length - 1]);
+        // History is the oldest data we have — SSE only delivers new events.
+        oldestIdRef.current = historicMessages[0].messageId;
+        setHasOlder(result.has_more);
+        setGeneration((g) => g + 1);
+      } else {
+        // No chat history — but keep whatever the SSE stream has already
+        // delivered, and leave the cursor wherever bumpNewest put it.
+        oldestIdRef.current = null;
+        setHasOlder(false);
+      }
+
+      historyLoadedRef.current = true;
+      return true;
+    } catch {
+      historyLoadedRef.current = true;
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId, dmPair, bumpNewest]);
+
+  // Forward poll: fetch new messages since the newest known
+  const poll = useCallback(async () => {
+    const isVisible = () => document.visibilityState !== 'hidden';
+    if (!sessionId || !historyLoadedRef.current || !isVisible()) return;
+    if (pollInFlightRef.current?.sessionId === sessionId) return;
+    const flight = { sessionId };
+    pollInFlightRef.current = flight;
+
+    try {
+      // Keep fetching while there are more events (handles bursts of status
+      // messages). Pagination advances a local cursor — the shared
+      // newestIdRef may concurrently jump ahead via SSE, which would skip
+      // the batches this loop is still backfilling.
+      let cursor = newestIdRef.current;
+      let hasMore = true;
+      while (hasMore && isVisible()) {
+        const result = dmPair
+          ? await (async () => {
+              const r = await workspaceApi.pollConversation(dmPair[0], dmPair[1], {
+                after: cursor ?? undefined,
+              });
+              return {
+                messages: eventsToScopedMessages(r.events, sessionId, dmPair),
+                hasMore: r.has_more,
+              };
+            })()
+          : await workspaceApi.pollMessages(
+              sessionId,
+              cursor ?? undefined,
+            );
+
+        // Discard response if session changed while request was in flight
+        if (sessionId !== currentSessionRef.current) return;
+
+        const newMessages = scopeMessagesToSession(result.messages, sessionId, dmPair);
+        hasMore = result.hasMore && newMessages.length > 0;
+
+        if (newMessages.length > 0) {
+          const lastMsg = newMessages[newMessages.length - 1];
+          cursor = lastMsg.messageId;
+          bumpNewest(lastMsg);
+          setMessages((prev) => mergeMessages(prev, newMessages));
+        }
+      }
+    } catch {
+      // Polling error — will retry on next interval
+    } finally {
+      if (pollInFlightRef.current === flight) pollInFlightRef.current = null;
+    }
+  }, [sessionId, dmPair, bumpNewest]);
+
+  // Load older messages (infinite scroll upward)
+  const loadOlder = useCallback(async () => {
+    if (!sessionId || !hasOlder || loadingOlder) return;
+
+    setLoadingOlder(true);
+    try {
+      const result = dmPair
+        ? await workspaceApi.pollConversation(dmPair[0], dmPair[1], {
+            before: oldestIdRef.current ?? undefined,
+            sort: 'desc',
+            limit: 30,
+            excludeMessageTypes: ['thinking', 'status', 'todos'],
+          })
+        : await workspaceApi.loadMessageHistory(sessionId, {
+            before: oldestIdRef.current ?? undefined,
+            limit: 30,
+          });
+
+      if (sessionId !== currentSessionRef.current) return;
+
+      if (result.events.length > 0) {
+        const olderMessages = eventsToScopedMessages(result.events, sessionId, dmPair).reverse();
+        oldestIdRef.current = olderMessages.length > 0 ? olderMessages[0].messageId : oldestIdRef.current;
+        setHasOlder(olderMessages.length > 0 && result.has_more);
+
+        setMessages((prev) => mergeMessages(prev, olderMessages));
+      } else {
+        setHasOlder(false);
+      }
+    } catch {
+      // Best-effort
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [sessionId, hasOlder, loadingOlder, dmPair]);
+
+  // Initial load + SSE with polling fallback
+  useEffect(() => {
+    if (!sessionId || !enabled || document.visibilityState === 'hidden') return;
+    let cancelled = false;
+
+    if (!historyLoadedRef.current) {
+      // History hydration excludes intermediate step events (thinking/status/
+      // todos), and SSE only carries events published after the connection
+      // opens — so without an explicit catch-up poll, steps emitted before
+      // the refresh would never load and an agent mid-task would look idle.
+      // The forward poll is unfiltered and starts after the newest chat
+      // message, so it backfills exactly that gap. Only run it when a cursor
+      // actually exists — after a failed history request, or a successful
+      // one over a channel with no chat messages at all (only excluded step
+      // events), the cursor is null and the poll loop would page through
+      // the channel's entire event log from the beginning.
+      loadHistory().then((ok) => {
+        if (!cancelled && ok && newestIdRef.current) poll();
+      });
+    }
+
+    // The workspace's live stream (beta setting "realtime_stream") carries this
+    // thread or DM on the tab's single connection. Catch up with a poll on
+    // every (re)connect or when it reports it may have missed something. When
+    // it is not live, fall through to the per-thread stream and polling below.
+    const liveStream = live.state === 'live' ? live.stream : null;
+    if (liveStream) {
+      const offEvent = liveStream.onEvent((event) => {
+        if (cancelled || sessionId !== currentSessionRef.current) return;
+        if (event.type && event.type !== 'workspace.message.posted') return;
+        try {
+          const msg = scopeMessageToSession(eventToMessage(event as unknown as ONMEvent), sessionId, dmPair);
+          if (!msg) return;
+          bumpNewest(msg);
+          setMessages((prev) => mergeMessages(prev, [msg]));
+        } catch {
+          // malformed event
+        }
+      });
+      const offSync = liveStream.onResync(() => {
+        if (!cancelled && newestIdRef.current) void poll();
+      });
+      if (historyLoadedRef.current && newestIdRef.current) void poll();
+      return () => {
+        cancelled = true;
+        offEvent();
+        offSync();
+      };
+    }
+
+    // Try SSE first for instant updates, fall back to polling
+    const isDM = sessionId.startsWith('dm:');
+    let eventSource: EventSource | null = null;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+    let connectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let retryDelay = 5_000;
+    let polling = false;
+    let pollGeneration = 0;
+    // clearTimeout cannot stop a timer that already fired and is awaiting
+    // poll(); without this flag that callback re-schedules after cleanup and
+    // the old loop runs forever. Every re-run (each tab refocus bumps the
+    // reconnect nonce) could leak one more 2s loop.
+    const stopPolling = () => {
+      polling = false;
+      pollGeneration++;
+      if (timeout) clearTimeout(timeout);
+      timeout = null;
+    };
+
+    const startPolling = () => {
+      if (cancelled || polling) return;
+      polling = true;
+      const generation = ++pollGeneration;
+      const getDelay = () => {
+        // Poll fast while an agent is actively working, regardless of user
+        // idle — otherwise a 15s backoff strands the UI on "thinking…" for
+        // seconds after the answer has already landed.
+        if (agentWorkingRef.current) return 2_000;
+        const idle = Date.now() - lastActivityRef.current;
+        return idle > 60_000 ? 15_000 : 2_000;
+      };
+      const schedule = () => {
+        if (cancelled || !polling || generation !== pollGeneration) return;
+        timeout = setTimeout(async () => {
+          timeout = null;
+          await poll();
+          schedule();
+        }, getDelay());
+      };
+      schedule();
+    };
+
+    const connect = () => {
+      if (cancelled) return;
+      const retry = () => {
+        if (cancelled || retryTimeout) return;
+        // A transient disconnect must not leave a visible thread polling for
+        // the rest of its lifetime. Rebuild the URL to pick up refreshed auth.
+        const delay = retryDelay + Math.floor(Math.random() * retryDelay * 0.2);
+        retryDelay = Math.min(retryDelay * 2, 60_000);
+        retryTimeout = setTimeout(() => {
+          retryTimeout = null;
+          connect();
+        }, delay);
+      };
+      try {
+        const sseUrl = workspaceApi.getSSEUrl(sessionId);
+        const source = new EventSource(sseUrl);
+        eventSource = source;
+        const failed = () => {
+          if (cancelled || eventSource !== source) return;
+          source.close();
+          eventSource = null;
+          if (connectTimeout) clearTimeout(connectTimeout);
+          connectTimeout = null;
+          startPolling();
+          retry();
+        };
+        // Some intermediaries stall without opening or raising an error.
+        connectTimeout = setTimeout(failed, 10_000);
+        source.onopen = () => {
+          if (cancelled || eventSource !== source) return;
+          if (connectTimeout) clearTimeout(connectTimeout);
+          connectTimeout = null;
+          retryDelay = 5_000;
+          stopPolling();
+          // The stream is live-only: backfill messages missed while reconnecting.
+          if (newestIdRef.current) void poll();
+        };
+
+        source.onmessage = (ev) => {
+          if (cancelled || eventSource !== source || sessionId !== currentSessionRef.current) return;
+          try {
+            const event = JSON.parse(ev.data);
+            // The SSE stream carries every event for the channel, not just
+            // chat messages. Only render posted messages — otherwise control
+            // events like network.channel.join/leave (emitted when adding or
+            // removing an agent) get converted into empty "User" bubbles.
+            if (event.type && event.type !== 'workspace.message.posted') return;
+            const msg = scopeMessageToSession(eventToMessage(event), sessionId, null);
+            if (!msg) return;
+            bumpNewest(msg);
+            setMessages((prev) => mergeMessages(prev, [msg]));
+          } catch {
+            // malformed event
+          }
+        };
+
+        source.onerror = failed;
+      } catch {
+        startPolling();
+        retry();
+      }
+    };
+    if (isDM) startPolling();
+    else connect();
+
+    return () => {
+      cancelled = true;
+      if (eventSource) eventSource.close();
+      stopPolling();
+      if (retryTimeout) clearTimeout(retryTimeout);
+      if (connectTimeout) clearTimeout(connectTimeout);
+    };
+  }, [sessionId, enabled, poll, loadHistory, reconnectNonce, live.state, live.stream, dmPair, bumpNewest]);
+
+  // Recover after the tab is backgrounded (esp. mobile browsers, which suspend
+  // timers and kill the EventSource). On return to the foreground: immediately
+  // poll to catch up any messages missed while hidden — so the UI doesn't sit
+  // on a stale "thinking…" after the agent already answered — and bump the
+  // reconnect nonce to re-establish a fresh SSE connection for live updates.
+  useEffect(() => {
+    if (!sessionId || !enabled) return;
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        lastActivityRef.current = Date.now();
+        poll();
+      }
+      // Also tear down the stream/fallback timers when hidden. Other workspace
+      // discovery/notification mechanisms remain responsible for background UI.
+      setReconnectNonce((n) => n + 1);
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [sessionId, enabled, poll]);
+
+  // If seeded with cache, do a background refresh to catch any new messages
+  useEffect(() => {
+    if (!sessionId || !enabled) return;
+    if (initialMessages && initialMessages.length > 0) {
+      // Immediately poll for new messages after cache display
+      poll();
+    }
+  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Force immediate poll (after sending a message)
+  const forceRefresh = useCallback(() => {
+    lastActivityRef.current = Date.now();
+    poll();
+  }, [poll]);
+
+  return { messages, loading, forceRefresh, generation, loadOlder, hasOlder, loadingOlder };
+}

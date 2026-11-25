@@ -1,0 +1,169 @@
+// @vitest-environment jsdom
+import React, { act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { expect, it, vi } from 'vitest';
+import { NavRail } from './nav-rail';
+import { NavSecondary } from './nav-secondary';
+import { OnboardingSurfaceContext } from './onboarding-surface';
+
+const state = vi.hoisted(() => ({ openView: vi.fn(), unreadThreadsTotal: 0, servicesEnabled: true as boolean | undefined }));
+vi.mock('./layout-context', () => ({ useLayout: () => ({
+  viewMode: 'threads', railViewMode: 'threads', openView: state.openView, isRailExpanded: true, setThreadFilter: vi.fn(),
+}), RAIL_WIDTH_COLLAPSED: 48, RAIL_WIDTH_EXPANDED: 208 }));
+vi.mock('@/lib/workspace-context', () => ({ useWorkspace: () => ({
+  unreadThreadsTotal: state.unreadThreadsTotal, workspace: { name: 'Test', settings: { services_enabled: state.servicesEnabled } }, agents: [{ agentName: 'shared', ownerEmail: 'maya@example.com', status: 'online', canStartThread: true }],
+  currentUser: { id: 'sam@example.com' }, tasks: [], onlineUsers: [], pendingApprovalsByAgent: {}, unreadDmCounts: {},
+}) }));
+vi.mock('@/lib/i18n', () => ({ useT: () => (key: string) => key }));
+vi.mock('@/components/ui/sidebar', () => {
+  const wrap = ({ children }: { children?: React.ReactNode }) => React.createElement('div', null, children);
+  return Object.fromEntries(['Sidebar', 'SidebarContent', 'SidebarFooter', 'SidebarGroup', 'SidebarGroupContent', 'SidebarGroupLabel', 'SidebarHeader', 'SidebarMenu', 'SidebarMenuItem', 'SidebarMenuAction'].map(k => [k, wrap]).concat([
+    ['SidebarMenuButton', ({ children, onClick, isActive, ...props }: { children?: React.ReactNode; onClick?: () => void; isActive?: boolean; 'aria-current'?: React.AriaAttributes['aria-current'] }) => React.createElement('button', { onClick, 'data-active': isActive, 'aria-current': props['aria-current'] }, children)],
+  ]));
+});
+vi.mock('@/components/ui/tooltip', () => {
+  const wrap = ({ children }: { children?: React.ReactNode }) => React.createElement('div', null, children);
+  return { Tooltip: wrap, TooltipContent: wrap, TooltipTrigger: wrap };
+});
+vi.mock('next/image', () => ({ default: () => null }));
+vi.mock('./sidebar-members', () => ({ SidebarMembers: () => null }));
+vi.mock('@/components/threads/desktop-notification-prompt', () => ({ DesktopNotificationPrompt: () => null }));
+vi.mock('./search-menu', () => ({ SearchMenu: () => null }));
+vi.mock('./user-menu', () => ({ UserMenu: () => null }));
+vi.mock('./rail-edge', () => ({ RailEdge: () => null }));
+vi.stubGlobal('React', React);
+vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+
+it('shows shared agents alongside workspace navigation for a member with no owned agents', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  const root = createRoot(host);
+  try {
+    await act(async () => root.render(React.createElement(NavRail)));
+    for (const label of ['views.files', 'views.knowledge', 'views.issues', 'views.inbox', 'collab.viewAgents']) expect(host.textContent).toContain(label);
+    expect(host.textContent).toContain('shared');
+    expect(host.textContent).toContain('nav.agentsWithCount');
+    expect(host.textContent).not.toContain('views.tasks');
+    const services = [...host.querySelectorAll('button')].find(b => b.textContent === 'collab.viewAgents')!;
+    await act(async () => services.click());
+    expect(state.openView).toHaveBeenCalledWith('agents');
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
+it('shows the Threads unread total, caps large counts, and clears the badge at zero', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  const root = createRoot(host);
+  const threads = () => [...host.querySelectorAll('button')].find(b => b.textContent?.startsWith('views.threads'))!;
+  try {
+    state.unreadThreadsTotal = 7;
+    await act(async () => root.render(React.createElement(NavRail)));
+    expect(threads().querySelector('[aria-label="nav.unreadCount"]')?.textContent).toBe('7');
+    state.unreadThreadsTotal = 120;
+    await act(async () => root.render(React.createElement(NavRail)));
+    expect(threads().querySelector('[aria-label="nav.unreadCount"]')?.textContent).toBe('99+');
+    state.unreadThreadsTotal = 0;
+    await act(async () => root.render(React.createElement(NavRail)));
+    expect(threads().querySelector('[aria-label="nav.unreadCount"]')).toBeNull();
+  } finally { state.unreadThreadsTotal = 0; await act(async () => root.unmount()); host.remove(); }
+});
+
+it('selects Manage Agents rather than the seeded thread while onboarding owns the page', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  const root = createRoot(host);
+  const dismiss = vi.fn();
+  try {
+    await act(async () => root.render(React.createElement(OnboardingSurfaceContext.Provider, { value: { active: true, onDismiss: dismiss } }, React.createElement(NavRail))));
+    const threads = [...host.querySelectorAll('button')].find(b => b.textContent === 'views.threads')!;
+    const connect = [...host.querySelectorAll('button')].find(b => b.textContent === 'nav.manageAgents')!;
+    expect(threads.getAttribute('data-active')).toBe('false');
+    expect(connect.getAttribute('data-active')).toBe('true');
+    expect(connect.getAttribute('aria-current')).toBe('page');
+    await act(async () => threads.click());
+    expect(dismiss).toHaveBeenCalledOnce();
+    expect(state.openView).toHaveBeenCalledWith('threads');
+    await act(async () => root.render(React.createElement(OnboardingSurfaceContext.Provider, { value: { active: false } }, React.createElement(NavRail))));
+    expect(threads.getAttribute('data-active')).toBe('true');
+    expect(connect.getAttribute('data-active')).toBe('false');
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
+it('puts Manage Agents at the top with Inbox as the envelope beside it, as dashboard-01 does', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  const root = createRoot(host);
+  try {
+    await act(async () => root.render(React.createElement(NavRail)));
+    const buttons = [...host.querySelectorAll('button')];
+    const manage = buttons.findIndex(b => b.textContent === 'nav.manageAgents');
+    const threads = buttons.findIndex(b => b.textContent?.startsWith('views.threads'));
+    expect(manage).toBeGreaterThanOrEqual(0);
+    expect(manage).toBeLessThan(threads);
+    const inbox = host.querySelectorAll('button[aria-label="views.inbox"]');
+    expect(inbox).toHaveLength(1);
+    await act(async () => (inbox[0] as HTMLButtonElement).click());
+    expect(state.openView).toHaveBeenCalledWith('inbox');
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
+it('shows an active Welcome tab only during the introduction, then selects Connect Agent', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  const root = createRoot(host);
+  const button = (label: string) => [...host.querySelectorAll('button')].find(b => b.textContent === label);
+  try {
+    await act(async () => root.render(React.createElement(OnboardingSurfaceContext.Provider,
+      { value: { active: true, welcome: true } }, React.createElement(NavRail))));
+    expect(button('nav.welcome')?.getAttribute('aria-current')).toBe('page');
+    expect(button('nav.manageAgents')?.getAttribute('data-active')).toBe('false');
+    expect(button('views.files')).toBeDefined();
+    await act(async () => root.render(React.createElement(OnboardingSurfaceContext.Provider,
+      { value: { active: true, welcome: false } }, React.createElement(NavRail))));
+    expect(button('nav.welcome')).toBeUndefined();
+    expect(button('nav.manageAgents')?.getAttribute('data-active')).toBe('true');
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
+it('hides Services by default and reflects the workspace toggle', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  const root = createRoot(host);
+  try {
+    for (const enabled of [undefined, false, true, false]) {
+      state.servicesEnabled = enabled;
+      await act(async () => root.render(React.createElement(NavRail)));
+      expect(host.textContent?.includes('collab.viewAgents')).toBe(enabled === true);
+    }
+  } finally { state.servicesEnabled = true; await act(async () => root.unmount()); host.remove(); }
+});
+
+it('keeps Welcome accessible outside the tour until an agent is added and restores it when empty', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  const root = createRoot(host);
+  const openWelcome = vi.fn();
+  const welcome = () => [...host.querySelectorAll('button')].find(b => b.textContent === 'nav.welcome');
+  try {
+    const render = (available: boolean) => root.render(React.createElement(OnboardingSurfaceContext.Provider,
+      { value: { active: false, welcome: false, welcomeAvailable: available, onOpenWelcome: openWelcome } }, React.createElement(NavRail)));
+    await act(async () => render(true));
+    expect(welcome()?.getAttribute('data-active')).toBe('false');
+    await act(async () => welcome()!.click());
+    expect(openWelcome).toHaveBeenCalledOnce();
+    await act(async () => render(false));
+    expect(welcome()).toBeUndefined();
+    await act(async () => render(true));
+    expect(welcome()).toBeDefined();
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
+it.each([['desktop', NavRail], ['mobile', NavSecondary]] as const)(
+  'opens agent setup directly from Welcome in the %s navigation', async (_name, Navigation) => {
+    const host = document.createElement('div'); document.body.append(host);
+    const root = createRoot(host);
+    const openConnect = vi.fn();
+    try {
+      await act(async () => root.render(React.createElement(OnboardingSurfaceContext.Provider,
+        { value: { active: true, welcome: true, welcomeAvailable: true, onOpenConnect: openConnect } },
+        React.createElement(Navigation))));
+      const connect = [...host.querySelectorAll('button')].find(button => button.textContent === 'nav.manageAgents')!;
+      expect(connect.getAttribute('data-active')).toBe('false');
+      await act(async () => connect.click());
+      expect(openConnect).toHaveBeenCalledOnce();
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  },
+);

@@ -1,0 +1,2059 @@
+/**
+ * OpenCode adapter for OpenAgents workspace.
+ *
+ * Bridges OpenCode (opencode-ai) to an OpenAgents workspace by running
+ * `opencode run --format json` as a subprocess. OpenCode handles its own
+ * model configuration, provider selection, and tool chain.
+ *
+ * Port of Python PR #316: sdk/src/openagents/adapters/opencode.py
+ */
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { execSync, spawnSync } = require('child_process');
+// spawn() here is the WSL bridge from ../wsl: same signature as
+// child_process.spawn, and a straight pass-through unless the resolved CLI
+// lives on the other side of the Windows/WSL boundary.
+const { spawn } = require('../wsl');
+const { opencodeTranscript } = require('../host-agent');
+
+const BaseAdapter = require('./base');
+const { pendingImport } = require('../session-imports');
+const { formatAttachmentsForPrompt, redactSecrets, stripAnsi, CREDIT_EXHAUSTED } = require('./utils');
+const { buildOpenCodeSkillMd, buildOpenCodeSystemPrompt, workspaceSkillName } = require('./workspace-prompt');
+const { whichBinary, whereBinary, getEnhancedEnv } = require('../paths');
+const { isPostinstallStub, isPostinstallStubOutput } = require('../postinstall-stub');
+const EventEmitter = require('events');
+const { OpenCodeServer } = require('./opencode-server');
+
+// The launcher's own CLI, whose `mcp-server` command serves the workspace tools.
+const WORKSPACE_MCP_BIN = path.resolve(__dirname, '..', '..', 'bin', 'agent-connector.js');
+
+const IS_WINDOWS = process.platform === 'win32';
+
+// Max time an `opencode run` may stay completely silent. This is deliberately
+// an IDLE timeout, not a wall-clock cap: long coding tasks routinely exceed
+// five minutes while continuing to emit text/tool events. A fixed spawn
+// timeout killed those healthy runs midway through their answer.
+const TIMEOUT_MS = 300000; // 5 minutes
+
+// _runViaServer's answer for "the server can't take this message": run it the ordinary way.
+const NO_SERVER = Symbol('no-server');
+
+// Pinned OpenCode CLI version. Do NOT use @latest anywhere (registry.json /
+// opencode.yaml install commands, install hints below). This adapter parses
+// opencode's `--format json` stream, so an unbounded version floats the event
+// schema (text / tool / error / step events) out from under us and makes the
+// same workspace behave differently per machine.
+const OPENCODE_PINNED_VERSION = '1.17.11';
+// Supported floor — below this we block the run with `unsupported_version`.
+// The 1.17.x line is the stream-json shape this adapter targets.
+const OPENCODE_MIN_VERSION = '1.17.0';
+// First major this adapter cannot drive. OpenCode 2 (`@opencode/cli`, its
+// Homebrew formula and curl installer) is a new command line: `run` has no
+// `--dir`, so every message died with "Unrecognized flag: --dir" while the
+// preflight, seeing only "newer than tested", let it through.
+const OPENCODE_UNSUPPORTED_MAJOR = 2;
+// Highest version whose JSON behavior is treated as verified. Newer is allowed
+// but flagged 'degraded' (the run still proceeds; any failure is classified).
+const OPENCODE_TESTED_MAX_VERSION = '1.17.11';
+
+// How long a detected CLI version / executability probe is cached on the
+// adapter instance, so preflight never spawns `--version` more than once per
+// window across channels.
+const VERSION_PROBE_TTL_MS = 60000;
+
+// Provider id this adapter writes into the run directory's
+// .opencode/opencode.json when the agent points at a custom OpenAI-compatible
+// gateway. opencode's built-in `openai` provider validates model names against
+// its catalog (a gateway model like `deepseek-4-flash` dies with
+// ProviderModelNotFoundError before any request is sent) and speaks the
+// Responses API (`/v1/responses`), which most gateways don't serve (404 →
+// endless retry). Declaring the gateway as an @ai-sdk/openai-compatible
+// provider keeps requests on `/chat/completions` and skips catalog validation.
+const CUSTOM_PROVIDER_ID = 'openagents-gateway';
+
+// The database OpenCode is pointed at (OPENCODE_DB) once the shared one cannot
+// be opened. OpenCode 1.x and 2.x both default to <data>/opencode/opencode.db;
+// 2.x renames the `session` table to `session_v2` when it migrates it, and from
+// then on the 1.x CLI this adapter runs dies at startup with "Database is not
+// empty and has no session table" on every message (opencode-ai 1.17.11,
+// packages/core/src/database/migration.ts). OPENCODE_DB takes an absolute path
+// in that version (packages/core/src/database/database.ts). Once this file
+// exists it is used from then on; auth.json stays shared, so sign-ins keep
+// working, and the user's own database is never written.
+// Resolved per call, so it follows HOME.
+const ownDbPath = () => path.join(os.homedir(), '.openagents', 'opencode', 'opencode.db');
+const SHARED_DB_MIGRATED_RE = /database is not empty and has no session table/i;
+
+// Lets OpenCode's subagents read and write outside the working directory, as
+// the main session already may. `opencode run --dangerously-skip-permissions`
+// answers only the main session's permission prompts (opencode-ai 1.17.11,
+// packages/opencode/src/cli/cmd/run.ts: `permission.sessionID !== sessionID`
+// is skipped). A subagent started by the task tool runs in a child session,
+// and `external_directory` defaults to "ask", so its prompt went unanswered
+// until the idle watchdog stopped the turn: "OpenCode timed out before
+// producing a reply" (daily errors dashboard, 2026-11-17, ~10 runs from 4
+// users). Fixed upstream in 1.19.0, which also answers child sessions; the
+// pinned 1.17.11 is not. OPENCODE_PERMISSION is merged over the user's config
+// last (packages/opencode/src/config/config.ts), so it is left out when the
+// user set it, wrote an external_directory rule of their own, or set every
+// permission at once.
+const SUBAGENT_PERMISSION = JSON.stringify({ external_directory: 'allow' });
+const CONFIG_FILES = ['opencode.json', 'opencode.jsonc', path.join('.opencode', 'opencode.json'), path.join('.opencode', 'opencode.jsonc')];
+
+// Short, de-identified, actionable user messages per failure category. These
+// must NEVER default to "run auth login": only credential_missing / auth_failed
+// mention authentication. Diagnostics (exit code, signal, redacted stdout/
+// stderr) go to the daemon log, not to these.
+const FAILURE_MESSAGES = {
+  cli_not_found: `OpenCode CLI not found. Install it (\`npm install -g opencode-ai@${OPENCODE_PINNED_VERSION}\`) and try again.`,
+  cli_not_executable: 'OpenCode CLI was found but could not be started. Reinstall it, then retry.',
+  install_incomplete: `OpenCode is installed, but its setup never finished: the opencode-ai package's postinstall script did not run (npm \`ignore-scripts\`, or a pnpm/bun install), so the \`opencode\` command is only a placeholder. Reinstall OpenCode from the launcher — or, for a copy you installed yourself, run \`npm install -g opencode-ai@${OPENCODE_PINNED_VERSION} --ignore-scripts=false\` — then retry.`,
+  unsupported_version: `This OpenCode CLI version is not supported: OpenAgents runs the opencode-ai 1.x CLI (${OPENCODE_MIN_VERSION} or newer), and OpenCode 2.x changed its command line. Reinstall OpenCode from the launcher, or run \`npm install -g opencode-ai@${OPENCODE_PINNED_VERSION}\`, and retry.`,
+  model_missing: "No model is configured for OpenCode. Set a model (LLM_MODEL, e.g. `gpt-4o`) in this agent's configuration, then retry.",
+  credential_missing: 'OpenCode has no API key or sign-in configured. Add an API key (LLM_API_KEY) or run `opencode auth login`, then retry.',
+  auth_failed: "OpenCode's provider rejected the credentials (authentication failed). Check the API key or sign-in and retry.",
+  provider_not_configured: 'OpenCode has no usable provider configured. Configure a provider and model, then retry.',
+  model_not_found: 'The configured model was not found or is not accessible. Check the model name and your access, then retry.',
+  rate_limited: 'The provider is rate-limiting requests. Wait a moment and retry.',
+  quota_exhausted: "The provider account has run out of balance or credit. Top it up, or give this agent a key with credit, then retry.",
+  request_too_large: 'The provider refused the request as too large — the conversation or its attachments exceed what it accepts. Start a new thread or send less, then retry.',
+  network_error: 'OpenCode could not reach the provider (network or service error). Retry shortly.',
+  provider_server_error: 'The provider returned a server error. Retry shortly.',
+  timeout: 'OpenCode timed out before producing a reply. Retry; if it persists, check the model and provider configuration.',
+  stream_parse_error: 'OpenCode produced output this version could not parse. Update to a supported OpenCode version, or open diagnostics.',
+  empty_response: 'OpenCode finished without producing a final reply. Retry; if it persists, open diagnostics.',
+  incomplete_run: 'OpenCode stopped mid-task right after a tool call and never produced a final reply — its progress notes are shown above. Send "continue" to pick up where it left off. Check the tool error or permission request before retrying.',
+  permission_denied: 'OpenCode could not get permission for a tool call. Check the agent’s explicit deny rules or file access settings; sending continue alone will not change them.',
+  process_crashed: 'OpenCode exited unexpectedly. Open diagnostics or retry.',
+  cwd_unavailable: "OpenCode's working directory is not accessible. Check the agent's configured path (or agent home) permissions.",
+  shared_db_migrated: "OpenCode could not open its session database: a newer OpenCode (2.x, or the OpenCode desktop app) on this device has converted it to a format the OpenCode CLI that OpenAgents runs cannot read, and running it on a database of its own did not help either. Reinstall OpenCode from the launcher, or set OPENCODE_DB in this agent's configuration to the full path of a new file, then retry.",
+  malformed_tool_call: "The model sent back a tool call OpenCode could not read (it named no tool), so the run stopped. This comes from the model or the endpoint serving it, not from this agent's settings: retry, and if it keeps happening, switch this agent to another model or provider.",
+  config_invalid: 'OpenCode would not start because one of its config files is invalid — the file and what is wrong with it are below. OpenCode reads it on every run, so every message fails until it is fixed: correct or remove that entry, then retry.',
+  unknown_error: 'OpenCode failed for an undetermined reason. Open diagnostics or retry.',
+};
+
+/** Where the opencode CLI is: the launcher's runtime first, then PATH and
+ *  the usual install spots. Shared with src/local-sessions.js. */
+function findOpencodeBinary() {
+  const home = os.homedir();
+  const ext = IS_WINDOWS ? '.cmd' : '';
+
+  // Tier 0: the actual native binary the opencode-ai package ships, NOT the
+  // npm `.cmd`/`.bin` shim. opencode-ai's `bin` is a single self-contained
+  // executable named `opencode.exe` on every platform (on macOS/Linux it's
+  // the native Mach-O/ELF binary — the .exe suffix is just how the package
+  // names it). Returning it directly lets us spawn it without going through
+  // `cmd.exe /C opencode.cmd`, which on Windows is what flashed a console
+  // window — and an attached console makes opencode drop into its interactive
+  // TUI instead of non-interactive `run`, so it hung waiting for keypresses.
+  const nativeExe = path.join(home, '.openagents', 'runtimes', 'opencode', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe');
+  if (fs.existsSync(nativeExe)) return nativeExe;
+
+  // Tier 0b: Isolated runtime prefix shim — where the launcher installs agents
+  // (~/.openagents/runtimes/opencode/node_modules/.bin). Every other adapter
+  // checks this first; opencode was the lone exception, so a launcher-managed
+  // install was invisible unless its .bin happened to be on PATH — which is
+  // exactly why the workspace failed with "opencode CLI not found" even though
+  // the marketplace showed it installed.
+  const runtimeBin = path.join(home, '.openagents', 'runtimes', 'opencode', 'node_modules', '.bin', `opencode${ext}`);
+  if (fs.existsSync(runtimeBin)) return runtimeBin;
+
+  // Tier 0b: Legacy shared portable prefix.
+  const legacyBin = path.join(home, '.openagents', 'nodejs', 'node_modules', '.bin', `opencode${ext}`);
+  if (fs.existsSync(legacyBin)) return legacyBin;
+
+  // Tier 1: PATH. Use the ENRICHED env (node-version-manager/homebrew/npm
+  // dirs the launcher adds) so the lookup matches a packaged daemon's real
+  // reach; windowsHide stops a console window from flashing on Windows.
+  // Codepage-safe lookup (whereBinary forces UTF-8 output + verifies existence
+  // so a non-ASCII/Chinese username isn't mangled into an ENOENT). Uses the
+  // ENRICHED env so a packaged daemon's minimal PATH still reaches nvm/fnm/
+  // volta/homebrew/npm dirs.
+  const viaWhere = whereBinary('opencode');
+  if (viaWhere) return viaWhere;
+
+  // Tier 2: Next to Node.js
+  const nearNode = path.join(path.dirname(process.execPath), `opencode${ext}`);
+  if (fs.existsSync(nearNode)) return nearNode;
+
+  // Tier 3: Common locations
+  const candidates = IS_WINDOWS ? [
+    path.join(process.env.APPDATA || '', 'npm', 'opencode.cmd'),
+  ] : [
+    path.join(home, '.openagents', 'npm-global', 'bin', 'opencode'),
+    path.join(home, '.npm-global', 'bin', 'opencode'),
+    path.join(home, '.local', 'bin', 'opencode'),
+    '/usr/local/bin/opencode',
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+
+  // Tier 4: Deep scan of every known bin dir (nvm/fnm/volta node-global,
+  // homebrew, …) — catches an `opencode` installed as a global npm package
+  // under a version-managed Node, which the fixed-PATH tiers above miss.
+  const viaWhich = whichBinary('opencode');
+  if (viaWhich) return viaWhich;
+
+  return null;
+}
+
+class OpenCodeAdapter extends BaseAdapter {
+  /**
+   * @param {object} opts - BaseAdapter opts plus:
+   * @param {Set} [opts.disabledModules]
+   * @param {string} [opts.workingDir]
+   * @param {{session_id: string}} [opts.seedSession] - The OpenCode chat this
+   *   agent was created from (`agn join`). Each channel's first turn carries a
+   *   transcript of it, so the agent starts with what was said there.
+   */
+  constructor(opts) {
+    super(opts);
+    this.disabledModules = opts.disabledModules || new Set();
+    this._seedSession = opts.seedSession && opts.seedSession.session_id ? opts.seedSession : null;
+    // Pin the channel's glossary into the system prompt.
+    this._usesPinnedContext = true;
+
+    // Agent home directory: ~/.openagents/agents/{agentName}/ — scratch storage
+    // for sessions, skills, and opencode config. This is NOT the directory
+    // opencode runs in; opencode runs in the configured workingDir (see
+    // _resolveCwd) so it can actually reach the project's files. (issue #435)
+    this.agentHome = path.join(os.homedir(), '.openagents', 'agents', this.agentName);
+    fs.mkdirSync(this.agentHome, { recursive: true });
+
+    this._channelSessions = {};
+    // Channels whose next run must start a new OpenCode session (routine fires).
+    this._freshChannels = new Set();
+    this._sessionsFile = this._sessionsFileFor();
+    this._migrateSessionsFile();
+    this._loadSessions();
+
+    // Process tracking for stop control
+    this._channelProcesses = {}; // channel → child process
+    this._stoppingChannels = new Set();
+    this._server = null;  // warm `opencode serve` (opencode-server.js), when enabled
+
+    this._opencodeBinary = this._findOpencodeBinary();
+    if (this._opencodeBinary) {
+      this._log(`Using ${this._cliLabel()} subprocess mode: ${this._opencodeBinary}`);
+    } else {
+      this._log(`${this._cliLabel()} binary not found. ${this._installHint()}`);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // What differs between OpenCode and the CLIs built on it
+  // ------------------------------------------------------------------
+  //
+  // Vendors ship their own agents on top of OpenCode (Huawei's CodeArts Agent
+  // is one — see codearts.js). They keep its `run --format json` stream, its
+  // sessions and its failure shapes, and change how the CLI is found, launched
+  // and authenticated. These hooks are exactly that difference.
+
+  /** Product name used in logs and user-facing errors. */
+  _cliLabel() {
+    return 'OpenCode';
+  }
+
+  _installHint() {
+    return `Install with: npm install -g opencode-ai@${OPENCODE_PINNED_VERSION}`;
+  }
+
+  /** User-facing message per failure category. */
+  _failureMessages() {
+    return FAILURE_MESSAGES;
+  }
+
+  /** Whether a run may not start without a model (OpenCode hangs without one). */
+  _modelRequired() {
+    return true;
+  }
+
+  /** Arguments after the binary for one `run`. */
+  _buildRunArgs({ runCwd, model, sessionId }) {
+    // Preflight guarantees a resolvable model; pin it explicitly — without it
+    // opencode hangs waiting for interactive provider/model selection.
+    // Connected agents run unattended: let the CLI resolve permission prompts
+    // automatically instead of rejecting tools outside the working directory.
+    // --thinking adds the model's reasoning to the JSON stream as `reasoning`
+    // events, shown live as thinking (like Claude and Codex). Available since
+    // the minimum supported 1.17.0.
+    const args = ['run', '--format', 'json', '--thinking', '--dangerously-skip-permissions', '--dir', runCwd, '--model', model];
+    if (sessionId) args.push('--session', sessionId);
+    return args;
+  }
+
+  /**
+   * The text sent on stdin for one turn. A new session carries the workspace
+   * context ahead of the message; a resumed one already holds it.
+   */
+  _composePrompt(content, msgChannel, sessionId) {
+    if (sessionId) return content;
+    this._ensureWorkspaceSkill(msgChannel);
+    const context = this._buildSystemContext(msgChannel);
+    const seed = this._seedTranscript(msgChannel);
+    return seed
+      ? `${context}\n\n---\n\n${seed}\n\n---\n\n${content}`
+      : `${context}\n\n---\n\n${content}`;
+  }
+
+  /**
+   * For a channel's first turn: the conversation this agent was created from,
+   * read with `opencode export` (never written to), or ''. Not a fork: OpenCode
+   * forks of a session that ran tools are refused by Anthropic models, whose
+   * thinking blocks are bound to the original conversation. A seed that can
+   * no longer be read turns seeding off.
+   */
+  _seedTranscript(msgChannel) {
+    if (Object.prototype.hasOwnProperty.call(this._channelSessions, msgChannel)) return '';
+    // A channel that is an imported local OpenCode session (src/session-imports.js)
+    // starts from that session the same way, once.
+    this._adoptedImports = this._adoptedImports || new Set();
+    const imported = this._adoptedImports.has(msgChannel) ? null
+      : pendingImport(this.workspaceId, this.agentName, msgChannel, 'opencode');
+    if (imported) this._adoptedImports.add(msgChannel);
+    const seed = imported || this._seedSession;
+    if (!seed) return '';
+    try {
+      const r = spawnSync(this._opencodeBinary, ['export', seed.session_id], {
+        env: this._spawnEnv(msgChannel), encoding: 'utf-8', timeout: 30000,
+        maxBuffer: 64 * 1024 * 1024, windowsHide: true,
+        shell: IS_WINDOWS && /\.cmd$/i.test(this._opencodeBinary || ''),
+      });
+      if (r.status !== 0 || !r.stdout) throw new Error((r.stderr || r.error || `exit ${r.status}`).toString().slice(0, 200));
+      const text = opencodeTranscript(JSON.parse(r.stdout.slice(r.stdout.indexOf('{'))));
+      if (!text) return '';
+      return 'Before you joined this workspace, you were in this OpenCode conversation with the user. '
+        + 'It is your own memory, quoted for reference; continue from it.\n\n<previous_conversation>\n'
+        + `${text}\n</previous_conversation>`;
+    } catch (e) {
+      if (imported) {
+        this._log(`Imported session ${seed.session_id} unavailable for ${msgChannel} (${e.message}); starting fresh`);
+        return '';
+      }
+      this._log(`Seed conversation ${seed.session_id} unavailable (${e.message}); new channels start fresh`);
+      this._seedSession = null;
+      return '';
+    }
+  }
+
+  /** Environment the CLI is spawned with. */
+
+  /** Test seam for the inactivity watchdog. */
+  _runTimeoutMs() {
+    return TIMEOUT_MS;
+  }
+
+  /**
+   * Arm a watchdog that expires only after a continuous period without CLI
+   * output. Every stdout/stderr chunk proves the process is still making
+   * progress and pushes the deadline out again.
+   */
+  _createIdleWatchdog(onTimeout) {
+    const timeoutMs = this._runTimeoutMs();
+    let timer = null;
+    let stopped = false;
+    const touch = () => {
+      if (stopped) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(onTimeout, timeoutMs);
+    };
+    const cancel = () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+    touch();
+    return { touch, cancel, timeoutMs };
+  }
+
+  /**
+   * Whether the user's own OpenCode config has an external_directory rule,
+   * or sets every permission at once (`"permission": "deny"` or
+   * `{"*": "deny"}`): the global config and ~/.opencode, OPENCODE_CONFIG and
+   * OPENCODE_CONFIG_DIR, the inline config, and the project files from the
+   * run's folder up. A text match is enough, and errs toward leaving
+   * their rules alone.
+   */
+  static _userRulesExternalDirs(env, runCwd) {
+    const mentions = (text) => /external_directory/.test(String(text || ''))
+      || OpenCodeAdapter._setsEveryPermission(String(text || ''));
+    if (mentions(env.OPENCODE_CONFIG_CONTENT)) return true;
+    const home = env.HOME || env.USERPROFILE || os.homedir();
+    const globalDir = path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'opencode');
+    const files = ['config.json', 'opencode.json', 'opencode.jsonc'].map((f) => path.join(globalDir, f));
+    files.push(...['opencode.json', 'opencode.jsonc'].map((f) => path.join(home, '.opencode', f)));
+    if (env.OPENCODE_CONFIG) files.push(env.OPENCODE_CONFIG);
+    if (env.OPENCODE_CONFIG_DIR) files.push(...['opencode.json', 'opencode.jsonc'].map((f) => path.join(env.OPENCODE_CONFIG_DIR, f)));
+    for (let dir = runCwd ? path.resolve(runCwd) : ''; dir; ) {
+      files.push(...CONFIG_FILES.map((f) => path.join(dir, f)));
+      const up = path.dirname(dir);
+      dir = up === dir ? '' : up;
+    }
+    return files.some((file) => {
+      try { return mentions(fs.readFileSync(file, 'utf-8')); } catch { return false; }
+    });
+  }
+
+  /**
+   * Whether a config's text sets every permission at once: `"permission":
+   * "deny"`, or a `"*"` key anywhere in the permission object — not only as
+   * its first key: `{"bash": {"git *": "allow"}, "*": "deny"}` was read as
+   * no rule, and the external_directory allow then went over a lockdown.
+   * Only the object's own keys count, not a `"*"` inside a nested rule.
+   */
+  static _setsEveryPermission(text) {
+    const re = /"permission"\s*:\s*/g;
+    for (let m = re.exec(text); m; m = re.exec(text)) {
+      let i = m.index + m[0].length;
+      if (text[i] === '"') return true;
+      if (text[i] !== '{') continue;
+      let depth = 0;
+      let inString = false;
+      for (let start = i; i < text.length; i++) {
+        const c = text[i];
+        if (inString) {
+          if (c === '\\') i++;
+          else if (c === '"') {
+            inString = false;
+            // A key of the permission object itself.
+            if (depth === 1 && text.slice(start, i + 1) === '"*"' && /^\s*:/.test(text.slice(i + 1))) return true;
+          }
+        } else if (c === '"') { inString = true; start = i; }
+        else if (c === '{') depth++;
+        else if (c === '}' && --depth === 0) break;
+      }
+    }
+    return false;
+  }
+
+  _spawnEnv(channel, { contextFile = null } = {}) {
+    const env = { ...(this.agentEnv || process.env) };
+    if (!env.OPENCODE_DB && fs.existsSync(ownDbPath())) env.OPENCODE_DB = ownDbPath();
+    if (!env.OPENCODE_PERMISSION && !OpenCodeAdapter._userRulesExternalDirs(env, this._resolveCwd())) {
+      env.OPENCODE_PERMISSION = SUBAGENT_PERMISSION;
+    }
+    if (!this._wiresWorkspaceMcp()) return env;
+    // Give OpenCode the workspace tools (publish, todos, browser, ...) through
+    // our MCP server, as the Claude adapter does. Merged into any inline config
+    // the host already passes; the token travels in the child's environment only.
+    let cfg = {};
+    try { cfg = JSON.parse(env.OPENCODE_CONFIG_CONTENT || '{}') || {}; } catch { return env; }
+    if (typeof cfg !== 'object' || Array.isArray(cfg)) return env;
+    const args = [WORKSPACE_MCP_BIN, 'mcp-server',
+      '--workspace-id', this.workspaceId, '--channel-name', channel || this.channelName || 'general',
+      '--agent-name', this.agentName, '--endpoint', this.endpoint];
+    // On the warm server one tools server serves every channel: it reads the
+    // turn's channel and requester from this file (written per turn).
+    if (contextFile) args.push('--context-file', contextFile);
+    const disabled = this.disabledModules || new Set();
+    if (disabled.has('files')) args.push('--disable-files');
+    if (disabled.has('browser')) args.push('--disable-browser');
+    if (disabled.has('knowledge')) args.push('--disable-knowledge');
+    const requester = !contextFile && channel && this.requesterEmailFor ? this.requesterEmailFor(channel) : null;
+    cfg.mcp = { ...(cfg.mcp || {}), openagents: { type: 'local', enabled: true,
+      command: [process.execPath, ...args],
+      environment: { OA_WORKSPACE_TOKEN: this.token, ...(requester ? { OPENAGENTS_REQUESTER_EMAIL: requester } : {}) } } };
+    env.OPENCODE_CONFIG_CONTENT = JSON.stringify(cfg);
+    return env;
+  }
+
+  /**
+   * Whether a run that failed on the shared database can be retried on
+   * ownDbPath(), creating that file if need be. False when the failed run was
+   * not on the shared database to begin with: OPENCODE_DB set by the user, the
+   * file already there before the run (`ownBefore`), or a fork that builds its
+   * own environment. The sessions saved so far are ids in the old database
+   * and are dropped when the file is created here.
+   */
+  _moveToOwnDatabase(ownBefore) {
+    if (ownBefore || this._spawnEnv !== OpenCodeAdapter.prototype._spawnEnv) return false;
+    if ((this.agentEnv || process.env).OPENCODE_DB) return false;
+    const file = ownDbPath();
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, '', { flag: 'wx' });
+    } catch (e) {
+      // Another channel's run got here first: the file is the one to use.
+      if (e && e.code === 'EEXIST') return true;
+      this._log(`Could not create ${file}: ${e && e.message}`, 'error');
+      return false;
+    }
+    this._log(`Shared OpenCode database was migrated by a newer OpenCode; using ${file}`);
+    this._channelSessions = {};
+    // Channels whose next run must start a new OpenCode session (routine fires).
+    this._freshChannels = new Set();
+    this._saveSessions();
+    return true;
+  }
+
+  /**
+   * Only plain OpenCode reads OPENCODE_CONFIG_CONTENT; the forks built on this
+   * adapter (CodeArts, MiMo Code) replace _spawnEnv and keep the curl skill.
+   */
+  _wiresWorkspaceMcp() {
+    // An OpenCode across the Windows/WSL boundary could not start our node.
+    const bin = String(this._opencodeBinary || '');
+    if (bin.startsWith('wsl:') || (!IS_WINDOWS && /\.(exe|cmd|bat)$/i.test(bin))) return false;
+    return this._spawnEnv === OpenCodeAdapter.prototype._spawnEnv
+      && Boolean(this.token && this.workspaceId) && fs.existsSync(WORKSPACE_MCP_BIN);
+  }
+
+  /**
+   * Migrate sessions file from old location to agent home.
+   */
+  _migrateSessionsFile() {
+    // Only the legacy sessions.json (no workingDir → opencode still runs in
+    // agentHome) inherits sessions from the pre-agentHome location. A scoped
+    // file belongs to a different --dir, so seeding it with IDs created under
+    // agentHome would make every later resume 404.
+    if (path.basename(this._sessionsFile) !== 'sessions.json') return;
+    const oldPath = path.join(
+      os.homedir(), '.openagents', 'sessions',
+      `${this.workspaceId}_${this.agentName}_opencode.json`
+    );
+    try {
+      if (fs.existsSync(oldPath) && !fs.existsSync(this._sessionsFile)) {
+        fs.copyFileSync(oldPath, this._sessionsFile);
+        fs.unlinkSync(oldPath);
+        this._log(`Migrated sessions file from ${oldPath}`);
+      }
+    } catch {}
+  }
+
+  _loadSessions() {
+    try {
+      if (fs.existsSync(this._sessionsFile)) {
+        const data = JSON.parse(fs.readFileSync(this._sessionsFile, 'utf-8'));
+        if (data && typeof data === 'object') {
+          Object.assign(this._channelSessions, data);
+          this._log(`Loaded ${Object.keys(data).length} session(s)`);
+        }
+      }
+    } catch {
+      this._log('Could not load sessions file, starting fresh');
+    }
+  }
+
+  _saveSessions() {
+    try {
+      fs.mkdirSync(path.dirname(this._sessionsFile), { recursive: true });
+      fs.writeFileSync(this._sessionsFile, JSON.stringify(this._channelSessions));
+    } catch {}
+  }
+
+  /**
+   * Effective working directory for `opencode run --dir` and the spawn cwd.
+   *
+   * opencode confines an agent's file access to its --dir worktree root; in
+   * headless mode a tool call that reaches outside it is auto-rejected with
+   * "user rejected permission". So opencode must run in the agent's configured
+   * project path (workingDir), not the per-agent scratch dir (agentHome). With
+   * no path configured, fall back to agentHome so pre-existing agents keep
+   * running where they always did. (issue #435)
+   */
+  _resolveCwd() {
+    return this.workingDir || this.agentHome;
+  }
+
+  /**
+   * Persisted-session-store path, scoped per working directory.
+   *
+   * An opencode session ID is only resumable against the --dir it was created
+   * under. If an agent's workingDir changes (or an agent that previously ran in
+   * agentHome gets a path configured), resuming a stored ID under the new --dir
+   * 404s with a confusing error. Scope the store by working dir so each project
+   * keeps its own IDs; the default (no workingDir) keeps the legacy
+   * sessions.json so existing agents retain their context. Files always live
+   * under agentHome — never inside the project tree. Mirrors the sha256[:16]
+   * per-cwd idiom used by the goose and nanoclaw adapters.
+   */
+  _sessionsFileFor() {
+    if (!this.workingDir) return path.join(this.agentHome, 'sessions.json');
+    const slug = crypto.createHash('sha256').update(this.workingDir).digest('hex').slice(0, 16);
+    return path.join(this.agentHome, `sessions-${slug}.json`);
+  }
+
+  /**
+   * Write workspace skill to OpenCode's skill directory for auto-discovery.
+   */
+  _ensureWorkspaceSkill(channelName) {
+    const skillDir = path.join(this.agentHome, '.opencode', 'skills');
+    // Filename matches the per-agent frontmatter name; remove the legacy
+    // shared-name file so a stale duplicate skill is never auto-discovered.
+    const skillFile = path.join(skillDir, `${workspaceSkillName(this.agentName)}.md`);
+    try {
+      fs.unlinkSync(path.join(skillDir, 'openagents-workspace.md'));
+    } catch {}
+    try {
+      const content = buildOpenCodeSkillMd({
+        endpoint: this.endpoint,
+        workspaceId: this.workspaceId,
+        token: this.token,
+        agentName: this.agentName,
+        channelName,
+        disabledModules: this.disabledModules,
+      });
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(skillFile, content, 'utf-8');
+    } catch {}
+  }
+
+  _buildSystemContext(channelName) {
+    return buildOpenCodeSystemPrompt({
+      agentName: this.agentName,
+      workspaceId: this.workspaceId,
+      channelName,
+      endpoint: this.endpoint,
+      token: this.token,
+      mode: this._mode,
+      model: this.modelLabel(),
+      disabledModules: this.disabledModules,
+      workspaceMcp: this._wiresWorkspaceMcp(),
+      ...this.pinnedPromptOpts(channelName),
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Binary discovery
+  // ------------------------------------------------------------------
+
+  _findOpencodeBinary() {
+    return findOpencodeBinary();
+  }
+
+  // ------------------------------------------------------------------
+  // Message handler
+  // ------------------------------------------------------------------
+
+  async _handleMessage(msg) {
+    let content = (msg.content || '').trim();
+    const attachments = msg.attachments || [];
+
+    const attText = formatAttachmentsForPrompt(attachments);
+    if (attText) {
+      content = content ? content + attText : attText.trim();
+    }
+
+    if (!content) return;
+
+    const msgChannel = msg.sessionId || this.channelName;
+    const sender = msg.senderName || msg.senderType || 'user';
+    this._log(`Processing message from ${sender} in ${msgChannel}: ${content.slice(0, 80)}...`);
+    // Every routine fire carries the routine's full instructions, so each run
+    // starts a new OpenCode session instead of resuming one that grows with every
+    // fire until it overflows the model. The new session is still saved for the
+    // channel, so a person replying in the routine thread continues that run.
+    if (sender === 'system:routine') this._freshChannels.add(msgChannel);
+
+    await this._autoTitleChannel(msgChannel, content);
+    await this.sendStatus(msgChannel, 'thinking...');
+
+    try {
+      let responseText;
+      const ownBefore = fs.existsSync(ownDbPath());
+      try {
+        responseText = await this._runOpencode(content, msgChannel);
+      } catch (e) {
+        if (!(e && e.category === 'shared_db_migrated') || !this._moveToOwnDatabase(ownBefore)) throw e;
+        await this.sendStatus(msgChannel, "OpenCode's shared database was converted by a newer OpenCode on this "
+          + 'device, so this agent now uses one of its own. Earlier context in this thread is not carried over.');
+        responseText = await this._runOpencode(content, msgChannel);
+      }
+
+      if (this._stoppingChannels.has(msgChannel)) {
+        this._stoppingChannels.delete(msgChannel);
+        return;
+      }
+
+      // The only way _runOpencode resolves empty now is the stop path (handled
+      // above). Every real failure — including exit 0 with no assistant text —
+      // is thrown with a category and handled in catch, so we no longer post a
+      // generic "produced no response" that misattributes everything to auth.
+      if (responseText) {
+        await this.sendResponse(msgChannel, responseText);
+      }
+    } catch (e) {
+      if (this._stoppingChannels.has(msgChannel)) {
+        this._stoppingChannels.delete(msgChannel);
+        return;
+      }
+      const category = (e && e.category) ? e.category : this._classifyErrno(e);
+      const diagnostic = this._redact((e && (e.diagnostic || e.message)) || '');
+      this._log(`OpenCode failure [${category}] in ${msgChannel}: ${diagnostic.slice(0, 300)}`, 'error');
+      await this._sendClassifiedError(msgChannel, category, e && e.detail, !!(e && e.explained));
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // JSON output parsing
+  // ------------------------------------------------------------------
+
+  /**
+   * Split a string containing concatenated JSON objects.
+   */
+  static _splitJsonObjects(raw) {
+    return OpenCodeAdapter._drainJsonObjects(raw).objects;
+  }
+
+  /**
+   * Extract complete JSON objects from a possibly partial stream buffer.
+   * Returns unparsed trailing text as `rest` so callers can prepend it to the
+   * next stdout chunk. OpenCode may concatenate JSON objects without newlines.
+   */
+  static _drainJsonObjects(raw) {
+    const objects = [];
+    raw = String(raw || '');
+    let pos = 0;
+    while (pos < raw.length) {
+      if (' \t\r\n'.includes(raw[pos])) { pos++; continue; }
+      if (raw[pos] !== '{') { pos++; continue; }
+      // Find matching brace
+      let depth = 0;
+      let inStr = false;
+      let escaped = false;
+      const start = pos;
+      for (let i = pos; i < raw.length; i++) {
+        const ch = raw[i];
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\' && inStr) { escaped = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) {
+            try {
+              const obj = JSON.parse(raw.slice(start, i + 1));
+              if (typeof obj === 'object' && obj !== null) objects.push(obj);
+            } catch {}
+            pos = i + 1;
+            break;
+          }
+        }
+        if (i === raw.length - 1) pos = raw.length; // no match, skip
+      }
+      if (depth !== 0) return { objects, rest: raw.slice(start) };
+    }
+    return { objects, rest: '' };
+  }
+
+  /**
+   * Extract user-visible text from a single opencode JSON event.
+   */
+  static _extractTextFromEvent(event) {
+    if (!event || typeof event !== 'object') return null;
+    // Control / tool / error events carry no user-visible assistant text. Match
+    // both underscore and hyphen spellings (`step_finish` vs `step-finish`) and
+    // detect tool events by shape, since opencode's exact top-level `type`
+    // string varies across versions.
+    const eventType = String(event.type || '').toLowerCase();
+    if (['step_start', 'step-start', 'step_finish', 'step-finish', 'tool_use', 'tool'].includes(eventType)) return null;
+    if (OpenCodeAdapter._isToolEvent(event)) return null;
+    if (OpenCodeAdapter._isReasoningEvent(event)) return null;
+    if (eventType.includes('error')) return null;
+
+    const part = event.part;
+    if (part && typeof part === 'object') {
+      const text = part.text || part.content || '';
+      if (text) return text;
+    }
+
+    const item = event.item || event;
+    const text = item.text || item.content || '';
+    return text || null;
+  }
+
+  /** Tool name from a tool event (null for non-tool events). */
+  static _toolNameFromEvent(event) {
+    if (!OpenCodeAdapter._isToolEvent(event)) return null;
+    const item = event.item || event.part || event.tool || event;
+    return OpenCodeAdapter._safeToolName(item.name || item.tool || item.toolName || item.id || 'tool');
+  }
+
+  static _toolStatusFromEvent(event) {
+    if (!OpenCodeAdapter._isToolEvent(event)) return null;
+
+    const item = event.item || event.part || event.tool || event;
+    const toolName = OpenCodeAdapter._safeToolName(
+      item.name || item.tool || item.toolName || item.id || 'tool'
+    );
+    const input = OpenCodeAdapter._toolInputFromItem(item);
+    const preview = OpenCodeAdapter._toolInputPreview(input);
+
+    return OpenCodeAdapter._formatToolStatus(toolName, preview);
+  }
+
+  static _safeToolName(name) {
+    return String(name || 'tool').replace(/[`\\]/g, '').slice(0, 80) || 'tool';
+  }
+
+  static _toolInputFromItem(item) {
+    if (!item || typeof item !== 'object') return {};
+    if (item.state && typeof item.state === 'object' && item.state.input) {
+      return item.state.input;
+    }
+    return item.input || item.args || item.arguments || item.parameters || item.params || {};
+  }
+
+  static _toolInputPreview(input) {
+    if (input == null) return '';
+    if (typeof input === 'string') return input.slice(0, 1000);
+    try {
+      return JSON.stringify(input, null, 2).slice(0, 1000);
+    } catch {
+      return String(input).slice(0, 1000);
+    }
+  }
+
+  static _markdownFence(body) {
+    const runs = String(body || '').match(/`+/g) || [];
+    const maxRun = runs.reduce((max, run) => Math.max(max, run.length), 2);
+    return '`'.repeat(Math.max(3, maxRun + 1));
+  }
+
+  static _formatToolStatus(toolName, preview) {
+    const header = `**Using tool:** \`${toolName}\``;
+    const body = String(preview || '').trim();
+    if (!body) return header;
+    const fence = OpenCodeAdapter._markdownFence(body);
+    return `${header}\n${fence}\n${body}\n${fence}`;
+  }
+
+  async _handleStreamEvent(event, msgChannel, responseState = null) {
+    // Reasoning is a live thinking trace only: it never counts toward the reply.
+    const reasoning = OpenCodeAdapter._reasoningFromEvent(event);
+    if (reasoning !== null) {
+      if (reasoning.trim()) await this.sendThinking(msgChannel, reasoning.trim());
+      return;
+    }
+
+    const status = OpenCodeAdapter._toolStatusFromEvent(event);
+    if (status) {
+      // A tool call resets `finalText` (the "text since the last tool"), so the
+      // final answer is the text emitted AFTER the last tool. `allText` stays
+      // intact for diagnostics, and `lastTool` lets the exit handler tell a
+      // finished answer from a run that died on its last tool call.
+      if (responseState) {
+        responseState.finalText = '';
+        responseState.lastTool = OpenCodeAdapter._toolNameFromEvent(event);
+        const item = event.part || event.item || event;
+        if (item.state?.status === 'error' && /reject.*permission|permission.*reject|permission.*denied/i.test(item.state.error || '')) {
+          responseState.permissionDenied = true;
+        }
+      }
+      await this.sendStatus(msgChannel, status);
+      return;
+    }
+
+    const text = OpenCodeAdapter._extractTextFromEvent(event);
+    if (text) {
+      if (responseState) {
+        responseState.seenText = true;
+        responseState.finalText += text;
+        responseState.allText = (responseState.allText || '') + text;
+      }
+      if (text.trim()) await this.sendThinking(msgChannel, text.trim());
+    }
+  }
+
+  /**
+   * Extract human-readable text from opencode --format json output.
+   */
+  static _extractTextFromJson(raw) {
+    const events = OpenCodeAdapter._splitJsonObjects(raw);
+    if (!events.length) return raw.trim();
+
+    const texts = [];
+    for (const event of events) {
+      const text = OpenCodeAdapter._extractTextFromEvent(event);
+      if (text) texts.push(text);
+    }
+    return texts.length ? texts.join('\n').trim() : raw.trim();
+  }
+
+  static _finalTextFromStdout(raw, responseState = null) {
+    raw = String(raw || '').trim();
+    if (!raw) return '';
+    if (OpenCodeAdapter._isOnlyControlJson(raw)) return '';
+    if (responseState && responseState.seenText) {
+      // Prefer text after the last tool call (the natural final answer); fall
+      // back to everything streamed so a `text -> tool -> exit` sequence is not
+      // misreported as empty.
+      return (responseState.finalText || '').trim() || (responseState.allText || '').trim();
+    }
+    return OpenCodeAdapter._extractTextFromJson(raw);
+  }
+
+  /**
+   * True when `raw` is opencode JSON that carries ONLY control events
+   * (step_start / step_finish / tool_use) and no assistant text — which is what
+   * opencode emits when no model/provider is configured. In that case
+   * _extractTextFromJson falls back to returning the raw event JSON, which we
+   * must NOT post to the channel as if it were a reply. Non-JSON output (real
+   * plain text) returns false so it is kept.
+   */
+  static _isOnlyControlJson(raw) {
+    const events = OpenCodeAdapter._splitJsonObjects(raw);
+    if (!events.length) return false;
+    for (const ev of events) {
+      if (OpenCodeAdapter._extractTextFromEvent(ev)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Extract and persist session_id from OpenCode JSON events.
+   */
+  _persistSessionId(channel, rawOutput) {
+    const events = OpenCodeAdapter._splitJsonObjects(rawOutput);
+    let sessionId = null;
+    for (const event of events) {
+      let sid = event.sessionID;
+      if (!sid && event.session && typeof event.session === 'object') {
+        sid = event.session.id;
+      }
+      if (!sid && event.part && typeof event.part === 'object') {
+        sid = event.part.sessionID;
+      }
+      if (sid && typeof sid === 'string') sessionId = sid;
+    }
+
+    if (sessionId) {
+      const prev = this._channelSessions[channel];
+      this._channelSessions[channel] = sessionId;
+      this._saveSessions();
+      if (prev !== sessionId) {
+        this._log(`OpenCode session for channel ${channel}: ${sessionId}`);
+      }
+    }
+  }
+
+  /**
+   * Override BaseAdapter.stop so daemon shutdown also tears down in-flight
+   * opencode subprocesses cleanly.
+   */
+  stop() {
+    this._stopAllProcesses(
+      'Task interrupted — daemon restarting. Send another message to continue.'
+    ).catch(() => {});
+    if (this._server) this._server.stop();
+    super.stop();
+  }
+
+  /**
+   * Whether messages may go to a warm `opencode serve` instead of a new
+   * `opencode run`. Opt-in (OPENAGENTS_OPENCODE_SERVER=1), plain OpenCode
+   * only, and not on Windows or across the WSL boundary for now.
+   */
+  _serverEnabled() {
+    if ((this.agentEnv || process.env).OPENAGENTS_OPENCODE_SERVER !== '1') return false;
+    const bin = String(this._opencodeBinary || '');
+    return !IS_WINDOWS && !bin.startsWith('wsl:') && this._cliLabel() === 'OpenCode';
+  }
+
+  /** Where the warm server's tools read the current turn's channel and requester. */
+  _turnContextFile() {
+    return path.join(this.agentHome || os.tmpdir(), 'opencode-turn-context.json');
+  }
+
+  _getServer() {
+    if (!this._server) this._server = new OpenCodeServer({ binary: this._opencodeBinary, log: (m, l) => this._log(m, l) });
+    return this._server;
+  }
+
+  async _stopProcess(proc) {
+    // A turn on the warm server keeps going until the server is told to stop it.
+    if (proc && proc.__abortAttached) { try { await proc.__abortAttached(); } catch {} }
+    if (!proc || proc.exitCode !== null) return;
+    try {
+      if (IS_WINDOWS) {
+        try { proc.kill('SIGINT'); } catch {}
+        const exited = await new Promise((resolve) => {
+          if (proc.exitCode !== null) {
+            resolve(true);
+            return;
+          }
+          const timeout = setTimeout(() => resolve(false), 1500);
+          proc.once('exit', () => { clearTimeout(timeout); resolve(true); });
+        });
+        if (!exited) {
+          try { execSync(`taskkill /F /T /PID ${proc.pid}`, { timeout: 5000 }); } catch {}
+        }
+      } else {
+        try { process.kill(-proc.pid, 'SIGTERM'); } catch {
+          proc.kill('SIGTERM');
+        }
+        await new Promise((resolve) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            resolve();
+          };
+          const timeout = setTimeout(() => {
+            try { process.kill(-proc.pid, 'SIGKILL'); } catch {
+              proc.kill('SIGKILL');
+            }
+            const reapTimeout = setTimeout(finish, 1000);
+            proc.once('exit', () => { clearTimeout(reapTimeout); finish(); });
+          }, 1500);
+          proc.once('exit', () => { clearTimeout(timeout); finish(); });
+        });
+      }
+    } catch {}
+  }
+
+  async _stopAllProcesses(completionMessage = 'Execution stopped.') {
+    const entries = Object.entries(this._channelProcesses);
+    if (!entries.length) return;
+    this._log(`Stopping ${entries.length} running process(es)...`);
+    for (const [channel, proc] of entries) {
+      this._stoppingChannels.add(channel);
+      await this._stopProcess(proc);
+      delete this._channelProcesses[channel];
+      delete this._channelQueues[channel];
+      try {
+        await this.sendResponse(channel, completionMessage);
+      } catch {}
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Subprocess execution
+  // ------------------------------------------------------------------
+
+  /**
+   * Build the `--model` value (provider/model) for `opencode run`.
+   *
+   * CRITICAL: opencode-ai does NOT read the OPENCODE_MODEL env var. When no
+   * model is given on the command line AND none is set in opencode.json, the
+   * non-interactive `run` command hangs forever waiting for interactive
+   * provider/model selection — it emits zero output until the inactivity
+   * watchdog kills it with SIGTERM.
+   * Passing `--model` explicitly is what makes headless runs actually work.
+   */
+  _resolveModel() {
+    const env = this.agentEnv || process.env;
+    const model = (env.OPENCODE_MODEL || env.LLM_MODEL || '').trim();
+    if (!model) return '';
+    // Already provider-qualified (e.g. "openai/gpt-4o", "anthropic/claude-…").
+    if (model.includes('/')) return model;
+    // A custom gateway's models aren't in opencode's openai catalog — route
+    // them through the generated openai-compatible provider (see
+    // _ensureCustomProviderConfig).
+    if (this._customBaseUrl()) return `${CUSTOM_PROVIDER_ID}/${model}`;
+    // Infer the provider from which key/base URL the env resolved to. The
+    // registry maps LLM_* → OPENAI_* for OpenAI-compatible endpoints, so
+    // "openai" is the right default; only switch for an Anthropic endpoint.
+    const baseUrl = (env.OPENAI_BASE_URL || env.LLM_BASE_URL || '').toLowerCase();
+    const provider = (env.ANTHROPIC_API_KEY || baseUrl.includes('anthropic'))
+      ? 'anthropic'
+      : 'openai';
+    return `${provider}/${model}`;
+  }
+
+  /**
+   * The configured base URL when it points at a custom OpenAI-compatible
+   * gateway, '' for the real OpenAI / Anthropic endpoints (opencode's built-in
+   * providers handle those natively).
+   */
+  _customBaseUrl() {
+    const env = this.agentEnv || process.env;
+    const raw = (env.OPENAI_BASE_URL || env.LLM_BASE_URL || '').trim();
+    if (!raw) return '';
+    let host = '';
+    try { host = new URL(raw).hostname.toLowerCase(); } catch { return ''; }
+    if (host === 'openai.com' || host.endsWith('.openai.com')) return '';
+    if (host === 'anthropic.com' || host.endsWith('.anthropic.com')) return '';
+    return raw;
+  }
+
+  /**
+   * Declare the custom gateway in `<runCwd>/.opencode/opencode.json` so the
+   * `${CUSTOM_PROVIDER_ID}/<model>` id from _resolveModel actually resolves.
+   * Merges into an existing config (only our provider entry is touched); a
+   * file that exists but doesn't parse is left alone — never clobber a config
+   * the user hand-wrote. The API key is referenced as {env:OPENAI_API_KEY}
+   * (resolved by opencode from the spawn env) so it is never written to disk.
+   */
+  _ensureCustomProviderConfig(runCwd) {
+    const baseUrl = this._customBaseUrl();
+    if (!baseUrl) return;
+    const env = this.agentEnv || process.env;
+    const model = (env.OPENCODE_MODEL || env.LLM_MODEL || '').trim();
+    if (!model || model.includes('/')) return;
+
+    const file = path.join(runCwd, '.opencode', 'opencode.json');
+    let cfg = {};
+    try {
+      cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {};
+    } catch (e) {
+      if (e && e.code !== 'ENOENT') {
+        this._log(`Not updating ${file} — existing file is unreadable or not valid JSON`);
+        return;
+      }
+    }
+
+    const before = JSON.stringify(cfg);
+    if (!cfg.$schema) cfg.$schema = 'https://opencode.ai/config.json';
+    if (!cfg.provider || typeof cfg.provider !== 'object') cfg.provider = {};
+    const prev = (typeof cfg.provider[CUSTOM_PROVIDER_ID] === 'object' && cfg.provider[CUSTOM_PROVIDER_ID]) || {};
+    cfg.provider[CUSTOM_PROVIDER_ID] = {
+      ...prev,
+      npm: '@ai-sdk/openai-compatible',
+      name: prev.name || 'OpenAgents model gateway',
+      options: { ...(prev.options || {}), baseURL: baseUrl, apiKey: '{env:OPENAI_API_KEY}' },
+      // Keep previously-declared models so switching models doesn't invalidate
+      // sessions that still reference the old id.
+      models: { ...(prev.models || {}), [model]: (prev.models || {})[model] || {} },
+    };
+    if (JSON.stringify(cfg) === before) return;
+
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n', 'utf-8');
+      this._log(`Declared gateway provider for ${model} in ${file}`);
+    } catch (e) {
+      this._log(`Failed to write ${file}: ${e.message}`);
+    }
+  }
+
+  _runOpencode(content, msgChannel, { noServer = false } = {}) {
+    // Preflight BEFORE spawning: bail out with a structured, actionable error
+    // instead of launching a child that will hang for 5 minutes or exit 1 with
+    // an opaque message. Stubbing _runOpencode in tests bypasses this, exactly
+    // like the real send path bypasses spawn when preflight fails.
+    const pf = this._preflight(msgChannel);
+    if (!pf.ok) {
+      return Promise.reject(this._failure(pf.category, pf.diagnostic, pf.detail));
+    }
+
+    const binary = this._opencodeBinary;
+    const runCwd = this._resolveCwd();
+    // Custom gateways must be declared in the run dir's opencode.json before
+    // the spawn, or --model ${CUSTOM_PROVIDER_ID}/… won't resolve.
+    try { this._ensureCustomProviderConfig(runCwd); } catch (e) {
+      this._log(`Gateway provider config failed (continuing): ${e.message}`);
+    }
+    const model = this._resolveModel();
+    const fresh = this._freshChannels.delete(msgChannel);
+    if (fresh) this._log(`Routine run in ${msgChannel}: starting a new OpenCode session`);
+    const sessionId = fresh ? undefined : this._channelSessions[msgChannel];
+    const args = this._buildRunArgs({ runCwd, model, sessionId, channel: msgChannel });
+    const fullPrompt = this._composePrompt(content, msgChannel, sessionId);
+
+    this._log(`CLI: ${binary} ${args.join(' ')}`);
+
+    const spawnEnv = this._spawnEnv(msgChannel);
+
+    let spawnBinary = binary;
+    let spawnArgs = args;
+    // Only the npm `.cmd` shim needs a cmd.exe host. The native opencode.exe
+    // (preferred by _findOpencodeBinary) is spawned directly — no console host.
+    if (IS_WINDOWS && spawnBinary.toLowerCase().endsWith('.cmd')) {
+      spawnArgs = ['/C', spawnBinary, ...spawnArgs];
+      spawnBinary = process.env.COMSPEC || 'cmd.exe';
+    }
+
+    // Stopped while this turn was being prepared: start nothing (no tokens).
+    if (this._stoppedBeforeStart(msgChannel)) return Promise.resolve('');
+
+    if (!noServer && this._serverEnabled()) {
+      // The server's setup must not depend on the channel, so it can serve them all.
+      const contextFile = this._turnContextFile();
+      const serverEnv = this._spawnEnv(this.channelName || 'general', { contextFile });
+      return this._runViaServer({ msgChannel, runCwd, model, sessionId, fullPrompt, spawnEnv: serverEnv, contextFile })
+        .then((r) => {
+          if (r !== NO_SERVER) return r;
+          if (fresh) this._freshChannels.add(msgChannel);  // the fallback run starts fresh too
+          return this._runOpencode(content, msgChannel, { noServer: true });
+        });
+    }
+
+    return new Promise((resolve, reject) => {
+      const proc = spawn(spawnBinary, spawnArgs, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: spawnEnv,
+        cwd: runCwd,
+        detached: !IS_WINDOWS,
+        // Never let a console window appear. Besides being ugly, an attached
+        // console makes opencode start its interactive TUI and hang instead of
+        // running headless — the root cause of "stuck on thinking…" on Windows.
+        windowsHide: true,
+      });
+
+      this._channelProcesses[msgChannel] = proc;
+
+      let stdout = '';
+      let stderr = '';
+      let streamBuffer = '';
+      let pendingEvents = Promise.resolve();
+      const responseState = { finalText: '', allText: '', seenText: false };
+      let settled = false;
+      let timedOut = false;
+      const watchdog = this._createIdleWatchdog(() => {
+        timedOut = true;
+        this._log(`opencode idle for ${this._runTimeoutMs() / 1000}s; terminating`);
+        this._stopProcess(proc).catch(() => {});
+      });
+      const finish = (fn, arg) => {
+        if (settled) return;
+        settled = true;
+        watchdog.cancel();
+        if (this._channelProcesses[msgChannel] === proc) {
+          delete this._channelProcesses[msgChannel];
+        }
+        fn(arg);
+      };
+
+      if (proc.stdout) {
+        proc.stdout.on('data', (d) => {
+          watchdog.touch();
+          const chunk = d.toString('utf-8');
+          stdout += chunk;
+          streamBuffer += chunk;
+          const drained = OpenCodeAdapter._drainJsonObjects(streamBuffer);
+          streamBuffer = drained.rest;
+          for (const event of drained.objects) {
+            pendingEvents = pendingEvents
+              .then(() => this._handleStreamEvent(event, msgChannel, responseState))
+              .catch((e) => this._log(`opencode stream event handling failed: ${e.message}`));
+          }
+        });
+      }
+      if (proc.stderr) proc.stderr.on('data', (d) => {
+        watchdog.touch();
+        stderr += d;
+      });
+
+      // Send the prompt via stdin, then close it so opencode knows the message
+      // is complete and never blocks waiting for more input. Guard the write:
+      // if the child already died, writing to its stdin throws EPIPE.
+      if (proc.stdin) {
+        proc.stdin.on('error', () => {});
+        try {
+          proc.stdin.write(fullPrompt, 'utf-8');
+          proc.stdin.end();
+        } catch { /* child gone — the exit/error handler reports it */ }
+      }
+
+      proc.on('error', (err) => finish(reject, err));
+      // 'close' (not 'exit') fires after stdout/stderr have fully drained, so we
+      // never parse a truncated response. The explicit `timedOut` flag keeps a
+      // watchdog termination distinct from an external signal or crash.
+      proc.on('close', async (code, signal) => {
+        try { await pendingEvents; } catch {}
+
+        if (this._stoppingChannels.has(msgChannel)) {
+          this._stoppingChannels.delete(msgChannel);
+          return finish(resolve, '');
+        }
+
+        const outcome = this._settleOutcome({ code, signal, stdout, stderr, timedOut, timeoutMs: watchdog.timeoutMs, responseState, msgChannel });
+        return outcome.error ? finish(reject, outcome.error) : finish(resolve, outcome.text);
+      });
+    });
+  }
+
+  /**
+   * What a finished run means, from its exit and its JSON output: `{ text }`
+   * for a reply or `{ error }` (a classified failure). Shared by `opencode run`
+   * and runs on the warm server, so both fail the same way.
+   */
+  _settleOutcome({ code, signal, stdout, stderr, timedOut, timeoutMs, responseState, msgChannel }) {
+    stdout = String(stdout || '').trim();
+    stderr = String(stderr || '').trim();
+
+    // A structured error event may ride on stdout regardless of exit code
+    // (opencode emits {"type":"error", ...} as a JSONL event). Look there
+    // first so the real auth/provider/model failure is never discarded just
+    // because stderr happened to be empty.
+    const stdoutErr = OpenCodeAdapter._extractErrorFromStdout(stdout);
+
+    if (timedOut) {
+      this._log(`opencode timed out after ${timeoutMs / 1000}s idle (output: ${!!stdout})`);
+      const cls = this.constructor._classifyFailure({ code, signal, stdout, stderr, stdoutErr });
+      const category = (cls.category === 'unknown_error' || cls.category === 'process_crashed')
+        ? 'timeout' : cls.category;
+      return { error: this._failure(category, cls.diagnostic || `idle=${timeoutMs}ms`, cls.detail, cls.explained) };
+    }
+
+    if (signal) {
+      this._log(`opencode killed by signal ${signal} (output: ${!!stdout})`);
+      const cls = this.constructor._classifyFailure({ code, signal, stdout, stderr, stdoutErr });
+      return { error: this._failure(cls.category, cls.diagnostic || `signal=${signal}`, cls.detail, cls.explained) };
+    }
+
+    if (code !== 0) {
+      const cls = this.constructor._classifyFailure({ code, signal, stdout, stderr, stdoutErr });
+      this._log(`opencode exited code ${code} → [${cls.category}]: ${this._redact(cls.diagnostic).slice(0, 300)}`);
+      return { error: this._failure(cls.category, cls.diagnostic, cls.detail, cls.explained) };
+    }
+
+    // Exit 0.
+    if (stdout) this._persistSessionId(msgChannel, stdout);
+    const outcome = this.constructor._outcomeForCleanExit({ stdout, stderr, stdoutErr, responseState });
+    if (outcome.text) return { text: outcome.text };
+    const f = outcome.failure;
+    this._log(`opencode exit 0 → [${f.category}]: ${this._redact(f.diagnostic).slice(0, 300)}`);
+    return { error: this._failure(f.category, f.diagnostic, f.detail, f.explained) };
+  }
+
+  /**
+   * One turn on the warm server (opencode-server.js): the message goes to the
+   * session over HTTP and the server's live events become the same JSON
+   * events `opencode run --format json` prints, so thinking, tool steps and
+   * the reply show exactly as they do today. The finished message the request
+   * returns is the source of truth: parts the live stream missed are replayed
+   * from it. Permission requests are answered `once`, like
+   * --dangerously-skip-permissions (rules that deny still deny). Returns
+   * NO_SERVER when the message should run the ordinary way instead.
+   */
+  async _runViaServer({ msgChannel, runCwd, model, sessionId, fullPrompt, spawnEnv, contextFile = null }) {
+    const slash = String(model || '').indexOf('/');
+    if (slash <= 0) return NO_SERVER;
+    const server = this._getServer();
+    if (!(await server.acquire({ env: spawnEnv, cwd: runCwd }))) return NO_SERVER;
+    if (contextFile) {
+      // The server runs one turn at a time, so this is the only turn reading it.
+      try {
+        fs.mkdirSync(path.dirname(contextFile), { recursive: true });
+        const requesterEmail = this.requesterEmailFor ? this.requesterEmailFor(msgChannel) : null;
+        fs.writeFileSync(contextFile, JSON.stringify({ channel: msgChannel, requesterEmail }), { mode: 0o600 });
+      } catch (e) {
+        this._log(`Could not write the turn context (${e.message}); running this message without the server`, 'error');
+        server.release();
+        return NO_SERVER;
+      }
+    }
+
+    let sid = sessionId || null;
+    // Stand-in for a child process, so stop and interrupt reach this turn.
+    const proc = new EventEmitter();
+    proc.pid = null;
+    proc.exitCode = null;
+    proc.kill = () => { if (proc.exitCode === null) { proc.exitCode = 0; proc.emit('exit', 0); } };
+    proc.__abortAttached = () => server.abort(sid);
+    this._channelProcesses[msgChannel] = proc;
+
+    const responseState = { finalText: '', allText: '', seenText: false };
+    const lines = [];
+    const emitted = new Set();
+    const roles = {};
+    const early = [];  // parts seen before their message's role
+    const children = new Set();  // subagent sessions started from this turn's session
+    let pending = Promise.resolve();
+    let timedOut = false;
+    const watchdog = this._createIdleWatchdog(() => {
+      timedOut = true;
+      this._log(`opencode idle for ${this._runTimeoutMs() / 1000}s; stopping the turn on the server`);
+      server.abort(sid).catch(() => {});
+    });
+    const emit = (part, final = false) => {
+      const event = OpenCodeAdapter._eventForPart(part, final);
+      if (!event) return;
+      const key = `${part.id}:${event.type}`;
+      if (emitted.has(key)) return;
+      emitted.add(key);
+      lines.push(JSON.stringify(event));
+      pending = pending
+        .then(() => this._handleStreamEvent(event, msgChannel, responseState))
+        .catch((e) => this._log(`opencode stream event handling failed: ${e.message}`));
+    };
+    const unsubscribe = server.subscribe((ev) => {
+      const props = (ev && ev.properties) || {};
+      if (!sid) return;
+      if (ev.type === 'message.updated' && props.info && props.info.sessionID === sid) {
+        roles[props.info.id] = props.info.role;
+        for (let k = early.length - 1; k >= 0; k--) {
+          if (roles[early[k].messageID]) { const [part] = early.splice(k, 1); if (roles[part.messageID] === 'assistant') emit(part); }
+        }
+      } else if (ev.type === 'session.created' && props.info && props.info.parentID
+        && (props.info.parentID === sid || children.has(props.info.parentID))) {
+        children.add(props.info.id);
+      } else if (ev.type === 'permission.asked' && (props.sessionID === sid || children.has(props.sessionID))) {
+        // A subagent's prompt arrives from its own child session; left
+        // unanswered it held the turn until the idle watchdog stopped it.
+        watchdog.touch();
+        server.replyPermission(props.sessionID, props.id, 'once').catch(() => {});
+      } else if (ev.type === 'message.part.updated' && props.part && props.part.sessionID === sid) {
+        watchdog.touch();
+        const part = props.part;
+        if (!roles[part.messageID]) early.push(part);
+        else if (roles[part.messageID] === 'assistant') emit(part);
+      } else if (ev.type === 'message.part.delta' && props.sessionID === sid) {
+        watchdog.touch();
+      } else if ((ev.type === 'message.part.updated' && props.part && children.has(props.part.sessionID))
+        || (ev.type === 'message.part.delta' && children.has(props.sessionID))) {
+        // A subagent at work is the turn at work: its parts are not this
+        // channel's reply, but a long task run in a child session left the
+        // turn's own session quiet until the watchdog stopped it.
+        watchdog.touch();
+      }
+    });
+    const stopping = () => this._stoppingChannels.has(msgChannel);
+    const done = () => {
+      watchdog.cancel();
+      unsubscribe();
+      server.release();
+      if (this._channelProcesses[msgChannel] === proc) delete this._channelProcesses[msgChannel];
+      proc.kill();
+    };
+
+    try {
+      try {
+        if (!sid) {
+          sid = (await server.request('POST', '/session', {})).id;
+          this._channelSessions[msgChannel] = sid;
+          this._saveSessions();
+        }
+      } catch (e) {
+        this._log(`OpenCode server could not open a session (${e.message}); running this message without it`, 'error');
+        done();
+        return NO_SERVER;
+      }
+      this._log(`CLI (warm server): message to session ${sid}`);
+      let res;
+      try {
+        res = await server.request('POST', `/session/${encodeURIComponent(sid)}/message`, {
+          model: { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) },
+          parts: [{ type: 'text', text: fullPrompt }],
+        });
+      } catch (e) {
+        if (!emitted.size && !stopping() && !timedOut) {
+          // Nothing happened yet: an unknown session, or a server in trouble.
+          this._log(`OpenCode server turn failed before any output (${e.message}); running this message without it`, 'error');
+          if (e.status !== 404) server.stop();
+          done();
+          return NO_SERVER;
+        }
+        res = null;
+      }
+      for (const part of (res && res.parts) || []) emit(part, true);
+      const info = (res && res.info) || {};
+      if (info.error) lines.push(JSON.stringify({ type: 'error', sessionID: sid, error: info.error }));
+      try { await pending; } catch {}
+      if (stopping()) {
+        this._stoppingChannels.delete(msgChannel);
+        done();
+        return '';
+      }
+      done();
+      const outcome = this._settleOutcome({
+        code: info.error || !res ? 1 : 0, signal: null, stdout: lines.join('\n'), stderr: '',
+        timedOut, timeoutMs: watchdog.timeoutMs, responseState, msgChannel,
+      });
+      if (outcome.error) throw outcome.error;
+      return outcome.text;
+    } catch (e) {
+      if (this._channelProcesses[msgChannel] === proc) done();
+      throw e;
+    }
+  }
+
+  /**
+   * The `opencode run --format json` event for a finished message part, or
+   * null while it's still being written (live parts) / for other part types.
+   */
+  static _eventForPart(part, final = false) {
+    if (!part || typeof part !== 'object') return null;
+    const ended = final || Boolean(part.time && part.time.end);
+    const base = { sessionID: part.sessionID, part };
+    switch (part.type) {
+      case 'step-start': return { type: 'step_start', ...base };
+      case 'step-finish': return { type: 'step_finish', ...base };
+      case 'reasoning': return ended ? { type: 'reasoning', ...base } : null;
+      case 'text': return ended && !part.synthetic && !part.ignored ? { type: 'text', ...base } : null;
+      case 'tool': {
+        const status = part.state && part.state.status;
+        return (status === 'completed' || status === 'error') ? { type: 'tool_use', ...base } : null;
+      }
+      default: return null;
+    }
+  }
+
+  /**
+   * Decide what an exit-0 run means. Returns `{ text }` for a real reply or
+   * `{ failure: { category, diagnostic, detail } }`.
+   *
+   * A run that ends on a tool call with no text after it is NOT a finished
+   * answer: opencode stopped right as (or because) that tool ran. Field
+   * reports (Windows, multi-line PowerShell through the `bash` tool) showed
+   * the streamed reasoning being posted as the reply, which reads as the agent
+   * "going silent mid-task". Report it as a failure instead — preferring the
+   * structured error event when opencode emitted one — so the user gets a
+   * clear "stopped after `bash`" plus a way forward. Exit 0 with no text at
+   * all is likewise classified rather than guessed at.
+   */
+  static _outcomeForCleanExit({ stdout = '', stderr = '', stdoutErr = null, responseState = null } = {}) {
+    stdout = String(stdout || '').trim();
+    const state = responseState || {};
+    const lastTool = state.lastTool || null;
+    const endedOnTool = !!lastTool && !(state.finalText || '').trim();
+
+    if (state.permissionDenied && !(state.finalText || '').trim()) {
+      return { failure: { category: 'permission_denied', diagnostic: `permission rejected for ${lastTool}`,
+        detail: `Tool: \`${lastTool}\`` } };
+    }
+    // An error the run already got past (e.g. a too-long request that OpenCode
+    // answered by summarizing and continuing) is not why it ended.
+    if (stdoutErr && OpenCodeAdapter._errorRecovered(stdout)) stdoutErr = null;
+    if (endedOnTool) {
+      if (stdoutErr) {
+        const cls = this._classifyFailure({ code: 0, signal: null, stdout, stderr, stdoutErr });
+        const vague = ['unknown_error', 'process_crashed', 'empty_response'].includes(cls.category);
+        return {
+          failure: {
+            category: vague ? 'incomplete_run' : cls.category,
+            diagnostic: `exit 0 after tool ${lastTool} with error event: ${cls.diagnostic || ''}`,
+            detail: cls.detail || `Last tool call: \`${lastTool}\``,
+            explained: !!cls.detail && cls.explained,
+          },
+        };
+      }
+      return {
+        failure: {
+          category: 'incomplete_run',
+          diagnostic: `exit 0 right after tool ${lastTool}, no final assistant text`,
+          detail: `Last tool call: \`${lastTool}\``,
+        },
+      };
+    }
+
+    const text = stdout ? OpenCodeAdapter._finalTextFromStdout(stdout, responseState) : '';
+    if (text) return { text };
+
+    // Exit 0 with no final assistant text. This is NOT proof of a missing
+    // provider — it can be a structured error on stdout, an incomplete
+    // stream, or a genuinely empty completion. Classify rather than guess.
+    if (stdoutErr) {
+      const cls = this._classifyFailure({ code: 0, signal: null, stdout, stderr, stdoutErr });
+      return { failure: { category: cls.category, diagnostic: `exit 0 with error event: ${cls.diagnostic || ''}`, detail: cls.detail, explained: cls.explained } };
+    }
+    const emptyCat = OpenCodeAdapter._emptyExitCategory(stdout);
+    return {
+      failure: {
+        category: emptyCat,
+        diagnostic: `exit 0, no final assistant text; stdout head: ${stdout.slice(0, 200)}`,
+        detail: '',
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Preflight (deterministic, no model call) + failure classification
+  // ------------------------------------------------------------------
+
+  /**
+   * Cheap, side-effect-free readiness check run immediately before spawning.
+   * Returns { ok: true, ... } or { ok: false, category, detail?, diagnostic? }.
+   * Conservative by design: it blocks only on deterministic, locally-knowable
+   * problems (no binary, unsupported version, no model, no credential at all,
+   * unusable cwd) and lets anything ambiguous through to a real run.
+   */
+  _preflight() {
+    // The path found at start-up is kept, but not past the file it names: a
+    // reinstall or an antivirus quarantine took it away, and every message
+    // after that failed "CLI not found" until the agent restarted, even with
+    // a working copy installed by then.
+    let binary = this._opencodeBinary;
+    if (binary && !fs.existsSync(binary)) {
+      const found = this._findOpencodeBinary();
+      if (found !== binary) {
+        this._log(`${binary} is gone; ${found ? `using ${found}` : 'no other copy found'}`);
+        this._versionProbe = null;
+      }
+      binary = found;
+    }
+    binary = binary || this._findOpencodeBinary();
+    this._opencodeBinary = binary || null;
+    if (!binary) return { ok: false, category: 'cli_not_found' };
+
+    // Before every other check: the placeholder a skipped postinstall leaves
+    // behind has no version and runs no model, so each later check would blame
+    // the wrong thing — "no model configured" first, then an unexplained exit 1
+    // on every message once a model is set.
+    if (isPostinstallStub(binary)) {
+      return { ok: false, category: 'install_incomplete', diagnostic: `${binary} is the package's postinstall placeholder` };
+    }
+
+    const probe = this._detectCliVersion(binary);
+    if (probe.stub) {
+      return { ok: false, category: 'install_incomplete', diagnostic: `${binary} --version answered as the package's postinstall placeholder` };
+    }
+    if (!probe.executable) {
+      return { ok: false, category: 'cli_not_executable', diagnostic: 'opencode --version did not run' };
+    }
+    const vclass = this.constructor._classifyVersion(probe.version);
+    if (vclass === 'unsupported') {
+      return {
+        ok: false,
+        category: 'unsupported_version',
+        detail: `detected ${probe.version || 'unknown'}`,
+        diagnostic: `detected ${probe.version}, requires >= ${OPENCODE_MIN_VERSION} and < ${OPENCODE_UNSUPPORTED_MAJOR}.0.0`,
+      };
+    }
+    // 'unknown' (unparseable) and 'degraded' (newer than tested) still run.
+
+    const model = this._resolveModel();
+    if (!model && this._modelRequired()) return { ok: false, category: 'model_missing' };
+
+    const cred = this._credentialState();
+    if (cred === 'missing') return { ok: false, category: 'credential_missing' };
+
+    const runCwd = this._resolveCwd();
+    try {
+      fs.accessSync(runCwd, fs.constants.R_OK | fs.constants.W_OK);
+    } catch {
+      return { ok: false, category: 'cwd_unavailable', diagnostic: `cannot access ${runCwd}` };
+    }
+
+    return { ok: true, version: probe.version, versionClass: vclass, model, credential: cred };
+  }
+
+  /**
+   * Probe the CLI's version and executability, cached briefly so preflight never
+   * spawns `--version` more than once per VERSION_PROBE_TTL_MS across channels.
+   * Returns { version: string|null, executable: boolean, stub: boolean } —
+   * `stub` when what answered was the package's postinstall placeholder, which
+   * a wrapper script in front of it (pnpm, bun) hides from a look at the file.
+   */
+  _detectCliVersion(binary) {
+    const now = Date.now();
+    if (this._versionProbe && (now - this._versionProbe.ts) < VERSION_PROBE_TTL_MS) {
+      return this._versionProbe;
+    }
+    let version = null;
+    let executable = false;
+    let stub = false;
+    try {
+      const raw = execSync(`"${binary}" --version`, {
+        encoding: 'utf-8',
+        timeout: 5000,
+        windowsHide: true,
+        env: getEnhancedEnv(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      executable = true;
+      const m = raw.match(/(\d+\.\d+\.\d+)/);
+      version = m ? m[1] : (raw.split('\n')[0] || null);
+    } catch (e) {
+      const code = e && e.code;
+      if (code === 'ENOENT' || code === 'EACCES' || code === 'EPERM') {
+        executable = false; // never spawned
+      } else {
+        executable = true; // spawned but --version misbehaved
+        const out = String((e && (e.stdout || e.stderr)) || '');
+        const m = out.match(/(\d+\.\d+\.\d+)/);
+        version = m ? m[1] : null;
+        stub = isPostinstallStubOutput(`${(e && e.stdout) || ''}\n${(e && e.stderr) || ''}`);
+      }
+    }
+    // A placeholder is not cached: the fix is a reinstall, and the message
+    // right after it must not still be answered from the broken copy.
+    if (stub) return { version, executable, stub, ts: now };
+    this._versionProbe = { version, executable, stub, ts: now };
+    return this._versionProbe;
+  }
+
+  /**
+   * Best-effort credential/provider presence. 'present' | 'unknown' | 'missing'.
+   * 'unknown' (custom provider key, custom endpoint, or a config file we can't
+   * fully validate) is deliberately NOT blocked — only a total absence of any
+   * recognizable signal is 'missing'.
+   */
+  _credentialState() {
+    const env = this.agentEnv || process.env;
+    const val = (k) => (env[k] == null ? '' : String(env[k])).trim();
+    const KNOWN = [
+      'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY',
+      'GROQ_API_KEY', 'MISTRAL_API_KEY', 'DEEPSEEK_API_KEY', 'XAI_API_KEY',
+      'GEMINI_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY', 'GOOGLE_API_KEY',
+      'AZURE_API_KEY', 'AZURE_OPENAI_API_KEY',
+    ];
+    if (KNOWN.some((k) => val(k))) return 'present';
+
+    const home = os.homedir();
+    const fileNonEmpty = (p) => {
+      try { return fs.existsSync(p) && fs.statSync(p).size > 0; } catch { return false; }
+    };
+    const stores = [
+      path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+      path.join(home, '.config', 'opencode', 'opencode.json'),
+      path.join(home, '.config', 'opencode', 'config.json'),
+      path.join(this.agentHome, 'opencode.json'),
+      path.join(this.agentHome, '.opencode', 'opencode.json'),
+    ];
+    if (stores.some(fileNonEmpty)) return 'present';
+
+    // A model on a provider OpenCode sets up for itself is not ours to judge:
+    // OpenCode Zen's `opencode/…` free models need no sign-in at all, and any
+    // provider id other than openai/anthropic comes from OpenCode's own config.
+    // Blocking those would refuse a run the CLI can make.
+    const model = val('OPENCODE_MODEL') || val('LLM_MODEL');
+    const provider = model.includes('/') ? model.split('/')[0].toLowerCase() : '';
+    if (provider && provider !== 'openai' && provider !== 'anthropic') return 'unknown';
+
+    if (val('OPENAI_BASE_URL') || val('LLM_BASE_URL')) return 'unknown';
+    if (Object.keys(env).some((k) => /(_API_KEY|_API_TOKEN|_TOKEN)$/.test(k) && val(k))) return 'unknown';
+    return 'missing';
+  }
+
+  /** Build a categorized Error carrying diagnostic (for logs) + detail (for the user). */
+  _failure(category, diagnostic, detail, explained = false) {
+    const err = new Error(`opencode ${category}${detail ? `: ${detail}` : ''}`);
+    err.category = category;
+    err.diagnostic = diagnostic || '';
+    err.detail = detail || '';
+    err.explained = !!explained;  // detail is the provider's own explanation (see _providerExplanation)
+    return err;
+  }
+
+  /** Map a raw spawn errno (ENOENT/EACCES) to a category; default unknown_error. */
+  _classifyErrno(e) {
+    const code = e && e.code;
+    if (code === 'ENOENT') return 'cli_not_found';
+    if (code === 'EACCES' || code === 'EPERM') return 'cli_not_executable';
+    return 'unknown_error';
+  }
+
+  /**
+   * Post a user-visible, de-identified, actionable error that is clearly NOT a
+   * normal reply. Carries `error_category` in metadata so the UI can route it.
+   */
+  async _sendClassifiedError(channel, category, detail, explained = false) {
+    // A run the user stopped reads as "stopped mid-task"; it is not an error.
+    if (this._isMuted(channel)) return;
+    const messages = this._failureMessages();
+    const base = messages[category] || messages.unknown_error;
+    // The instance redaction: this agent's own secrets by value (whatever their
+    // format), then the credential shapes the static pass already took.
+    const safe = detail ? this._redact(detail).trim() : '';
+    // When the provider explained the failure in words (a platform's "included
+    // tokens used up until Dec 8, allow extra usage on its page"), that is the
+    // message: our generic line ("give this agent a key with credit") can be
+    // wrong for a managed gateway. Our hint still follows where it adds an action.
+    const body = safe && explained
+      ? (category === 'quota_exhausted' ? safe : `${safe}\n\n${base}`)
+      : safe ? `${base}\n\n> ${safe}` : base;
+    const label = this._cliLabel();
+    const headline = category === 'incomplete_run' ? `${label} stopped mid-task` : `${label} couldn't run`;
+    const content = `⚠️ **${headline}** — ${body}`;
+    try {
+      await this.client.sendMessage(this.workspaceId, channel, this.token, content, {
+        senderType: 'agent',
+        senderName: this.agentName,
+        messageType: 'error',
+        metadata: { agent_mode: this._mode, error: true, error_category: category },
+        sessionId: this._sessionId,
+      });
+    } catch {
+      // Older backends may reject an unknown messageType/metadata — fall back to
+      // the plain error path so the user still gets an actionable message.
+      try { await this.sendError(channel, content); } catch {}
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Static classifiers (pure — unit tested)
+  // ------------------------------------------------------------------
+
+  /** True when an event is a tool call, across opencode's version-varying shapes. */
+  /** A `--thinking` reasoning event (`{type:"reasoning", part:{type:"reasoning", text}}`). */
+  static _isReasoningEvent(event) {
+    if (!event || typeof event !== 'object') return false;
+    if (String(event.type || '').toLowerCase() === 'reasoning') return true;
+    const part = event.part;
+    return !!(part && typeof part === 'object' && String(part.type || '').toLowerCase() === 'reasoning');
+  }
+
+  /** Reasoning text from a reasoning event ('' when empty), or null for any other event. */
+  static _reasoningFromEvent(event) {
+    if (!OpenCodeAdapter._isReasoningEvent(event)) return null;
+    const part = (event.part && typeof event.part === 'object') ? event.part : event;
+    const text = part.text || part.content || '';
+    // Summaries of several reasoning steps arrive glued together
+    // ("**Checking A****Testing B**"); give each heading its own paragraph.
+    return typeof text === 'string' ? text.replace(/\*\*\*\*(?=\S)/g, '**\n\n**') : '';
+  }
+
+  static _isToolEvent(event) {
+    if (!event || typeof event !== 'object') return false;
+    const t = String(event.type || '').toLowerCase();
+    if (t === 'tool_use' || t === 'tool') return true;
+    const part = event.part;
+    if (part && typeof part === 'object' && String(part.type || '').toLowerCase() === 'tool') return true;
+    return false;
+  }
+
+  /** Scan stdout JSONL for a structured error event; last one wins. */
+  /**
+   * True when the run carried on after its last error event: a step or tool
+   * call finished later in the same output, so the error was recovered from
+   * (OpenCode retried, or summarized a too-long conversation and continued).
+   */
+  static _errorRecovered(raw) {
+    const events = OpenCodeAdapter._splitJsonObjects(raw);
+    let lastError = -1;
+    events.forEach((ev, i) => { if (OpenCodeAdapter._errorFromEvent(ev)) lastError = i; });
+    if (lastError < 0) return false;
+    return events.slice(lastError + 1).some((ev) => {
+      const type = String((ev && ev.type) || '').toLowerCase();
+      return type === 'step_finish' || type === 'step-finish' || type === 'tool_use' || type === 'tool';
+    });
+  }
+
+  static _extractErrorFromStdout(raw) {
+    const events = OpenCodeAdapter._splitJsonObjects(raw);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const err = OpenCodeAdapter._errorFromEvent(events[i]);
+      if (err) return err;
+    }
+    return null;
+  }
+
+  /** Pull { message, name, status } from one event, tolerant of nesting. */
+  static _errorFromEvent(ev) {
+    if (!ev || typeof ev !== 'object') return null;
+    const type = String(ev.type || '').toLowerCase();
+    const part = (ev.part && typeof ev.part === 'object') ? ev.part : null;
+    // Nested error objects carry the richest detail — try them before the
+    // wrapping event, whose only signal may be type === 'error'.
+    const candidates = [];
+    if (ev.error && typeof ev.error === 'object') candidates.push(ev.error);
+    if (part && part.error && typeof part.error === 'object') candidates.push(part.error);
+    if (part && String(part.type || '').toLowerCase().includes('error')) candidates.push(part);
+    if (type.includes('error')) candidates.push(ev);
+    if (typeof ev.error === 'string') candidates.push({ message: ev.error });
+    if (part && typeof part.error === 'string') candidates.push({ message: part.error });
+
+    const pick = (...vals) => {
+      for (const v of vals) if (typeof v === 'string' && v.trim()) return v;
+      return '';
+    };
+    for (const c of candidates) {
+      if (!c || typeof c !== 'object') continue;
+      const data = (c.data && typeof c.data === 'object') ? c.data : {};
+      const message = pick(c.message, c.error, c.detail, c.reason, data.message);
+      const name = pick(c.name, c.type);
+      const statusRaw = c.status != null ? c.status
+        : (c.statusCode != null ? c.statusCode
+          : (data.status != null ? data.status
+            : (typeof c.code === 'number' ? c.code : null)));
+      if (message || name || statusRaw != null) {
+        return {
+          message: String(message || ''),
+          name: String(name || ''),
+          status: statusRaw != null ? String(statusRaw) : '',
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Classify a failed run into one taxonomy category. Conservative: an exit
+   * code alone is never "auth"; only explicit 401/403/auth wording is. Returns
+   * { category, diagnostic, detail }.
+   */
+  static _classifyFailure({ code, signal, stdout, stderr, stdoutErr } = {}) {
+    // OpenCode colours its errors even into a pipe; quoted as they came, the
+    // channel showed "\x1b[91m\x1b[1mError: \x1b[0m…".
+    stderr = stripAnsi(stderr);
+    const err = stdoutErr || OpenCodeAdapter._extractErrorFromStdout(stdout || '');
+    const status = err && err.status ? String(err.status) : '';
+    const msg = (err && err.message) || '';
+    const name = (err && err.name) || '';
+    const diagnostic = [name, status, msg].filter(Boolean).join(' ')
+      || (stderr || '')
+      || `exit code ${code}${signal ? `, signal ${signal}` : ''}`;
+    const hay = `${name} ${status} ${msg} ${stderr || ''}`.toLowerCase();
+    const has = (re) => re.test(hay);
+
+    const configError = OpenCodeAdapter._configError(stderr);
+    let category;
+    if (isPostinstallStubOutput(hay)) {
+      category = 'install_incomplete';
+    } else if (SHARED_DB_MIGRATED_RE.test(hay)) {
+      category = 'shared_db_migrated';
+    } else if (configError) {
+      // Checked before the provider patterns: what is wrong with the file is
+      // free text ("Unrecognized key: model", "got {…401…}") that would read
+      // as a bad model or a rejected key.
+      category = 'config_invalid';
+    } else if (has(/(?:unrecognized|unknown) (?:flag|option|argument)s?:?\s*['"`]?--?[a-z]/)) {
+      // The CLI refused a flag this adapter always passes, so it is not a
+      // build we support (one whose version string we could not read gets
+      // through the preflight). It printed its usage too, and that came out
+      // as "produced output this version could not parse", which said nothing
+      // about reinstalling.
+      category = 'unsupported_version';
+    } else if (has(CREDIT_EXHAUSTED) || has(/allowance\b[^.]{0,60}\bused up|allowance_exhausted/)) {
+      // A spent account, not a busy one: waiting does not fix it. Seen in the
+      // field as "Insufficient balance" under "undetermined reason", and as a
+      // plan's "Your Pass allowance for this period is used up, and your
+      // account is set not to…" with no status code in the run's error.
+      // Ahead of the 401/403 rule: "Forbidden: Insufficient account balance"
+      // came out as rejected credentials (daily errors dashboard, 2026-11-23).
+      category = 'quota_exhausted';
+    } else if (has(/\b(401|403)\b/) || has(/unauthor|invalid api key|invalid_api_key|invalid or revoked api key|api key (?:has been |was )?revoked|api[ _-]?key.{0,20}expired|authentication|auth(entication)? failed|forbidden|invalid token|invalid credentials?\b|no api key|missing api key|permission denied/)) {
+      // "Invalid credential" and "This API key has expired. Create a new API
+      // key in OpenCode Console" both came out as "failed for an undetermined
+      // reason" (daily errors dashboard, 2026-11-19).
+      category = 'auth_failed';
+    } else if (has(/\b402\b/)) {
+      // After the 401/403 rule: three digits can sit in a path or an id.
+      category = 'quota_exhausted';
+    } else if (has(/\b429\b/) || has(/rate.?limit|too many requests|quota|overloaded/)) {
+      category = 'rate_limited';
+    } else if (has(/\b413\b|request entity too large|payload too large|failed to buffer the request body|length limit exceeded|context(?:_| )length(?:_| )exceeded|maximum context length/)) {
+      category = 'request_too_large';
+    } else if (has(/model.*(not found|does not exist|unknown|invalid|unsupported)|no such model|unknown model|invalid model|model_not_found|\b404\b/)) {
+      category = 'model_not_found';
+    } else if (has(/no provider|provider not configured|not configured|no model configured|no providers|missing provider/)) {
+      category = 'provider_not_configured';
+    } else if (has(/econnrefused|enotfound|etimedout|eai_again|network|fetch failed|socket hang|connection (refused|reset|error)|getaddrinfo|\bdns\b/)) {
+      category = 'network_error';
+    } else if (has(/\b5\d\d\b|server error|internal server|bad gateway|service unavailable|gateway timeout|server is busy|system is busy|系统繁忙|服务繁忙|đang bận/)
+      // A relay that was reached and then cut the reply off: "Upstream
+      // response stream was interrupted" read as "failed for an undetermined
+      // reason" (daily errors dashboard, 2026-11-25). Not "could not reach".
+      || has(/\bstream (?:was )?(?:interrupted|disconnected)\b/)) {
+      category = 'provider_server_error';
+    } else if (has(/expected '?function\.name'? to be a string/)) {
+      // The provider streamed a tool call with no tool name, and the AI SDK
+      // under OpenCode refused it: "Expected 'function.name' to be a string."
+      // Six times in a row from one user's agents on GLM / DeepSeek models
+      // (daily errors dashboard, 2026-11-18), each read as "OpenCode failed
+      // for an undetermined reason". After the provider categories: a key,
+      // credit or network failure in the same output is the cause to report.
+      category = 'malformed_tool_call';
+    } else if (has(/timeout|timed out/)) {
+      category = 'timeout';
+    } else if (err) {
+      category = 'unknown_error'; // recognized an error but not its kind
+    } else if (signal) {
+      category = 'timeout';
+    } else if (!stdout && !stderr) {
+      category = 'process_crashed';
+    } else if (stdout) {
+      category = 'stream_parse_error';
+    } else {
+      category = 'unknown_error';
+    }
+
+    const explanation = configError ? null : OpenCodeAdapter._providerExplanation(msg);
+    const detail = configError
+      ? OpenCodeAdapter._redact(configError).slice(0, 500)
+      : explanation
+        ? OpenCodeAdapter._redact(explanation).slice(0, 600)
+        : OpenCodeAdapter._redact(msg || stderr || '').slice(0, 200);
+    return { category, diagnostic, detail, explained: !!explanation };
+  }
+
+  /**
+   * The provider's own sentence from an error body such as
+   * `Payment Required: {"detail":"…"}` or `{"error":{"message":"…"}}`, or null.
+   * Gateways put their real reason there; quoted raw, the channel showed JSON
+   * cut off mid-word before the part that mattered (the date it resumes).
+   */
+  static _providerExplanation(msg) {
+    const text = String(msg || '');
+    const start = text.indexOf('{');
+    if (start < 0) return null;
+    let body;
+    try { body = JSON.parse(text.slice(start, text.lastIndexOf('}') + 1)); } catch { return null; }
+    const pick = (v) => (typeof v === 'string' && v.trim().length >= 12 ? v.trim() : null);
+    if (!body || typeof body !== 'object') return null;
+    const err = body.error;
+    return pick(body.detail) || pick(err && typeof err === 'object' ? err.message : err) || pick(body.message) || null;
+  }
+
+  /**
+   * OpenCode's refusal of a config file, as one line: which file, and what is
+   * wrong with it — or null. Its two shapes (opencode-ai 1.17.11):
+   *
+   *   Error: Configuration is invalid at <file>
+   *   ↳ Expected { readonly "type": "local", ... } | …, got {"url":"…"} mcp.upsy
+   *   ↳ Missing key mcp.upsy.enabled
+   *
+   *   Error: Config file at <file> is not valid JSON(C):
+   *   --- JSONC Input --- … --- Errors ---
+   *   ValueExpected at line 1, column 15
+   *      Line 1: {"provider": {,}
+   *                           ^
+   *
+   * The first 200 characters of stderr usually ended inside the file's path,
+   * before the reason.
+   */
+  static _configError(text) {
+    const lines = stripAnsi(text).split(/\r?\n/);
+    // OpenCode's own error line, not the phrase quoted somewhere else.
+    const at = lines.findIndex((l) => /^\s*(?:error:\s*)?(?:configuration is invalid at |config file at .+ is not valid json)/i.test(l));
+    if (at < 0) return null;
+    const head = lines[at].trim().replace(/^error:\s*/i, '').replace(/:\s*$/, '');
+    const reasons = [];
+    for (const l of lines.slice(at + 1)) {
+      const m = l.trim().match(/^↳\s*(.+)$/);
+      if (m) reasons.push(m[1]);
+    }
+    if (!reasons.length) {
+      const start = lines.findIndex((l) => l.trim() === '--- Errors ---');
+      for (const l of start < 0 ? [] : lines.slice(start + 1)) {
+        const t = l.trim();
+        if (/^---/.test(t)) break;
+        // The echoed source line and its caret, not reasons.
+        if (!t || /^line \d+:/i.test(t) || /^\^+$/.test(t)) continue;
+        reasons.push(t);
+      }
+    }
+    return reasons.length ? `${head}: ${reasons.join('; ')}` : head;
+  }
+
+  /** Category for an exit-0 run that produced no final assistant text. */
+  static _emptyExitCategory(stdout) {
+    const raw = String(stdout || '').trim();
+    if (!raw) return 'empty_response';
+    return 'empty_response';
+  }
+
+  /** 'ok' | 'degraded' (newer than tested) | 'unsupported' (too old, or 2.x) | 'unknown'. */
+  static _classifyVersion(version) {
+    // Non-semver (or unreadable) → 'unknown': allow the run, never block on it.
+    if (!version || !/^\d+\.\d+/.test(String(version))) return 'unknown';
+    if (OpenCodeAdapter._cmpVer(version, OPENCODE_MIN_VERSION) < 0) return 'unsupported';
+    if (Number(String(version).split('.')[0]) >= OPENCODE_UNSUPPORTED_MAJOR) return 'unsupported';
+    if (OPENCODE_TESTED_MAX_VERSION && OpenCodeAdapter._cmpVer(version, OPENCODE_TESTED_MAX_VERSION) > 0) return 'degraded';
+    return 'ok';
+  }
+
+  /** Numeric-segment semver compare. Returns -1 / 0 / 1. */
+  static _cmpVer(a, b) {
+    const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0);
+    const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d) return d < 0 ? -1 : 1;
+    }
+    return 0;
+  }
+
+  /** Redact secrets (keys, tokens, bearer/authorization, query secrets) from diagnostics. */
+  static _redact(s) {
+    return redactSecrets(s);
+  }
+}
+
+// The warm-server "run the ordinary way instead" sentinel, for tests.
+OpenCodeAdapter._NO_SERVER = NO_SERVER;
+
+module.exports = OpenCodeAdapter;
+module.exports.findOpencodeBinary = findOpencodeBinary;

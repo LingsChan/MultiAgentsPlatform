@@ -1,0 +1,73 @@
+{
+  "items": {
+    "dashboard": {
+      "label": "Connect Agents",
+      "short": "Agents",
+      "description": "Install and configure agents, then connect them to workspaces"
+    },
+    "install": {
+      "label": "Agent Marketplace",
+      "description": "Browse, install and update agents"
+    },
+    "agents": {
+      "label": "Agents",
+      "description": "Step 2 · Create agents, set API keys, test and connect"
+    },
+    "workspaces": {
+      "label": "Connected Workspaces",
+      "short": "Spaces",
+      "description": "Workspaces this computer is connected to as a device"
+    },
+    "chat": {
+      "label": "Chat",
+      "description": "Talk to a workspace this machine has joined"
+    },
+    "connections": {
+      "label": "Connections",
+      "description": "Connect external platforms like GitHub and Slack"
+    },
+    "credentials": {
+      "label": "Credentials",
+      "description": "Manage API keys and secrets in one place"
+    },
+    "github": {
+      "label": "GitHub",
+      "description": "Bind repos and view issues / PRs"
+    },
+    "logs": {
+      "label": "Logs",
+      "description": "View runtime logs and troubleshoot"
+    },
+    "settings": {
+      "label": "Settings",
+      "short": "Settings",
+      "description": "App settings and preferences"
+    }
+  },
+  "notifications": {
+    "tooltip": "Notifications",
+    "title": "Notifications",
+    "unread": "{{count}} unread",
+    "markAllRead": "Mark all read",
+    "clear": "Clear",
+    "empty": "No notifications yet."
+  },
+  "search": "Search agents, workspaces…",
+  "themeToggle": "Theme",
+  "modeLauncher": "This Computer",
+  "modeLauncherShort": "Computer",
+  "modeWorkspace": "Workspace",
+  "modeSwitch": "Switch between this computer and your workspaces",
+  "toggleSidebar": "Toggle sidebar",
+  "agentsSummary": {
+    "running_one": "{{count}} agent running",
+    "running_other": "{{count}} agents running",
+    "starting_one": "{{count}} agent starting",
+    "starting_other": "{{count}} agents starting",
+    "error_one": "{{count}} agent needs attention",
+    "error_other": "{{count}} agents need attention",
+    "stopped": "No agents running",
+    "none": "No agents yet",
+    "connectorOff": "Local connector off"
+  }
+}

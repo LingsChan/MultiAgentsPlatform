@@ -1,0 +1,138 @@
+'use client';
+import { useOnboardingSurface, useDismissOnboarding, useWelcomeSurface, useWelcomeNavigation } from './onboarding-surface';
+
+import { isRoutineSession, isIssueWorkSession } from '@/lib/conversation-list';
+
+import {
+  BookOpen, Bot, CircleDot, CalendarClock, FileText, Globe, Inbox, MessageSquare, Sparkles, Waypoints,
+} from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { UnreadBadge } from '@/components/ui/unread-badge';
+import {
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarMenu,
+  SidebarMenuBadge,
+  SidebarMenuButton,
+  SidebarMenuItem,
+} from '@/components/ui/sidebar';
+import { useWorkspace } from '@/lib/workspace-context';
+import { isRecentAgent } from '@/lib/helpers';
+import { countFiles } from '@/components/files/file-utils';
+import { unreadIssueCounts } from '@/lib/signals';
+import { useT } from '@/lib/i18n';
+import { useLayout, type ViewMode } from './layout-context';
+
+interface NavItem {
+  mode: ViewMode;
+  label: string;
+  icon: React.ReactNode;
+  count?: number;
+  /** Render the count as a red attention badge (something needs the user). */
+  urgent?: boolean;
+  /** Attention dot beside the label (unread threads, mentions, DMs). */
+  unread?: boolean;
+}
+
+/** `onNavigate` lets the mobile drawer close itself once a view is picked. */
+export function NavMain({ onNavigate }: { onNavigate?: () => void }) {
+  const { viewMode, openView, setThreadFilter } = useLayout();
+  const onboarding = useOnboardingSurface();
+  const welcome = useWelcomeSurface();
+  const welcomeNavigation = useWelcomeNavigation();
+  const dismissOnboarding = useDismissOnboarding();
+  const { workspace, agents, sessions, files, browserTabs, workflows, routines, knowledge, unreadNotificationCount, unreadThreadsTotal, unreadSignals } = useWorkspace();
+  const t = useT();
+  const unreadIssues = Object.values(unreadIssueCounts(unreadSignals)).reduce((sum, n) => sum + n, 0);
+
+  const hasAgents = agents.filter((a) => isRecentAgent(a) && !a.builtin).length > 0;
+  const items: NavItem[] = [
+    {
+          mode: 'threads',
+          label: t('views.threads'),
+          icon: <MessageSquare />,
+          count: unreadThreadsTotal,
+        },
+    {
+      mode: 'issues',
+      label: t('views.issues'),
+      icon: <CircleDot />,
+      count: unreadIssues,
+      urgent: true,
+    },
+    ...(hasAgents
+      ? ([
+          { mode: 'files', label: t('views.files'), icon: <FileText /> },
+          { mode: 'browser', label: t('views.browser'), icon: <Globe /> },
+          {
+            mode: 'routines',
+            label: t('views.routines'),
+            icon: <CalendarClock />,
+          },
+          { mode: 'knowledge', label: t('views.knowledge'), icon: <BookOpen /> },
+
+          {
+            mode: 'inbox',
+            label: t('views.inbox'),
+            icon: <Inbox />,
+            count: unreadNotificationCount > 0 ? unreadNotificationCount : undefined,
+          },
+          { mode: 'skills', label: t('views.skills'), icon: <Sparkles /> },
+          {
+            mode: 'workflows',
+            label: t('views.workflows'),
+            icon: <Waypoints />,
+          },
+          // v1.1 M2: team specialists directory
+          { mode: 'agents', label: t('collab.viewAgents'), icon: <Bot /> },
+        ] as NavItem[])
+      : []),
+  ];
+
+  return (
+    <SidebarGroup>
+      <SidebarGroupLabel>{t('nav.collaboration')}</SidebarGroupLabel>
+      <SidebarGroupContent>
+        <SidebarMenu className="gap-0.25">
+          {welcomeNavigation.available && <SidebarMenuItem>
+            <SidebarMenuButton isActive={welcome} aria-current={welcome ? 'page' : undefined} onClick={() => {
+              if (welcomeNavigation.open) welcomeNavigation.open(); else openView('connect');
+              onNavigate?.();
+            }}>
+              <Sparkles /><span>{t('nav.welcome')}</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>}
+          {items.filter((item) => item.mode !== 'agents' || workspace?.settings?.services_enabled === true).map((item) => (
+            <SidebarMenuItem key={item.mode}>
+              <SidebarMenuButton
+                tooltip={item.label}
+                isActive={!onboarding && viewMode === item.mode}
+                onClick={() => {
+                  if (item.mode === 'threads') { if (onboarding) dismissOnboarding?.(); setThreadFilter('all'); }
+                  openView(item.mode);
+                  onNavigate?.();
+                }}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+
+              </SidebarMenuButton>
+              {item.count !== undefined && item.count > 0 && (
+                <SidebarMenuBadge className="group-data-[collapsible=icon]:hidden">
+                  {item.urgent || item.mode === 'inbox' || item.mode === 'threads' ? (
+                    <UnreadBadge count={item.count} />
+                  ) : (
+                    <Badge variant="secondary" className="h-4 min-w-4 justify-center px-1 tabular-nums">
+                      {item.count > 99 ? '99+' : item.count}
+                    </Badge>
+                  )}
+                </SidebarMenuBadge>
+              )}
+            </SidebarMenuItem>
+          ))}
+        </SidebarMenu>
+      </SidebarGroupContent>
+    </SidebarGroup>
+  );
+}

@@ -1,0 +1,222 @@
+"use client"
+import { useLayoutEffect, useRef, useState } from "react"
+import { createPortal } from "react-dom"
+import { useWorkspace } from "@/lib/workspace-context"
+import { isRecentAgent } from "@/lib/helpers"
+import { useT } from "@/lib/i18n"
+import type { MessageKey } from "@/lib/i18n"
+import { cn } from "@/lib/utils"
+import { Separator } from "@/components/ui/separator"
+import { useLayout, type ViewMode } from "./layout-context"
+import { ListToggleButton } from "./list-collapse-button"
+import { ThreadTitle } from './thread-title'
+
+const ACTIONS_SLOT_ID = "app-header-actions"
+const TITLE_SLOT_ID = "app-header-title"
+
+/** Portals children into one of the app header's slots. */
+function HeaderSlot({
+  id,
+  children,
+}: {
+  id: string
+  children: React.ReactNode
+}) {
+  // Portal into a node of our own rather than the slot itself, so the view's
+  // header content can be detached as a whole. Views are kept mounted behind
+  // <Activity mode="hidden"> (see Wrapper), which only hides the view's own
+  // DOM — anything portalled into the shared header would stay on screen, and
+  // be dead to clicks. Hiding tears down layout effects in the same commit, so
+  // detaching here takes the content out of the header immediately.
+  const nodeRef = useRef<HTMLElement | null>(null)
+  const [container, setContainer] = useState<HTMLElement | null>(null)
+
+  useLayoutEffect(() => {
+    if (!nodeRef.current) {
+      nodeRef.current = document.createElement("div")
+      nodeRef.current.className = "contents"
+    }
+    setContainer(nodeRef.current)
+    return () => nodeRef.current?.remove()
+  }, [])
+
+  // The header renders before any detail view, so the slot exists by the time
+  // this effect runs; re-checking on every render keeps it correct across
+  // view switches that remount the header.
+  useLayoutEffect(() => {
+    const slot = document.getElementById(id)
+    if (container && slot && container.parentElement !== slot) {
+      slot.appendChild(container)
+    }
+  })
+
+  return container ? createPortal(children, container) : null
+}
+
+/**
+ * Renders its children into the app header's action toolbar. Each view keeps
+ * owning its own header logic and state — only the render target moves — so
+ * the shell shows the single action header the app-shell-4 layout calls for.
+ */
+export function AppHeaderActions({ children }: { children: React.ReactNode }) {
+  return <HeaderSlot id={ACTIONS_SLOT_ID}>{children}</HeaderSlot>
+}
+
+/**
+ * Replaces the app header's title. Views only need this when their title is
+ * interactive (file breadcrumbs, for instance) — otherwise {@link AppHeader}
+ * derives the title itself.
+ */
+export function AppHeaderTitle({ children }: { children: React.ReactNode }) {
+  return <HeaderSlot id={TITLE_SLOT_ID}>{children}</HeaderSlot>
+}
+
+/**
+ * Header for a detail view. On desktop the shell owns a single app-shell-4
+ * action header: the title is rendered there by {@link AppHeader} and only the
+ * actions are portalled up. On mobile there is no app header, so the view keeps
+ * rendering its own bar with both.
+ */
+export function DetailHeader({
+  title,
+  titleInHeader = false,
+  children,
+}: {
+  title: React.ReactNode
+  /**
+   * Render `title` in the app header too, replacing the title it would derive
+   * itself. For views whose title is interactive, like file breadcrumbs.
+   */
+  titleInHeader?: boolean
+  children?: React.ReactNode
+}) {
+  const { isMobile } = useLayout()
+
+  if (!isMobile) {
+    return (
+      <>
+        {titleInHeader && <AppHeaderTitle>{title}</AppHeaderTitle>}
+        <AppHeaderActions>{children}</AppHeaderActions>
+      </>
+    )
+  }
+
+  return (
+    <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 lg:px-4">
+      <div className="flex min-w-0 flex-1 items-center gap-2 lg:gap-3">
+        {title}
+      </div>
+      <div className="flex shrink-0 items-center gap-1 lg:gap-1.5">
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/** Every view mode maps onto a `views.*` message key. */
+export const VIEW_TITLE_KEYS: Record<ViewMode, MessageKey> = {
+  threads: "views.threads",
+  files: "views.files",
+  knowledge: "views.knowledge",
+  browser: "views.browser",
+  issues: "views.issues",
+  workflows: "views.workflows",
+  routines: "views.routines",
+  inbox: "views.inbox",
+  connect: "views.connect",
+  skills: "views.skills",
+  agents: "collab.directoryTitle", // v1.1 M2: agent directory
+}
+
+/** A detail view's title in the app header (dashboard-01's site header). */
+function HeaderTitle({ children }: { children: React.ReactNode }) {
+  return <h3 className="font-heading w-0 flex-1 truncate text-base font-medium text-foreground">{children}</h3>
+}
+
+/**
+ * The app-shell-4 action header: expand-list control, the selected item's
+ * title, and a toolbar that the active view fills via {@link AppHeaderActions}.
+ */
+export function AppHeader() {
+  const { viewMode, isSidebarOpen, hasListPanel } = useLayout()
+  const t = useT()
+  const {
+    files,
+    selectedFileId,
+    currentFilePath,
+    browserTabs,
+    selectedBrowserTabId,
+    agents,
+    sessions,
+  } = useWorkspace()
+
+  // A fresh workspace (no real agent, no threads) is in guided onboarding — the
+  // threads view renders the onboarding flow, so title it "Onboarding".
+  const isOnboarding =
+    !agents.some((a) => isRecentAgent(a) && !a.builtin) && sessions.length === 0
+
+  // Title: the selected item for list-backed views, the view name otherwise.
+  let title: React.ReactNode
+  if (viewMode === "threads" && isOnboarding) {
+    title = (
+      <HeaderTitle>{t("views.onboarding")}</HeaderTitle>
+    )
+  } else if (viewMode === "threads") {
+    title = <ThreadTitle />
+  } else if (viewMode === "files") {
+    const name =
+      files.find((f) => f.id === selectedFileId)?.filename || currentFilePath
+    title = (
+      <HeaderTitle>{name || t("views.files")}</HeaderTitle>
+    )
+  } else if (viewMode === "knowledge") {
+    title = (
+      <HeaderTitle>{t("views.knowledge")}</HeaderTitle>
+    )
+  } else if (viewMode === "browser") {
+    const tab = browserTabs.find((tabItem) => tabItem.id === selectedBrowserTabId)
+    title = (
+      <HeaderTitle>{tab?.title || tab?.url || t("views.browser")}</HeaderTitle>
+    )
+  } else {
+    title = (
+      <HeaderTitle>{t(VIEW_TITLE_KEYS[viewMode])}</HeaderTitle>
+    )
+  }
+
+  return (
+    <header
+      className={cn(
+        "flex h-(--header-height) min-w-0 shrink-0 items-center gap-1 border-b border-border px-2 py-1.5",
+        "sm:gap-1.5 sm:px-4",
+      )}
+    >
+      {/* Bring the list back when it has been collapsed away */}
+      {hasListPanel && !isSidebarOpen && (
+        <>
+          <ListToggleButton />
+          <Separator orientation="vertical" className="mx-1 data-vertical:h-4" />
+        </>
+      )}
+
+      {/* Title slot. The derived title is a fallback: once a view portals its
+          own title in, the fallback is no longer the only child and hides. */}
+      <div
+        id={TITLE_SLOT_ID}
+        className="flex w-0 flex-1 items-center gap-2 [&>[data-header-title-fallback]:not(:only-child)]:hidden"
+      >
+        <div data-header-title-fallback className="contents">
+          {title}
+        </div>
+      </div>
+
+      {/* Filled by the active view through <AppHeaderActions> */}
+      <div
+        id={ACTIONS_SLOT_ID}
+        role="toolbar"
+        aria-label={t("nav.viewActions")}
+        className="ml-auto flex shrink-0 items-center gap-1"
+      />
+    </header>
+  )
+}

@@ -1,0 +1,67 @@
+{
+  "version": "1.1.15",
+  "date": "2026-11-16",
+  "entries": [
+    {
+      "type": "feature",
+      "title": {
+        "en": "Name a conversation when you create it",
+        "zh": "新建会话时可填写标题"
+      },
+      "description": {
+        "en": "Left blank, it is named after the first message.",
+        "zh": "留空时按第一条消息自动命名。"
+      }
+    },
+    {
+      "type": "fix",
+      "title": {
+        "en": "Connected apps in workspace settings now opens",
+        "zh": "工作区设置中的「已连接的应用」可正常打开"
+      }
+    },
+    {
+      "type": "fix",
+      "title": {
+        "en": "A narrow window keeps the full workspace layout",
+        "zh": "窗口较窄时工作区保持完整布局"
+      }
+    },
+    {
+      "type": "fix",
+      "title": {
+        "en": "Intro slides no longer cover the page dots",
+        "zh": "介绍页不再遮挡底部页码"
+      }
+    },
+    {
+      "type": "improvement",
+      "title": {
+        "en": "A refreshed design",
+        "zh": "界面全面焕新"
+      },
+      "description": {
+        "en": "This Computer and the workspace share one clearer, more consistent look.",
+        "zh": "「此电脑」与工作区采用统一的新设计，层次更清晰，风格更一致。"
+      }
+    },
+    {
+      "type": "improvement",
+      "title": {
+        "en": "A tidier member list",
+        "zh": "成员列表更清晰"
+      },
+      "description": {
+        "en": "Up to five people, online first; + invites new members.",
+        "zh": "最多显示五人，在线成员优先；「+」用于邀请新成员。"
+      }
+    },
+    {
+      "type": "improvement",
+      "title": {
+        "en": "Files from agents can be downloaded right away",
+        "zh": "智能体生成的文件可立即下载"
+      }
+    }
+  ]
+}

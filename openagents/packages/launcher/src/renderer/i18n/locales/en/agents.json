@@ -1,0 +1,456 @@
+{
+  "list": {
+    "title": "My Agents",
+    "subtitle": "Manage installed agent instances",
+    "newAgent": "Add agent",
+    "searchPlaceholder": "Search agents…",
+    "filters": {
+      "all": "All",
+      "connected": "In a workspace",
+      "disconnected": "No workspace",
+      "running": "Running",
+      "error": "Problems"
+    },
+    "emptyNoMatch": "No agent is named “{{query}}”.",
+    "empty": "Pick a recommended agent above, or browse and connect more agents.",
+    "coreUpdateRequired": "Agent core update required",
+    "apiPrefix": "API: {{value}}",
+    "modelPrefix": "Model: {{value}}",
+    "stopping": "Stopping...",
+    "starting": "Starting...",
+    "stop": "Stop",
+    "start": "Start",
+    "chat": "Terminal",
+    "configure": "Configure",
+    "disconnect": "Leave workspace",
+    "openWorkspace": "Open Workspace",
+    "openInBrowser": "Open in browser",
+    "enterWorkspace": "Enter workspace",
+    "connect": "Join workspace",
+    "remove": "Remove",
+    "cancel": "Cancel",
+    "removeTitle": "Remove {{name}}?",
+    "removeBody": "This will stop and remove <1>{{name}}</1>.",
+    "alsoRemovedFromWorkspace": "Its membership in {{workspace}} is removed as well — otherwise it would stay there as a member $t(common.appName) can no longer reach.",
+    "health": {
+      "notConfigured": "Not configured",
+      "notInstalled": "Not installed",
+      "loginRequired": "Login required",
+      "ready": "Ready",
+      "apiKey": "API key",
+      "cliLogin": "Account sign-in"
+    },
+    "toast": {
+      "stoppingAgent": "Stopping {{name}}...",
+      "stoppedAgent": "{{name}} stopped",
+      "startingAgent": "Starting {{name}}...",
+      "nowRunning": "{{name}} is now running",
+      "removed": "Agent '{{name}}' removed",
+      "disconnected": "{{name}} left the workspace",
+      "notConnectedYet": "{{name}} hasn't joined a workspace yet — click Join workspace first.",
+      "openedInBrowserNotMember": "The signed-in account isn't a member of {{workspace}}, so it opened in the browser.",
+      "startingEllipsis": "Starting {{name}}…",
+      "couldntStart": "Couldn't start {{name}}: {{message}}",
+      "error": "Error: {{message}}",
+      "removedEverywhere": "Removed '{{name}}' and its workspace membership",
+      "renamed": "Renamed"
+    },
+    "sorts": {
+      "recent": "Recently active",
+      "name": "Name",
+      "status": "Status"
+    },
+    "views": {
+      "list": "List view",
+      "grid": "Card view"
+    },
+    "statuses": {
+      "running": "Running",
+      "idle": "Idle",
+      "starting": "Starting",
+      "error": "Error",
+      "offline": "Stopped",
+      "notConnected": "Not connected"
+    },
+    "error": {
+      "view": "View the error",
+      "title": "Last error from {{name}}",
+      "hint": "This is what the daemon reported when the agent last failed. It is cleared once the agent starts cleanly.",
+      "copy": "Copy",
+      "copied": "Copied",
+      "close": "Close"
+    },
+    "more": "More actions",
+    "totalCount": "{{count}} total",
+    "perPage": "Per page",
+    "pageOf": "{{page}} / {{pageCount}}",
+    "prevPage": "Previous page",
+    "nextPage": "Next page",
+    "addHint": "Add another agent instance",
+    "readiness": "Setup",
+    "columns": {
+      "agent": "Agent",
+      "workspace": "Workspace",
+      "model": "Model",
+      "status": "Status",
+      "actions": "Actions"
+    },
+    "emptyNoFilterMatch": "Every agent you have is in another state right now.",
+    "workspaceLine": "Workspace · {{name}}",
+    "emptyTitle": "No agents yet",
+    "emptyNoMatchTitle": "Nothing matches that search",
+    "emptyNoFilterMatchTitle": "Nothing matches this filter",
+    "rename": "Rename",
+    "theWorkspace": "the workspace",
+    "defaultModel": "Default model",
+    "noWorkspace": "Not joined"
+  },
+  "newDialog": {
+    "title": "New Agent",
+    "loadingTypes": "Loading installed types...",
+    "noRuntimes": "No supported agent runtimes installed. Install one first.",
+    "goToInstall": "Go to Install",
+    "cancel": "Cancel",
+    "agentType": "Agent type",
+    "agentName": "Agent name",
+    "workingDirectory": "Working directory",
+    "workingDirectoryPlaceholder": "/path/to/project",
+    "browse": "Browse…",
+    "create": "Create",
+    "toast": {
+      "invalidName": "Agent name can only contain letters, numbers, hyphens, and underscores",
+      "selectFolder": "Choose a working folder for the agent",
+      "created": "Agent '{{name}}' created",
+      "error": "Error: {{message}}"
+    }
+  },
+  "configureDialog": {
+    "title": "Configure {{name}}",
+    "workdir": {
+      "label": "Working directory",
+      "hint": "Where this agent runs. A change applies the next time the agent starts.",
+      "placeholder": "/path/to/project",
+      "browse": "Browse…",
+      "save": "Save folder",
+      "saving": "Saving…",
+      "toast": {
+        "saved": "Working directory updated to {{path}}",
+        "error": "Couldn't update the folder: {{message}}",
+        "required": "Choose a working folder"
+      }
+    },
+    "hintLoginOnly": "This agent signs in through its own service — no API key needed. Login opens a terminal running",
+    "hintLoginOnlySuffix": "; complete the sign-in there.",
+    "hintInstance": "Settings saved for this agent. Type defaults remain available as fallbacks.",
+    "hintType": "Settings saved to ~/.openagents/env/",
+    "hintNoConfig": "No configuration required for this agent type.",
+    "authReadyPrefix": "Ready —",
+    "authReadyGeneric": "authenticated",
+    "authNotReadyGeneric": "This agent requires authentication before use.",
+    "loadingConfig": "Loading configuration...",
+    "awaitingTerminalPrefix": "A terminal opened running",
+    "awaitingTerminalSuffix": ". Once you've finished signing in there, let us know and we'll verify it.",
+    "orUseApiKey": "Or use an API key",
+    "close": "Close",
+    "finishedSigningIn": "I've finished signing in",
+    "notYet": "Not yet",
+    "reLogin": "Re-login",
+    "login": "Login",
+    "save": "Save",
+    "testing": "Testing...",
+    "testConnection": "Test Connection",
+    "cancel": "Cancel",
+    "fieldRequired": "{{field}} is required",
+    "toast": {
+      "configurationSaved": "Configuration saved",
+      "errorSaving": "Error saving: {{message}}"
+    },
+    "test": {
+      "okResult": "OK — model: {{model}}, response: \"{{response}}\"",
+      "unknownError": "Unknown error"
+    },
+    "modelWithLogin": "Optional — leave empty to use the CLI's own default model.",
+    "modelRequiredWithLogin": "Required — this agent cannot run without a model."
+  },
+  "loginStatus": {
+    "checking": "Checking sign-in…",
+    "signedIn": "Signed in",
+    "notSignedIn": "Not signed in",
+    "installFirst": "Not installed — install it first",
+    "signInWithCli": "Sign in with your account",
+    "opensTerminalPrefix": "Signs you in right here by running",
+    "opensTerminalSuffix": "— no API key needed.",
+    "finishThenConfirm": "Finish signing in in the terminal, then confirm below.",
+    "finishedSigningIn": "I've finished signing in",
+    "notYet": "Not yet",
+    "reLogin": "Re-login",
+    "signIn": "Sign in",
+    "opensTerminalTerminalPrefix": "This agent can only sign in from a terminal. “Sign in” opens one running",
+    "opensTerminalTerminalSuffix": "— the authorisation still happens in your browser.",
+    "installOnAdd": "Not installed yet — adding the agent installs it"
+  },
+  "connectDialog": {
+    "title": "Add '{{name}}' to a workspace",
+    "searchPlaceholder": "Search workspace name or ID…",
+    "noMatch": "No workspaces match your search.",
+    "cancel": "Cancel",
+    "toast": {
+      "connecting": "Adding {{name}} to the workspace…",
+      "connectedTo": "Joined {{slug}}",
+      "error": "Error: {{message}}"
+    },
+    "emptyTitle": "This device isn't in any workspace yet",
+    "getCode": "Get a pairing code to join a workspace",
+    "pickHint": "Choose the workspace this agent should join.",
+    "connect": "Connect",
+    "pairToggle": "Join with a pairing code",
+    "pairToggleHint": "Have a pairing code for a workspace? Join it here.",
+    "agentCount_one": "{{count}} agent from this computer",
+    "agentCount_other": "{{count}} agents from this computer",
+    "importOffer": "It's in. Bring in your past {{tool}} sessions from this computer, to read and continue them in the workspace?",
+    "importNow": "Import past sessions",
+    "importLater": "Not now"
+  },
+  "detail": {
+    "back": "Back to Agent Marketplace",
+    "backToSetup": "Back to setup",
+    "uninstallTitle": "Uninstall {{name}}?",
+    "uninstallBody": "This will remove <1>{{name}}</1> from your system. Configured agents of this type may stop working.",
+    "alsoRemoveEnv": "Also remove saved environment variables",
+    "alsoRemoveEnvHint": "(API keys, model selection — kept by default and reappear in the setup wizard on reinstall)",
+    "uninstall": "Uninstall",
+    "cancel": "Cancel",
+    "toast": {
+      "installSuccess": "{{name}} {{action}}",
+      "installed": "installed",
+      "updated": "updated",
+      "installFailed": "{{verb}} failed: {{message}}",
+      "uninstalled": "{{name}} uninstalled",
+      "uninstallFailed": "Uninstall failed: {{message}}",
+      "noPreviousVersion": "No previous version recorded",
+      "rolledBack": "Rolled back to v{{version}}",
+      "rollbackFailed": "Rollback failed: {{message}}",
+      "rollbackFailedBare": "Rollback failed",
+      "logCopied": "Log copied to clipboard",
+      "logCopyFailed": "Failed to copy log",
+      "uninstalledButGlobal": "Removed the copy of {{name}} that $t(common.appName) manages, but another install is still on your PATH",
+      "configNotRemoved": "The configuration could not be removed — check ~/.openagents/env/ yourself"
+    }
+  },
+  "header": {
+    "noDescription": "No description available",
+    "externalInstall": "External install",
+    "github": "GitHub",
+    "docs": "Docs",
+    "currentVersion": "current v{{version}}",
+    "latestVersion": "latest v{{version}}"
+  },
+  "actions": {
+    "uninstalling": "Uninstalling…",
+    "rollingBack": "Rolling back…",
+    "updating": "Updating…",
+    "installing": "Installing…",
+    "updateToVersion": "Update to v{{version}}",
+    "reinstall": "Reinstall",
+    "rollBack": "Roll back",
+    "uninstall": "Uninstall",
+    "addAgent": "Add agent",
+    "installOnly": "Install only"
+  },
+  "readme": {
+    "overview": "Overview",
+    "noDescription": "No description available for this agent yet."
+  },
+  "screenshots": {
+    "openFullSize": "Open full size",
+    "altScreenshot": "{{prefix}} screenshot {{index}}",
+    "watchDemo": "▶ Watch demo video ↗"
+  },
+  "requirements": {
+    "title": "System requirements",
+    "platforms": "Platforms",
+    "runtime": "Runtime",
+    "installMode": "Install mode",
+    "apiOnly": "API only — no binary required",
+    "binary": "Binary",
+    "updatedAt": "Updated"
+  },
+  "dependencies": {
+    "title": "Install command"
+  },
+  "quickStart": {
+    "title": "Quick start",
+    "launch": "Launch {{name}}",
+    "signInConfigure": "Sign in / configure",
+    "copyCommand": "Copy command",
+    "toast": {
+      "copyFailed": "Copy failed"
+    }
+  },
+  "changelog": {
+    "title": "Versions",
+    "loading": "Loading…",
+    "viewOnNpm": "View on npm",
+    "installed": "installed",
+    "released": "Released {{date}}",
+    "releaseNotesGithub": "Release notes on GitHub",
+    "recent": "{{count}} most recent",
+    "notFromNpm": "This agent ships through the vendor's install script rather than npm, so there is no version list to query. Running the install again fetches the newest build."
+  },
+  "installConfirm": {
+    "install": "Install",
+    "update": "Update",
+    "confirmTitle": "{{verb}} {{name}}?",
+    "willRunCommand": "This will run the following command on your system:",
+    "willInstall": "This will {{verb}} <1>{{name}}</1> on your system.",
+    "cancel": "Cancel"
+  },
+  "envFields": {
+    "required": "{{name}} is required",
+    "enterField": "Enter {{name}}",
+    "model": {
+      "placeholder": "Default model",
+      "browse": "Choose a model",
+      "search": "Search models…",
+      "loading": "Loading models…",
+      "empty": "No models to show.",
+      "noMatch": "No model matches that.",
+      "refresh": "Refresh",
+      "freeform": "Or type any id your provider serves",
+      "source": {
+        "cli": "From your signed-in account",
+        "cliKey": "From the key entered above",
+        "api": "From this endpoint",
+        "builtin": "Built-in list — may be out of date",
+        "none": "No list available"
+      },
+      "sourceByAgent": {
+        "opencode": {
+          "cli": "What OpenCode can run now — OpenCode Zen's free models until you sign in"
+        }
+      },
+      "need_key": "Enter an API key above to load this endpoint's models.",
+      "need_login": "Sign in above to load the models your account can run.",
+      "no_list": "This sign-in publishes no model list — type the model id.",
+      "cli_missing": "This agent's CLI wasn't found — install it first.",
+      "cli_timeout": "The CLI didn't return its model list in time. Refresh to retry, or type a model id.",
+      "cli_failed": "The CLI couldn't list its models: {{detail}}",
+      "cli_empty": "The CLI returned no model list. Refresh to retry, or type a model id.",
+      "recommended": "Recommended"
+    },
+    "advanced": "Advanced"
+  },
+  "unmanaged": {
+    "title": "Installed by you",
+    "originalBody": "You installed this copy of {{name}} yourself, outside the $t(common.appName) directory (~/.openagents). Updates are applied at its original install path; no second copy is installed.",
+    "managedBody": "You installed this copy of {{name}} yourself (for example with Homebrew or a vendor install script), and $t(common.appName) cannot update it at its original install path. Updating installs a new version in the $t(common.appName) directory (~/.openagents) for workspaces to use; your original install is left unchanged.",
+    "installPath": "Install path: ",
+    "adminPrompt": "This path requires administrator rights; your system will ask for authorization during the update.",
+    "adminManual": "This path requires administrator rights and cannot be updated from here. Open a terminal as administrator and run:"
+  },
+  "cliLogin": {
+    "browserHint": "A browser tab should have opened. If it didn't, use the link below.",
+    "browserTitle": "Finish signing in in your browser",
+    "cancel": "Cancel",
+    "codeHint": "The page will show a code — paste it here to finish.",
+    "codePlaceholder": "Paste the code from your browser",
+    "copied": "Copied",
+    "copyLink": "Copy link",
+    "failed": "The sign-in didn't complete.",
+    "openBrowser": "Open sign-in page",
+    "starting": "Starting sign-in…",
+    "submitCode": "Submit",
+    "terminalFallback": "This CLI needs a real terminal, so one was opened for you. Follow the steps there — this page updates on its own once you're signed in.",
+    "tryAgain": "Try again",
+    "useTerminal": "Sign in in a terminal",
+    "verifying": "Confirming sign-in…"
+  },
+  "codexApiMode": {
+    "label": "API mode",
+    "responses": "Coding agent · Responses API",
+    "chat": "Chat only · Chat Completions API",
+    "responsesHint": "Runs the Codex CLI with tools and conversation memory. Requires Codex to be installed and an endpoint that supports the Responses API.",
+    "chatHint": "Sends chat requests directly to your endpoint, without Codex tools or CLI session memory."
+  },
+  "shared": {
+    "thisComputer": "This Computer",
+    "runsHere": "Runs on: This Computer",
+    "localOnly": "Local use",
+    "apiKey": "API key",
+    "testing": "Testing…",
+    "testConnection": "Test connection",
+    "verifyApiSettings": "Verify API settings",
+    "verifyApiSettingsHint": "Check the key, endpoint, and model before saving.",
+    "connectionWorks": "Connection successful.",
+    "connectionFailed": "The connection could not be verified.",
+    "overviewSubtitle": "Install a recommended agent, or browse and connect more.",
+    "agentsHere": "Connected agents",
+    "installing": "Installing…",
+    "addedAfterInstall": "{{name}} is installed and added.",
+    "addAfterInstallFailed": "{{name}} could not be added because its install failed: {{message}}",
+    "installAndSignIn": "Install and sign in",
+    "agentUnavailable": "This agent is no longer available. Return to the agent list.",
+    "folderHint": "Defaults to your home folder. Choose a project folder for this agent’s work.",
+    "workdirOptional": "Working directory (optional)",
+    "homeFolder": "Your home folder",
+    "recommended": {
+      "label": "Recommended agents",
+      "prev": "Previous",
+      "next": "Next",
+      "installNow": "Install now",
+      "more": "Browse and connect more agents",
+      "hint": "Install one to create an agent on this computer; installed types are reused.",
+      "update": "A new version is available — update it"
+    },
+    "aside": {
+      "title": "Details",
+      "device": "Runs on",
+      "workspace": "Workspace",
+      "pickLater": "Choose after adding",
+      "about": "About this type",
+      "version": "Version",
+      "notInstalled": "Not installed — installs when added",
+      "installed": "Installed",
+      "links": "Links",
+      "homepage": "Homepage",
+      "manage": "Versions & uninstall"
+    }
+  },
+  "renameDialog": {
+    "title": "Rename {{name}}",
+    "description": "This changes the label shown here and in the agent's workspace. Its identity is unchanged, so sessions, working directory and workspace membership all stay as they are.",
+    "label": "Display name",
+    "hint": "Leave empty to go back to {{name}}.",
+    "save": "Save",
+    "saving": "Saving…"
+  },
+  "credentials": {
+    "unprobeable": {
+      "codebuddy": "CodeBuddy signs in against Tencent’s own service, so its key can’t be checked from here — save it and launch the agent to verify. Note that CODEBUDDY_BASE_URL selects another CodeBuddy deployment (enterprise or self-hosted), not an OpenAI-compatible endpoint: a model-gateway or relay key won’t work with this agent.",
+      "cursor": "Cursor signs in through its own service — there’s no key endpoint to test here. Save the key and launch the agent to verify.",
+      "amp": "Amp authenticates against Sourcegraph’s own service — its key is verified by running the CLI. Save it and launch the agent, or run `amp login`.",
+      "commandcode": "Command Code verifies its key against its own account service — there’s no endpoint to test here. Save it and launch the agent, or run `command-code login`.",
+      "copilot": "Copilot authenticates with your GitHub account, and its token is checked by GitHub on first use — there’s no model endpoint to probe here. Save it and launch the agent to verify.",
+      "claudeOauth": "A subscription token is verified by Claude itself on first use — there’s no endpoint to test it against here. Save it and send a message in the workspace to confirm.",
+      "aider": "Aider injects your key into the provider chosen by AIDER_PROVIDER (or the model name) and verifies it on its first run — there’s no single endpoint to test here. Set AIDER_PROVIDER (and LLM_BASE_URL for a relay) to have it checked, or save and send a message in the workspace to confirm.",
+      "cline": "Cline targets your selected provider — this provider can’t be tested directly here. Save the settings and launch the agent to verify (or run `cline auth`).",
+      "codearts": "CodeArts Agent authenticates with a Huawei Cloud access key pair, which Huawei Cloud checks when the agent runs — there’s no endpoint to test it against here. Save it and launch the agent to verify.",
+      "qoder": "Qoder checks a personal access token against its own service when the agent runs — there’s no endpoint to test it against here. Save it and launch the agent to verify, or sign in with `qodercli login` (`qoderclicn login` for the China edition) instead.",
+      "kiro": "Kiro checks its API key against its own service when the agent runs — there’s no endpoint to test it against here. Save it and launch the agent to verify, or sign in with `kiro-cli login` instead.",
+      "clientOnly": "This endpoint only takes requests from the coding tools it recognises, so it turned away this test, which calls it directly — that says nothing about the key. Save the settings and send the agent a message: a normal reply confirms it works."
+    },
+    "unprobeableTitle": "This agent isn’t tested here",
+    "endpointMismatch": {
+      "gatewayIntoPlatform": "That looks like a model API endpoint (an OpenAI-compatible gateway or relay). This agent cannot use one: this field takes a deployment of the vendor’s own service. For a model-gateway key, use an OpenAI-protocol agent such as opencode, openclaw or codex."
+    },
+    "noEndpoint": {
+      "commandcode": "Command Code configures its own BYOK providers in ~/.commandcode/providers.json and calls them straight from this machine, so there is no endpoint field here. Once one is set up, name the model as provider/model above — for example openrouter/deepseek-v4-flash.",
+      "cline": "Cline’s providers and their endpoints are set up by `cline auth`, so there is no endpoint field here. The provider above only picks among the ones already configured.",
+      "cursor": "Cursor authenticates against its own service and takes no custom endpoint, so there is no such field here.",
+      "copilot": "Copilot uses your GitHub account and GitHub decides the endpoint, so there is no endpoint field here.",
+      "codearts": "CodeArts Agent runs on Huawei Cloud’s own model service, so there is no endpoint field here. Name the model as provider/model above — `codearts models` lists the ones your account can use.",
+      "qoder": "Qoder runs on the models of your Qoder account and takes no custom endpoint, so there is no such field here. Other providers’ API keys don’t work with it; `qodercli --list-models` lists the models your account can use.",
+      "kiro": "Kiro runs on the models of your Kiro account and takes no custom endpoint, so there is no such field here. Other providers’ API keys don’t work with it; `kiro-cli chat --list-models` lists the models your account can use."
+    }
+  }
+}

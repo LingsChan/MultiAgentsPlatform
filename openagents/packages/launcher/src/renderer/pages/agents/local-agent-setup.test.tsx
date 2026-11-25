@@ -1,0 +1,261 @@
+import React from "react"
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
+import { render, screen, waitFor } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
+
+import type { CatalogEntry, EnvField } from "@renderer/types"
+import { createLocalSetupApi, type LocalConfiguration } from "./local-setup-api"
+import { LocalConfigurationFields } from "./local-agent-setup"
+
+// Radix Select uses browser pointer/scroll APIs that jsdom does not implement.
+const domMethods = ["hasPointerCapture", "setPointerCapture", "releasePointerCapture", "scrollIntoView"] as const
+const domDescriptors = domMethods.map(name => Object.getOwnPropertyDescriptor(HTMLElement.prototype, name))
+beforeAll(() => domMethods.forEach(name => Object.defineProperty(HTMLElement.prototype, name, { configurable: true, value: vi.fn(() => false) })))
+afterAll(() => domMethods.forEach((name, i) => {
+  if (domDescriptors[i]) Object.defineProperty(HTMLElement.prototype, name, domDescriptors[i]!)
+  else Reflect.deleteProperty(HTMLElement.prototype, name)
+}))
+
+type Api = Record<string, ReturnType<typeof vi.fn>>
+
+const FIELDS: Record<string, EnvField[]> = {
+  opencode: [
+    { name: "LLM_API_KEY", required: true, password: true },
+    { name: "LLM_BASE_URL" },
+  ] as EnvField[],
+  codebuddy: [
+    { name: "CODEBUDDY_API_KEY", required: true, password: true },
+    { name: "CODEBUDDY_BASE_URL" },
+  ] as EnvField[],
+}
+
+let api: Api
+
+const captured: { loginEvent?: (ev: { agentType: string; phase: string }) => void } = {}
+let rendered: { onChange: ReturnType<typeof vi.fn<(config: LocalConfiguration | null) => void>> }
+
+function setup(type: string, saved: Record<string, string> = {}, entry: Partial<CatalogEntry> = { name: type },
+  health: Record<string, unknown> = { installed: true, ready: false }) {
+  api = {
+    getEnvFields: vi.fn().mockResolvedValue(FIELDS[type]),
+    getAgentEnv: vi.fn().mockResolvedValue(saved),
+    getAgentInstanceEnv: vi.fn().mockResolvedValue({}),
+    healthCheck: vi.fn().mockResolvedValue(health),
+    refreshLogin: vi.fn().mockResolvedValue({ installed: true, ready: false }),
+    testLLM: vi.fn().mockResolvedValue({ success: true }),
+    onCliLoginEvent: vi.fn((cb) => { captured.loginEvent = cb; return () => {} }),
+    clearLoginKey: vi.fn().mockResolvedValue(undefined),
+    listModels: vi.fn().mockResolvedValue([]),
+  }
+  ;(window as unknown as { api: Api }).api = api
+  const onChange = vi.fn<(config: LocalConfiguration | null) => void>()
+  render(
+    <LocalConfigurationFields
+      type={type}
+      catalog={[entry as CatalogEntry]}
+      onChange={onChange}
+      onChanged={() => {}}
+      onBusy={() => {}}
+    />,
+  )
+  rendered = { onChange }
+  return { onChange }
+}
+
+describe("LocalConfigurationFields — API key form", () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it("offers to import an existing key and to test the connection", async () => {
+    setup("opencode")
+    expect(await screen.findByText(/Already set up a key in another tool/)).toBeInTheDocument()
+    expect(screen.getByText("Verify API settings")).toBeInTheDocument()
+    expect(screen.getByText(/Check the key, endpoint, and model/)).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeInTheDocument()
+  })
+
+  it("explains how an unprobeable agent is verified instead of offering a test", async () => {
+    setup("codebuddy")
+    expect(await screen.findByText(/isn.t tested here/)).toBeInTheDocument()
+    expect(screen.getByText(/signs in against Tencent/)).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Test connection" })).not.toBeInTheDocument()
+  })
+
+  it("blocks saving a model-gateway URL into a vendor-platform agent", async () => {
+    const { onChange } = setup("codebuddy", { CODEBUDDY_API_KEY: "k", CODEBUDDY_BASE_URL: "https://api.openai.com/v1" })
+    await waitFor(() => expect(onChange.mock.calls.at(-1)?.[0]?.blocked).toMatch(/model API endpoint/))
+  })
+})
+
+describe("LocalConfigurationFields — a type ready only on another agent's key", () => {
+  beforeEach(() => vi.clearAllMocks())
+  const labelled = { name: "opencode", check_ready: { auth_detected_labels: { api_key: "API key" } } } as Partial<CatalogEntry>
+
+  it("does not tell a new agent it is ready", async () => {
+    setup("opencode", {}, labelled, { installed: true, ready: true, typeReady: false, auth_mode: "api_key", message: "Ready" })
+    expect(await screen.findByText("This agent requires authentication before use.")).toBeInTheDocument()
+    expect(screen.queryByText(/Ready —/)).not.toBeInTheDocument()
+  })
+
+  it("still says ready when the type is ready on its own", async () => {
+    setup("opencode", {}, labelled, { installed: true, ready: true, auth_mode: "api_key", message: "Ready" })
+    expect(await screen.findByText(/Ready —/)).toBeInTheDocument()
+  })
+})
+
+describe("LocalConfigurationFields — sign-in confirmed after switching tabs", () => {
+  it("keeps the key tab and the key typed while the sign-in was being checked", async () => {
+    let fire: (ev: { agentType: string; phase: string }) => void = () => {}
+    let finishRefresh: (health: unknown) => void = () => {}
+    setup("opencode", {}, { name: "opencode", installed: true, check_ready: { login_command: "opencode auth login" } })
+    await screen.findByTestId("auth-tab-cli")
+    const onChange = rendered.onChange
+    fire = captured.loginEvent!
+    api.refreshLogin.mockImplementation(() => new Promise((resolve) => { finishRefresh = resolve }))
+
+    const user = userEvent.setup()
+    fire({ agentType: "opencode", phase: "success" })
+    await user.click(screen.getByTestId("auth-tab-key"))
+    await user.type(document.querySelector<HTMLInputElement>("[id$='-LLM_API_KEY']")!, "sk-typed")
+    finishRefresh({ installed: true, ready: true })
+
+    await waitFor(() => expect(api.getAgentEnv).toHaveBeenCalledTimes(2))
+    await waitFor(() => {
+      const last = onChange.mock.calls.at(-1)?.[0]
+      expect(last?.authTab).toBe("key")
+      expect(last?.values.LLM_API_KEY).toBe("sk-typed")
+    })
+  })
+})
+
+describe("LocalConfigurationFields — signing in instead of a key", () => {
+  const CODEX: EnvField[] = [
+    { name: "OPENAI_API_KEY", password: true },
+    { name: "OPENAI_BASE_URL" },
+    { name: "CODEX_MODEL" },
+  ] as EnvField[]
+  const TYPE_ENV = { OPENAI_API_KEY: "sk-old", OPENAI_BASE_URL: "https://relay.example/v1", CODEX_MODEL: "openai-gpt-oss-20b" }
+
+  function open(name: string | undefined, typeEnv: Record<string, string>, instance: Record<string, string> = {}) {
+    api = {
+      getEnvFields: vi.fn().mockResolvedValue(CODEX),
+      getAgentEnv: vi.fn().mockResolvedValue(typeEnv),
+      getAgentInstanceEnv: vi.fn().mockResolvedValue(instance),
+      refreshLogin: vi.fn().mockResolvedValue({ installed: true, ready: true, logged_in: true }),
+      healthCheck: vi.fn().mockResolvedValue({ installed: true, ready: true }),
+      onCliLoginEvent: vi.fn(() => () => {}),
+      clearLoginKey: vi.fn().mockResolvedValue(undefined),
+      listModels: vi.fn().mockResolvedValue([]),
+      testLLM: vi.fn(),
+    }
+    ;(window as unknown as { api: Api }).api = api
+    const onChange = vi.fn<(config: LocalConfiguration | null) => void>()
+    render(<LocalConfigurationFields type="codex" name={name} onChange={onChange} onChanged={() => {}} onBusy={() => {}}
+      catalog={[{ name: "codex", installed: true, check_ready: { login_command: "codex login" } } as CatalogEntry]} />)
+    return onChange
+  }
+  const last = (onChange: ReturnType<typeof open>) => onChange.mock.calls.at(-1)?.[0]
+
+  it("a new agent on the sign-in tab does not take the model saved with the type's key", async () => {
+    const onChange = open(undefined, { CODEX_MODEL: "openai-gpt-oss-20b" })
+    await screen.findByTestId("auth-tab-cli")
+    await waitFor(() => expect(last(onChange)?.authTab).toBe("cli"))
+    expect(last(onChange)?.values.CODEX_MODEL).toBe("")
+  })
+
+  it("an existing agent without the marker, saved untouched, is saved as before", async () => {
+    const onChange = open("codex", { CODEX_MODEL: "openai-gpt-oss-20b" })
+    await screen.findByTestId("auth-tab-cli")
+    await waitFor(() => expect(last(onChange)).toBeTruthy())
+    expect(last(onChange)?.authTab).toBeUndefined()
+    expect(last(onChange)?.values.CODEX_MODEL).toBe("openai-gpt-oss-20b")
+  })
+
+  it("picking the sign-in tab on that agent is the choice, and drops the type's model", async () => {
+    const onChange = open("codex", TYPE_ENV)
+    const user = userEvent.setup()
+    await user.click(await screen.findByTestId("auth-tab-cli"))
+    await waitFor(() => expect(last(onChange)?.authTab).toBe("cli"))
+    expect(last(onChange)?.values.CODEX_MODEL).toBe("")
+
+    await user.click(screen.getByTestId("auth-tab-key"))
+    await waitFor(() => expect(last(onChange)?.authTab).toBe("key"))
+    expect(last(onChange)?.values.CODEX_MODEL).toBe("openai-gpt-oss-20b")
+  })
+
+  it("a signed-in agent keeps its own model", async () => {
+    const onChange = open("codex", TYPE_ENV, { OPENAGENTS_AUTH_MODE: "cli_login", CODEX_MODEL: "gpt-5.5" })
+    await screen.findByTestId("auth-tab-cli")
+    await waitFor(() => expect(last(onChange)?.authTab).toBe("cli"))
+    expect(last(onChange)?.values.CODEX_MODEL).toBe("gpt-5.5")
+  })
+  it("offers both custom-endpoint modes without changing an untouched legacy config", async () => {
+    const onChange = open("codex", TYPE_ENV)
+    const select = await screen.findByRole("combobox", { name: "API mode" })
+    expect(select).toHaveTextContent("Chat only · Chat Completions API")
+    expect(last(onChange)?.values.CODEX_WIRE_API).toBeUndefined()
+    const user = userEvent.setup()
+    await user.click(select)
+    await user.click(screen.getByRole("option", { name: "Coding agent · Responses API" }))
+    expect(last(onChange)?.values.CODEX_WIRE_API).toBe("responses")
+    api.testLLM.mockResolvedValue({ success: true })
+    await user.click(screen.getByRole("button", { name: "Test connection" }))
+    expect(api.testLLM).toHaveBeenCalledWith(expect.objectContaining({ CODEX_WIRE_API: "responses" }), "codex")
+    await user.click(select)
+    await user.click(screen.getByRole("option", { name: "Chat only · Chat Completions API" }))
+    expect(last(onChange)?.values.CODEX_WIRE_API).toBe("chat")
+  })
+
+  it.each(["responses", "chat"])("creates an instance with the selected %s mode", async (mode) => {
+    const onChange = open(undefined, TYPE_ENV)
+    const user = userEvent.setup()
+    const select = await screen.findByRole("combobox", { name: "API mode" })
+    if (mode === "chat") {
+      await user.click(select)
+      await user.click(screen.getByRole("option", { name: "Coding agent · Responses API" }))
+    }
+    await user.click(select)
+    await user.click(screen.getByRole("option", { name: mode === "responses" ? "Coding agent · Responses API" : "Chat only · Chat Completions API" }))
+    Object.assign(api, {
+      getCatalog: vi.fn().mockResolvedValue([{ name: "codex", installed: true }]),
+      getSupportedAgentTypes: vi.fn().mockResolvedValue(["codex"]),
+      listAgents: vi.fn().mockResolvedValue([]),
+      listPaths: vi.fn().mockResolvedValue({ home: "/home/test" }),
+      addAgent: vi.fn().mockResolvedValue({ success: true }),
+    })
+    const backend = createLocalSetupApi(api as unknown as Window["api"], () => last(onChange) || null)
+    await backend.enqueueNodeCommand("this-computer", "create_agent", { type: "codex", name: "new-codex" })
+    expect(api.addAgent).toHaveBeenCalledWith(expect.objectContaining({ env: expect.objectContaining({ CODEX_WIRE_API: mode }) }))
+  })
+
+  it.each(["responses", "chat"])("reads the instance %s mode over the type default and saves a change", async (mode) => {
+    const other = mode === "responses" ? "chat" : "responses"
+    const onChange = open("codex", { ...TYPE_ENV, CODEX_WIRE_API: other }, { CODEX_WIRE_API: mode })
+    const select = await screen.findByRole("combobox", { name: "API mode" })
+    expect(select).toHaveTextContent(mode === "responses" ? "Coding agent · Responses API" : "Chat only · Chat Completions API")
+    const user = userEvent.setup()
+    await user.click(select)
+    await user.click(screen.getByRole("option", { name: other === "responses" ? "Coding agent · Responses API" : "Chat only · Chat Completions API" }))
+    Object.assign(api, { listAgents: vi.fn().mockResolvedValue([{ name: "codex", type: "codex" }]), saveAgentInstanceEnv: vi.fn().mockResolvedValue({ success: true }) })
+    const backend = createLocalSetupApi(api as unknown as Window["api"], () => last(onChange) || null)
+    await backend.enqueueNodeCommand("this-computer", "configure_agent", { type: "codex", name: "codex" })
+    expect(api.saveAgentInstanceEnv).toHaveBeenCalledWith("codex", { CODEX_WIRE_API: other })
+  })
+
+  it("hides the custom API choice on CLI sign-in without discarding its saved value", async () => {
+    const onChange = open("codex", { ...TYPE_ENV, CODEX_WIRE_API: "responses" })
+    await screen.findByRole("combobox", { name: "API mode" })
+    const user = userEvent.setup()
+    await user.click(screen.getByTestId("auth-tab-cli"))
+    expect(screen.queryByRole("combobox", { name: "API mode" })).not.toBeInTheDocument()
+    expect(last(onChange)?.values.CODEX_WIRE_API).toBe("responses")
+    await user.click(screen.getByTestId("auth-tab-key"))
+    expect(screen.getByRole("combobox", { name: "API mode" })).toHaveTextContent("Responses API")
+  })
+
+  it("does not offer the custom-endpoint mode for OpenAI's native endpoint", async () => {
+    open("codex", { ...TYPE_ENV, OPENAI_BASE_URL: "https://api.openai.com/v1" })
+    await screen.findByTestId("auth-tab-key")
+    expect(screen.queryByRole("combobox", { name: "API mode" })).not.toBeInTheDocument()
+  })
+
+})

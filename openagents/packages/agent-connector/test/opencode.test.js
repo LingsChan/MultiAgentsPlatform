@@ -1,0 +1,798 @@
+'use strict';
+
+/**
+ * OpenCode adapter stability + preflight tests.
+ *
+ * These cover the four reliability fixes (no @latest / version gate, structured
+ * stdout-error preservation, failure classification, empty/tool-event handling)
+ * and the send-time preflight. All fixtures are synthetic — no network, no CLI.
+ */
+
+const { describe, it } = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const OpenCodeAdapter = require('../src/adapters/opencode');
+
+function makeAdapter(overrides = {}) {
+  const adapter = new OpenCodeAdapter({
+    workspaceId: 'ws',
+    channelName: 'thread',
+    token: 'token',
+    agentName: 'opencode-test',
+    ...overrides,
+  });
+  // Neutralize network/IO side effects for unit scope.
+  adapter._log = () => {};
+  return adapter;
+}
+
+// ---------------------------------------------------------------------------
+// 8.1 Version pin & compatibility
+// ---------------------------------------------------------------------------
+
+describe('OpenCode — version pin & install (8.1)', () => {
+  const registry = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', 'registry.json'), 'utf-8'),
+  );
+  const entry = (registry.agents || registry).find((a) => a.name === 'opencode');
+
+  it('install commands pin an exact version and never use @latest', () => {
+    assert.ok(entry, 'opencode entry exists');
+    for (const os of ['macos', 'linux', 'windows']) {
+      const cmd = entry.install[os];
+      assert.ok(/opencode-ai@\d+\.\d+\.\d+/.test(cmd), `${os} pins a version: ${cmd}`);
+      assert.ok(!cmd.includes('@latest'), `${os} does not use @latest`);
+    }
+  });
+
+  it('declares a min_version so the compatibility gate is active', () => {
+    assert.equal(entry.check_ready.min_version, '1.17.0');
+  });
+
+  it('marks LLM_MODEL as required (model is a real ready condition)', () => {
+    const model = entry.env_config.find((f) => f.name === 'LLM_MODEL');
+    assert.equal(model.required, true);
+  });
+
+  it('classifies versions: too-old=unsupported, in-range=ok, newer=degraded, 2.x=unsupported, junk=unknown', () => {
+    assert.equal(OpenCodeAdapter._classifyVersion('1.0.0'), 'unsupported');
+    assert.equal(OpenCodeAdapter._classifyVersion('1.16.9'), 'unsupported');
+    assert.equal(OpenCodeAdapter._classifyVersion('1.17.0'), 'ok');
+    assert.equal(OpenCodeAdapter._classifyVersion('1.17.11'), 'ok');
+    assert.equal(OpenCodeAdapter._classifyVersion('1.18.0'), 'degraded');
+    assert.equal(OpenCodeAdapter._classifyVersion('1.19.5'), 'degraded');
+    // OpenCode 2 is a new command line (`run` has no --dir): blocked up front
+    // instead of failing every message with "Unrecognized flag: --dir".
+    assert.equal(OpenCodeAdapter._classifyVersion('2.0.0'), 'unsupported');
+    assert.equal(OpenCodeAdapter._classifyVersion('2.2.5'), 'unsupported');
+    assert.equal(OpenCodeAdapter._classifyVersion(null), 'unknown');
+    assert.equal(OpenCodeAdapter._classifyVersion('opencode-dev'), 'unknown');
+  });
+
+  // Regression: _detectCliVersion uses getEnhancedEnv() for the `--version`
+  // probe. It must be imported from ../paths — a missing import throws a
+  // ReferenceError that the method's own try/catch swallows, silently degrading
+  // EVERY probe to { version: null, executable: true } and disabling the
+  // version/executability preflight. The other preflight tests stub
+  // _detectCliVersion, so only a real spawn (against node as a stand-in binary)
+  // exercises this path.
+  it('_detectCliVersion actually spawns and parses a version (getEnhancedEnv wired)', () => {
+    const adapter = Object.create(OpenCodeAdapter.prototype);
+    adapter._log = () => {};
+    const probe = adapter._detectCliVersion(process.execPath); // `node --version`
+    assert.equal(probe.executable, true);
+    assert.match(probe.version, /^\d+\.\d+\.\d+$/, 'a real version was parsed, not null');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8.2 Preflight — blocks before spawn, conservative
+// ---------------------------------------------------------------------------
+
+describe('OpenCode — preflight (8.2)', () => {
+  function preflightWith({ binary = '/fake/opencode', probe = { version: '1.17.11', executable: true }, env = {} }) {
+    const adapter = makeAdapter();
+    adapter._opencodeBinary = binary;
+    adapter._findOpencodeBinary = () => binary;
+    adapter._detectCliVersion = () => probe;
+    adapter.agentEnv = env;
+    return adapter._preflight('thread');
+  }
+
+  it('cli_not_found when no binary', () => {
+    const r = preflightWith({ binary: null });
+    assert.equal(r.ok, false);
+    assert.equal(r.category, 'cli_not_found');
+  });
+
+  it('looks again when the path found at start-up no longer exists', () => {
+    const adapter = makeAdapter();
+    adapter._opencodeBinary = path.join(os.tmpdir(), 'oa-opencode-gone', 'opencode.exe');
+    adapter._versionProbe = { version: '1.0.0', executable: true, stub: false, ts: Date.now() };
+    adapter._findOpencodeBinary = () => process.execPath;
+    let probed = null;
+    adapter._detectCliVersion = (b) => { probed = b; return { version: '1.17.11', executable: true }; };
+    adapter._preflight('thread');
+    assert.equal(adapter._opencodeBinary, process.execPath);
+    assert.equal(probed, process.execPath);
+    assert.equal(adapter._versionProbe, null, 'the old copy\'s version is not reused');
+  });
+
+  it('unsupported_version for OpenCode 2.x, before any run', () => {
+    const r = preflightWith({ probe: { version: '2.2.5', executable: true } });
+    assert.equal(r.ok, false);
+    assert.equal(r.category, 'unsupported_version');
+  });
+
+  it('cli_not_executable when --version cannot run', () => {
+    const r = preflightWith({ probe: { version: null, executable: false } });
+    assert.equal(r.ok, false);
+    assert.equal(r.category, 'cli_not_executable');
+  });
+
+  it('unsupported_version when too old', () => {
+    const r = preflightWith({
+      probe: { version: '1.2.3', executable: true },
+      env: { LLM_MODEL: 'gpt-4o', OPENAI_API_KEY: 'x' },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.category, 'unsupported_version');
+  });
+
+  it('model_missing when no model resolvable', () => {
+    const r = preflightWith({ env: { OPENAI_API_KEY: 'x' } });
+    assert.equal(r.ok, false);
+    assert.equal(r.category, 'model_missing');
+  });
+
+  it('credential_missing when nothing present', () => {
+    const r = preflightWith({ env: { LLM_MODEL: 'gpt-4o' } });
+    assert.equal(r.ok, false);
+    assert.equal(r.category, 'credential_missing');
+  });
+
+  it('does NOT hard-block when a custom endpoint / unknown key is present', () => {
+    const r = preflightWith({ env: { LLM_MODEL: 'gpt-4o', LLM_BASE_URL: 'https://proxy.example/v1', SOME_CUSTOM_API_KEY: 'k' } });
+    assert.equal(r.ok, true);
+    assert.equal(r.credential, 'unknown');
+  });
+
+  it('does NOT hard-block a model on a provider OpenCode configures itself', () => {
+    // OpenCode Zen's free models run with no sign-in and no key.
+    const r = preflightWith({ env: { LLM_MODEL: 'opencode/big-pickle' } });
+    assert.equal(r.ok, true);
+    assert.equal(r.credential, 'unknown');
+  });
+
+  it('passes with binary + supported version + model + key', () => {
+    const r = preflightWith({ env: { LLM_MODEL: 'gpt-4o', OPENAI_API_KEY: 'x' } });
+    assert.equal(r.ok, true);
+    assert.equal(r.versionClass, 'ok');
+  });
+
+  // An npm install with ignore-scripts on leaves opencode-ai's placeholder
+  // where the CLI should be. It used to get as far as the model check — so an
+  // agent that had no working CLI at all was told "No model is configured",
+  // and once a model was set, failed every message with an unexplained exit 1.
+  describe('a CLI that is only its package\'s postinstall placeholder', () => {
+    const STUB = 'echo "Error: opencode-ai\'s postinstall script was not run." >&2\nexit 1\n';
+    let dir;
+    const plant = (name, content, mode) => {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-stub-'));
+      const p = path.join(dir, name);
+      fs.writeFileSync(p, content);
+      if (mode) fs.chmodSync(p, mode);
+      return p;
+    };
+    const cleanup = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} };
+
+    it('install_incomplete, ahead of the model check and without running it', () => {
+      const binary = plant('opencode.exe', STUB);
+      try {
+        const adapter = makeAdapter();
+        adapter._opencodeBinary = binary;
+        adapter._detectCliVersion = () => { throw new Error('the placeholder must not be run'); };
+        adapter.agentEnv = { OPENAI_API_KEY: 'x' }; // no model — the old first complaint
+        const r = adapter._preflight('thread');
+        assert.equal(r.ok, false);
+        assert.equal(r.category, 'install_incomplete');
+      } finally { cleanup(); }
+    });
+
+    it('install_incomplete when a wrapper in front of it hides the file', () => {
+      const r = preflightWith({ probe: { version: null, executable: true, stub: true }, env: {} });
+      assert.equal(r.ok, false);
+      assert.equal(r.category, 'install_incomplete');
+    });
+
+    it('_detectCliVersion hears the placeholder through a wrapper, and does not cache it', { skip: process.platform === 'win32' }, () => {
+      // pnpm and bun put their own launcher script on PATH; the placeholder is
+      // what it ends up running.
+      const wrapper = plant('opencode', `#!/bin/sh\n${STUB}`, 0o755);
+      try {
+        const adapter = Object.create(OpenCodeAdapter.prototype);
+        adapter._log = () => {};
+        const probe = adapter._detectCliVersion(wrapper);
+        assert.equal(probe.stub, true);
+        assert.equal(adapter._versionProbe, undefined, 'the next message re-checks — the fix is a reinstall');
+      } finally { cleanup(); }
+    });
+
+    it('a real CLI is not flagged', () => {
+      const adapter = Object.create(OpenCodeAdapter.prototype);
+      adapter._log = () => {};
+      assert.equal(adapter._detectCliVersion(process.execPath).stub, false);
+    });
+  });
+
+  it('_runOpencode rejects (without spawning) when preflight fails', async () => {
+    const adapter = makeAdapter();
+    adapter._preflight = () => ({ ok: false, category: 'model_missing' });
+    // If spawn were reached it would throw a different error; assert the category.
+    await assert.rejects(
+      () => adapter._runOpencode('hi', 'thread'),
+      (e) => e.category === 'model_missing',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8.3 stdout / stderr / structured error classification
+// ---------------------------------------------------------------------------
+
+describe('OpenCode — failure classification (8.3)', () => {
+  it('extracts a structured error event from stdout JSONL', () => {
+    const raw = '{"type":"step_start"} {"type":"error","error":{"name":"APIError","message":"Unauthorized","status":401}} {"type":"step-finish"}';
+    const err = OpenCodeAdapter._extractErrorFromStdout(raw);
+    assert.equal(err.name, 'APIError');
+    assert.equal(err.status, '401');
+    assert.match(err.message, /Unauthorized/);
+  });
+
+  it('code=1 + empty stderr + stdout 401 error → auth_failed (not generic exit 1)', () => {
+    const stdout = '{"type":"error","error":{"message":"Invalid API key","status":401}}';
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, signal: null, stdout, stderr: '' });
+    assert.equal(cls.category, 'auth_failed');
+  });
+
+  it('code=1 + stdout model-not-found error → model_not_found', () => {
+    const stdout = '{"type":"error","error":{"name":"NotFoundError","message":"The model `gpt-5` does not exist","status":404}}';
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout, stderr: '' });
+    assert.equal(cls.category, 'model_not_found');
+  });
+
+  it('code=1 + stderr network error (empty stdout) → network_error', () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr: 'Error: connect ECONNREFUSED 127.0.0.1:443' });
+    assert.equal(cls.category, 'network_error');
+  });
+
+  // Field reports (core 0.2.223) that all read "failed for an undetermined
+  // reason" while the provider had said exactly why.
+  it('names a spent account, a revoked key, an oversized request and a busy provider', () => {
+    const err = (message) => ({ code: 1, stdout: `{"type":"error","error":{"message":${JSON.stringify(message)}}}`, stderr: '' });
+    assert.equal(OpenCodeAdapter._classifyFailure(err('Insufficient balance')).category, 'quota_exhausted');
+    assert.equal(OpenCodeAdapter._classifyFailure(err('Invalid or revoked API key.')).category, 'auth_failed');
+    // Daily errors dashboard, 2026-11-19: both read "an undetermined reason".
+    assert.equal(OpenCodeAdapter._classifyFailure(err('Invalid credential')).category, 'auth_failed');
+    assert.equal(OpenCodeAdapter._classifyFailure(err('This API key has expired. Create a new API key in OpenCode Console and replace it.')).category, 'auth_failed');
+    // Daily errors dashboard, 2026-11-23: a spent account refused at 403 read
+    // as rejected credentials.
+    assert.equal(OpenCodeAdapter._classifyFailure(err('Forbidden: Insufficient account balance')).category, 'quota_exhausted');
+    assert.equal(OpenCodeAdapter._classifyFailure(err('403 Insufficient user quota, remaining quota: $-0.000054')).category, 'quota_exhausted');
+    assert.equal(OpenCodeAdapter._classifyFailure(err('Forbidden')).category, 'auth_failed');
+    assert.equal(OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr: '401 Unauthorized\nlog: /srv/billing-service/opencode.log' }).category, 'auth_failed');
+    assert.equal(OpenCodeAdapter._classifyFailure(err("429 RESOURCE_EXHAUSTED: Quota exceeded for quota metric 'requests per minute'")).category, 'rate_limited');
+    // A plan's allowance, quoted with no status code in the run's error.
+    assert.equal(OpenCodeAdapter._classifyFailure(err('Your Pass allowance for this period is used up, and your account is set not to overdraw.')).category, 'quota_exhausted');
+    assert.equal(OpenCodeAdapter._classifyFailure(err('Bad Request: Failed to buffer the request body: length limit exceeded')).category, 'request_too_large');
+    assert.equal(OpenCodeAdapter._classifyFailure(err('Hệ thống đang bận, vui lòng thử lại sau ít phút.')).category, 'provider_server_error');
+    const messages = OpenCodeAdapter.prototype._failureMessages();
+    assert.match(messages.quota_exhausted, /balance or credit/);
+    assert.match(messages.request_too_large, /too large/);
+  });
+
+  // Field report (core 0.2.226): the shared opencode.db had been migrated by
+  // OpenCode 2.x, and the 1.x CLI died on it before every message.
+  it('names a shared database a newer OpenCode converted', () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr: 'Error: Unexpected error\n\nDatabase is not empty and has no session table' });
+    assert.equal(cls.category, 'shared_db_migrated');
+    assert.match(OpenCodeAdapter.prototype._failureMessages().shared_db_migrated, /OPENCODE_DB/);
+  });
+
+  it('code=1 + 429 → rate_limited', () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout: '{"type":"error","error":{"message":"rate limit exceeded","status":429}}', stderr: '' });
+    assert.equal(cls.category, 'rate_limited');
+  });
+
+  it('code=1 + the postinstall placeholder\'s stderr → install_incomplete', () => {
+    const cls = OpenCodeAdapter._classifyFailure({
+      code: 1,
+      stdout: '',
+      stderr: "Error: opencode-ai's postinstall script was not run.\n\nThis occurs when using --ignore-scripts during installation",
+    });
+    assert.equal(cls.category, 'install_incomplete');
+  });
+
+  // Field report 2026-10-29 (Windows): the CLI refused a flag we always pass
+  // and printed its usage, and the channel was told the output "could not be
+  // parsed" instead of to reinstall.
+  it('a refused flag → unsupported_version, not stream_parse_error', () => {
+    const cls = OpenCodeAdapter._classifyFailure({
+      code: 1,
+      stdout: 'opencode run [message..]\n\nrun opencode with a message',
+      stderr: 'ERROR\n  Unrecognized flag: --dangerously-skip-permissions',
+    });
+    assert.equal(cls.category, 'unsupported_version');
+  });
+
+  it('an API error that merely mentions an unknown argument is not a version problem', () => {
+    const cls = OpenCodeAdapter._classifyFailure({
+      code: 1,
+      stdout: '{"type":"error","error":{"message":"Unknown argument reasoning_effort for this model","status":400}}',
+      stderr: '',
+    });
+    assert.notEqual(cls.category, 'unsupported_version');
+  });
+
+  it('code=1 + nothing usable → process_crashed (with exit diagnostic)', () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr: '' });
+    assert.equal(cls.category, 'process_crashed');
+    assert.match(cls.diagnostic, /exit code 1/);
+  });
+
+  it('exit code alone is never auth — an opaque non-zero exit is not auth_failed', () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout: 'some unparseable noise', stderr: '' });
+    assert.notEqual(cls.category, 'auth_failed');
+    assert.notEqual(cls.category, 'credential_missing');
+  });
+
+  it('code=0 + stdout error event → classified, NOT empty_response', () => {
+    const stdout = '{"type":"error","error":{"message":"forbidden","status":403}}';
+    const stdoutErr = OpenCodeAdapter._extractErrorFromStdout(stdout);
+    assert.ok(stdoutErr);
+    const cls = OpenCodeAdapter._classifyFailure({ code: 0, stdout, stderr: '', stdoutErr });
+    assert.equal(cls.category, 'auth_failed');
+  });
+
+  it('redacts secrets from diagnostics/details', () => {
+    const raw = 'Authorization: Bearer sk-abcdef0123456789abcdef0123456789 failed; api_key=SUPERSECRETVALUE1234567890ABalthough';
+    const red = OpenCodeAdapter._redact(raw);
+    assert.ok(!red.includes('sk-abcdef0123456789abcdef0123456789'));
+    assert.ok(!red.includes('SUPERSECRETVALUE1234567890AB'));
+    assert.match(red, /REDACTED/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8.4 text & tool event handling
+// ---------------------------------------------------------------------------
+
+// What opencode-ai 1.17.11 prints for a config file it refuses, verbatim
+// (colour codes and all — it colours its errors into a pipe too). The hosted
+// agent behind the 2026-11-07 report failed every message on the first shape
+// and was told "OpenCode failed for an undetermined reason".
+const CONFIG_SCHEMA_STDERR = '\x1b[91m\x1b[1mError: \x1b[0mConfiguration is invalid at /workspace/.opencode/opencode.json\n'
+  + '↳ Expected { readonly "type": "local", ... } | { readonly "type": "remote", ... }, got {"url":"https://upsy.ai/connect"} mcp.upsy\n'
+  + '↳ Missing key mcp.upsy.enabled\n';
+const CONFIG_JSON_STDERR = '\x1b[91m\x1b[1mError: \x1b[0mConfig file at /workspace/.opencode/opencode.json is not valid JSON(C): \n'
+  + '--- JSONC Input ---\n{"provider": {,}\n\n--- Errors ---\nValueExpected at line 1, column 15\n'
+  + '   Line 1: {"provider": {,}\n                        ^\nCloseBraceExpected at line 2, column 1\n--- End ---\n';
+
+describe('OpenCode — failures the daily errors dashboard showed as undetermined (2026-11-25)', () => {
+  it('reads a trial credit that cannot cover the request as spent', () => {
+    const cls = OpenCodeAdapter._classifyFailure({
+      code: 1, signal: null, stdout: '', stderr: '',
+      stdoutErr: { name: 'UnknownError', message: "Your CodeRouter free trial's $5.00 usage credit can't cover this request: it needs about $0.76 and $0.45 is left" },
+    });
+    assert.equal(cls.category, 'quota_exhausted');
+  });
+
+  it('reads a relay cutting the stream off as a provider failure, not an unreachable one', () => {
+    const cls = OpenCodeAdapter._classifyFailure({
+      code: 1, signal: null, stdout: '', stderr: '',
+      stdoutErr: { name: 'UnknownError', message: '"Upstream response stream was interrupted"' },
+    });
+    assert.equal(cls.category, 'provider_server_error');
+  });
+});
+
+describe('OpenCode — a tool call the model sent without a name', () => {
+  // Daily errors dashboard, 2026-11-18: six runs in a row on GLM / DeepSeek
+  // models, each reported as "an undetermined reason".
+  it('says the model sent it, not that the reason is unknown', () => {
+    const cls = OpenCodeAdapter._classifyFailure({
+      code: 1, signal: null, stdout: '', stderr: '',
+      stdoutErr: { name: 'UnknownError', message: "Expected 'function.name' to be a string." },
+    });
+    assert.equal(cls.category, 'malformed_tool_call');
+    assert.equal(cls.detail, "Expected 'function.name' to be a string.");
+  });
+
+  it('reports a refused key over a nameless tool call earlier in the output', () => {
+    const cls = OpenCodeAdapter._classifyFailure({
+      code: 1, signal: null, stdout: '', stderr: "WARN retrying: Expected 'function.name' to be a string.",
+      stdoutErr: { name: 'APIError', status: 401, message: 'Unauthorized' },
+    });
+    assert.equal(cls.category, 'auth_failed');
+  });
+
+  it('still reads a refused key as a refused key', () => {
+    const cls = OpenCodeAdapter._classifyFailure({
+      code: 1, signal: null, stdout: '', stderr: '', stdoutErr: { name: 'APIError', status: 401, message: 'Unauthorized' },
+    });
+    assert.equal(cls.category, 'auth_failed');
+  });
+});
+
+describe('OpenCode — an invalid config file', () => {
+  it('names the file and what is wrong with it, not "an undetermined reason"', () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, signal: null, stdout: '', stderr: CONFIG_SCHEMA_STDERR });
+    assert.equal(cls.category, 'config_invalid');
+    assert.equal(cls.detail,
+      'Configuration is invalid at /workspace/.opencode/opencode.json: '
+      + 'Expected { readonly "type": "local", ... } | { readonly "type": "remote", ... }, got {"url":"https://upsy.ai/connect"} mcp.upsy; '
+      + 'Missing key mcp.upsy.enabled');
+  });
+
+  it('reads a file that is not JSON the same way, keeping only the parser\'s reasons', () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, signal: null, stdout: '', stderr: CONFIG_JSON_STDERR });
+    assert.equal(cls.category, 'config_invalid');
+    assert.equal(cls.detail,
+      'Config file at /workspace/.opencode/opencode.json is not valid JSON(C): '
+      + 'ValueExpected at line 1, column 15; CloseBraceExpected at line 2, column 1');
+  });
+
+  it('needs OpenCode\'s own error line, not the phrase quoted in other output', () => {
+    const stderr = 'INFO tool output: the docs say "Configuration is invalid at <path>" means a typo\nError: 401 Unauthorized\n';
+    assert.notEqual(OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr }).category, 'config_invalid');
+  });
+
+  it('is not mistaken for a model or key problem by what the reason says', () => {
+    const stderr = '\x1b[91m\x1b[1mError: \x1b[0mConfiguration is invalid at /p/opencode.json\n↳ Unrecognized key: model_not_found 401\n';
+    assert.equal(OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr }).category, 'config_invalid');
+  });
+
+  it('keeps the reason that a long path pushed past the old 200-character cut', () => {
+    const deep = `/home/someone/${'very-long-directory-name/'.repeat(8)}.opencode/opencode.json`;
+    const stderr = `\x1b[91m\x1b[1mError: \x1b[0mConfiguration is invalid at ${deep}\n↳ Unrecognized key: modle\n`;
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr });
+    assert.ok(cls.detail.endsWith('Unrecognized key: modle'), cls.detail);
+  });
+
+  it('tells the channel to fix the file, and quotes it without terminal colour codes', async () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr: CONFIG_SCHEMA_STDERR });
+    const adapter = makeAdapter();
+    let content = null;
+    adapter.client = { sendMessage: async (_w, _c, _t, c) => { content = c; } };
+    await adapter._sendClassifiedError('thread', cls.category, cls.detail);
+    assert.match(content, /OpenCode couldn't run\*\* — OpenCode would not start because one of its config files is invalid/);
+    assert.match(content, /correct or remove that entry, then retry/);
+    assert.match(content, /> Configuration is invalid at \/workspace\/\.opencode\/opencode\.json: Expected/);
+    assert.doesNotMatch(content, /\x1b|\[91m|\[0m/);
+  });
+
+  it('strips colour codes from any quoted stderr, not just config errors', () => {
+    const cls = OpenCodeAdapter._classifyFailure({ code: 1, stdout: '', stderr: '\x1b[91m\x1b[1mError: \x1b[0mSomething unexpected broke' });
+    assert.equal(cls.category, 'unknown_error');
+    assert.equal(cls.detail, 'Error: Something unexpected broke');
+    assert.doesNotMatch(cls.diagnostic, /\x1b/);
+  });
+
+  it('has nothing to say about stderr that is not a config refusal', () => {
+    assert.equal(OpenCodeAdapter._configError('Error: connect ECONNREFUSED 127.0.0.1:443'), null);
+    assert.equal(OpenCodeAdapter._configError(''), null);
+    assert.equal(OpenCodeAdapter._configError(undefined), null);
+  });
+});
+
+describe('OpenCode — text/tool events (8.4)', () => {
+  async function runEvents(events) {
+    const adapter = makeAdapter();
+    adapter.sendThinking = async () => {};
+    adapter.sendStatus = async () => {};
+    const state = { finalText: '', allText: '', seenText: false };
+    for (const ev of events) await adapter._handleStreamEvent(ev, 'thread', state);
+    const raw = events.map((e) => JSON.stringify(e)).join(' ');
+    return { state, text: OpenCodeAdapter._finalTextFromStdout(raw, state) };
+  }
+
+  it('text -> final text -> exit: returns the text', async () => {
+    const { text } = await runEvents([{ type: 'text', part: { text: 'Answer: 42.' } }]);
+    assert.equal(text, 'Answer: 42.');
+  });
+
+  it('text -> tool -> final text: returns post-tool text', async () => {
+    const { text } = await runEvents([
+      { type: 'text', part: { text: 'Let me check. ' } },
+      { type: 'tool_use', item: { name: 'Read', input: { path: '/x' } } },
+      { type: 'text', part: { text: 'Done.' } },
+    ]);
+    assert.equal(text, 'Done.');
+  });
+
+  it('text -> tool -> exit (no closing text): does NOT report empty', async () => {
+    const { text } = await runEvents([
+      { type: 'text', part: { text: 'The result is 7.' } },
+      { type: 'tool_use', item: { name: 'Bash', input: { command: 'echo done' } } },
+    ]);
+    // earlier text recovered via allText fallback — not an empty "produced no response"
+    assert.equal(text, 'The result is 7.');
+  });
+
+  it('only control/tool events -> empty_response category', async () => {
+    const stdout = '{"type":"step_start"} {"type":"tool_use","item":{"name":"Bash"}}';
+    assert.equal(OpenCodeAdapter._finalTextFromStdout(stdout), '');
+    assert.equal(OpenCodeAdapter._emptyExitCategory(stdout), 'empty_response');
+  });
+
+  it('step_finish and step-finish are both treated as control (no text leak)', () => {
+    assert.equal(OpenCodeAdapter._extractTextFromEvent({ type: 'step_finish', tokens: 5 }), null);
+    assert.equal(OpenCodeAdapter._extractTextFromEvent({ type: 'step-finish', cost: 0.01 }), null);
+  });
+
+  it('detects tool events across shapes (tool_use / part.type=tool / message.part.updated)', () => {
+    assert.equal(OpenCodeAdapter._isToolEvent({ type: 'tool_use' }), true);
+    assert.equal(OpenCodeAdapter._isToolEvent({ type: 'message.part.updated', part: { type: 'tool' } }), true);
+    assert.equal(OpenCodeAdapter._isToolEvent({ type: 'text', part: { text: 'hi' } }), false);
+  });
+
+  it('error events carry no assistant text', () => {
+    assert.equal(OpenCodeAdapter._extractTextFromEvent({ type: 'error', error: { message: 'boom' } }), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8.5 _handleMessage routing — classified error, no generic fallback
+// ---------------------------------------------------------------------------
+
+describe('OpenCode — message routing (8.5)', () => {
+  it('routes a thrown classified failure to a classified error (no "produced no response")', async () => {
+    const adapter = makeAdapter();
+    const sent = [];
+    const responses = [];
+    adapter._autoTitleChannel = async () => {};
+    adapter.sendStatus = async () => {};
+    adapter.sendResponse = async (_c, content) => responses.push(content);
+    adapter._sendClassifiedError = async (channel, category, detail) => sent.push({ channel, category, detail });
+    adapter._runOpencode = async () => { throw adapter._failure('auth_failed', 'APIError 401', 'Invalid API key'); };
+
+    await adapter._handleMessage({ content: 'hi', sessionId: 'thread', senderName: 'human:user' });
+
+    assert.equal(responses.length, 0);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].category, 'auth_failed');
+  });
+
+  describe('a shared database converted by OpenCode 2.x', () => {
+    const migrated = (adapter) => adapter._failure('shared_db_migrated', 'Database is not empty and has no session table', '');
+    function withHome(fn) {
+      return async () => {
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-db-'));
+        const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+        process.env.HOME = home; process.env.USERPROFILE = home;
+        try { await fn(home); } finally {
+          for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+          fs.rmSync(home, { recursive: true, force: true });
+        }
+      };
+    }
+    function routed(adapter, outcomes) {
+      const seen = { envs: [], statuses: [], errors: [], responses: [] };
+      adapter._autoTitleChannel = async () => {};
+      adapter._saveSessions = () => {};
+      adapter.sendStatus = async (_c, m) => seen.statuses.push(m);
+      adapter.sendResponse = async (_c, m) => seen.responses.push(m);
+      adapter._sendClassifiedError = async (_c, category) => seen.errors.push(category);
+      adapter._runOpencode = async () => {
+        seen.envs.push(adapter._spawnEnv('thread').OPENCODE_DB);
+        const next = outcomes.shift();
+        if (next === 'migrated') throw migrated(adapter);
+        return next;
+      };
+      return seen;
+    }
+
+    it('moves to a database of its own, drops the old sessions and retries once', withHome(async (home) => {
+      const adapter = makeAdapter({ agentEnv: {} });
+      adapter._channelSessions = { thread: 'ses_old' };
+      const seen = routed(adapter, ['migrated', 'answer']);
+      await adapter._handleMessage({ content: 'hi', sessionId: 'thread', senderName: 'human:user' });
+      const own = path.join(home, '.openagents', 'opencode', 'opencode.db');
+      assert.deepEqual(seen.envs, [undefined, own]);
+      assert.ok(fs.existsSync(own));
+      assert.deepEqual(adapter._channelSessions, {});
+      assert.deepEqual(seen.responses, ['answer']);
+      assert.equal(seen.errors.length, 0);
+      assert.match(seen.statuses.join('\n'), /uses one of its own/);
+    }));
+
+    it('reports it when the run already had a database of its own', withHome(async (home) => {
+      const own = path.join(home, '.openagents', 'opencode', 'opencode.db');
+      fs.mkdirSync(path.dirname(own), { recursive: true });
+      fs.writeFileSync(own, '');
+      const adapter = makeAdapter({ agentEnv: {} });
+      const seen = routed(adapter, ['migrated', 'answer']);
+      await adapter._handleMessage({ content: 'hi', sessionId: 'thread', senderName: 'human:user' });
+      assert.deepEqual(seen.envs, [own]);
+      assert.deepEqual(seen.errors, ['shared_db_migrated']);
+    }));
+
+    it('leaves an OPENCODE_DB the user set alone', withHome(async (home) => {
+      const adapter = makeAdapter({ agentEnv: { OPENCODE_DB: '/x/mine.db' } });
+      const seen = routed(adapter, ['migrated', 'answer']);
+      await adapter._handleMessage({ content: 'hi', sessionId: 'thread', senderName: 'human:user' });
+      assert.deepEqual(seen.envs, ['/x/mine.db']);
+      assert.deepEqual(seen.errors, ['shared_db_migrated']);
+      assert.ok(!fs.existsSync(path.join(home, '.openagents', 'opencode', 'opencode.db')));
+    }));
+  });
+
+  it('classifies a raw spawn ENOENT as cli_not_found', () => {
+    const adapter = makeAdapter();
+    assert.equal(adapter._classifyErrno({ code: 'ENOENT' }), 'cli_not_found');
+    assert.equal(adapter._classifyErrno({ code: 'EACCES' }), 'cli_not_executable');
+    assert.equal(adapter._classifyErrno(new Error('weird')), 'unknown_error');
+  });
+
+  async function renderClassified(category, detail) {
+    const adapter = makeAdapter();
+    let captured = null;
+    adapter._mode = 'autonomous';
+    adapter._sessionId = 's1';
+    adapter.client = {
+      sendMessage: async (_w, _c, _t, content, opts) => { captured = { content, opts }; },
+    };
+    await adapter._sendClassifiedError('thread', category, detail);
+    return captured;
+  }
+
+  it('classified errors are tagged (messageType=error + error_category) and visibly not a normal reply', async () => {
+    const cap = await renderClassified('model_not_found', 'The model `gpt-5` does not exist');
+    assert.equal(cap.opts.messageType, 'error');
+    assert.equal(cap.opts.metadata.error_category, 'model_not_found');
+    assert.match(cap.content, /OpenCode couldn't run/);
+  });
+
+  it('does NOT tell the user to run auth login for non-auth failures', async () => {
+    for (const cat of ['model_missing', 'network_error', 'timeout', 'empty_response', 'unsupported_version']) {
+      const cap = await renderClassified(cat);
+      assert.ok(!/auth login/i.test(cap.content), `${cat} must not mention auth login`);
+    }
+  });
+
+  it('an incomplete install says so — reinstall, not "set a model"', async () => {
+    const cap = await renderClassified('install_incomplete');
+    assert.equal(cap.opts.metadata.error_category, 'install_incomplete');
+    assert.match(cap.content, /postinstall script did not run/);
+    assert.match(cap.content, /Reinstall OpenCode/);
+    assert.ok(!/No model is configured|undetermined reason/i.test(cap.content));
+  });
+
+  it('DOES guide auth only for auth/credential failures', async () => {
+    const cred = await renderClassified('credential_missing');
+    assert.match(cred.content, /API key|auth login/i);
+  });
+
+  it('redacts secrets that appear in the surfaced detail', async () => {
+    const cap = await renderClassified('auth_failed', 'rejected key sk-abcdef0123456789abcdef0123456789');
+    assert.ok(!cap.content.includes('sk-abcdef0123456789abcdef0123456789'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8.5b Long-running tasks — timeout is based on inactivity, not wall clock
+// ---------------------------------------------------------------------------
+
+describe('OpenCode — idle watchdog (8.5b)', () => {
+  it('keeps a long run alive while stream output continues', async () => {
+    const adapter = Object.create(OpenCodeAdapter.prototype);
+    adapter._runTimeoutMs = () => 40;
+    let expired = false;
+    const watchdog = adapter._createIdleWatchdog(() => { expired = true; });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    watchdog.touch();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    watchdog.touch();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    assert.equal(expired, false, 'continued output must renew the deadline');
+    watchdog.cancel();
+  });
+
+  it('expires after one full silent interval and cancel prevents later expiry', async () => {
+    const adapter = Object.create(OpenCodeAdapter.prototype);
+    adapter._runTimeoutMs = () => 25;
+    let expirations = 0;
+    const watchdog = adapter._createIdleWatchdog(() => { expirations++; });
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(expirations, 1);
+    watchdog.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    assert.equal(expirations, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8.6 Custom OpenAI-compatible gateways (generated provider config)
+// ---------------------------------------------------------------------------
+
+describe('OpenCode — custom gateway provider config (8.6)', () => {
+  const os = require('os');
+  const GW = 'https://api-gateway.example.org/v1';
+
+  function gatewayAdapter(env = {}) {
+    return makeAdapter({
+      agentEnv: {
+        OPENAI_API_KEY: 'sk-test',
+        OPENAI_BASE_URL: GW,
+        LLM_MODEL: 'deepseek-4-flash',
+        ...env,
+      },
+    });
+  }
+
+  it('qualifies bare models with the gateway provider when the base URL is custom', () => {
+    assert.equal(gatewayAdapter()._resolveModel(), 'openagents-gateway/deepseek-4-flash');
+  });
+
+  it('keeps the openai provider for the real OpenAI endpoint', () => {
+    const a = gatewayAdapter({ OPENAI_BASE_URL: 'https://api.openai.com/v1' });
+    assert.equal(a._resolveModel(), 'openai/deepseek-4-flash');
+  });
+
+  it('never rewrites an already provider-qualified model', () => {
+    const a = gatewayAdapter({ LLM_MODEL: 'anthropic/claude-sonnet-4-20250514' });
+    assert.equal(a._resolveModel(), 'anthropic/claude-sonnet-4-20250514');
+  });
+
+  it('writes an @ai-sdk/openai-compatible provider block without the raw key', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-gw-'));
+    gatewayAdapter()._ensureCustomProviderConfig(dir);
+    const raw = fs.readFileSync(path.join(dir, '.opencode', 'opencode.json'), 'utf-8');
+    const cfg = JSON.parse(raw);
+    const p = cfg.provider['openagents-gateway'];
+    assert.equal(p.npm, '@ai-sdk/openai-compatible');
+    assert.equal(p.options.baseURL, GW);
+    assert.equal(p.options.apiKey, '{env:OPENAI_API_KEY}');
+    assert.ok(p.models['deepseek-4-flash']);
+    assert.ok(!raw.includes('sk-test'), 'API key must never be written to disk');
+  });
+
+  it('merges into an existing config, keeping unrelated keys and old models', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-gw-'));
+    fs.mkdirSync(path.join(dir, '.opencode'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.opencode', 'opencode.json'),
+      JSON.stringify({
+        theme: 'dark',
+        provider: { 'openagents-gateway': { models: { 'old-model': {} } } },
+      }),
+    );
+    gatewayAdapter()._ensureCustomProviderConfig(dir);
+    const cfg = JSON.parse(fs.readFileSync(path.join(dir, '.opencode', 'opencode.json'), 'utf-8'));
+    assert.equal(cfg.theme, 'dark');
+    assert.ok(cfg.provider['openagents-gateway'].models['old-model']);
+    assert.ok(cfg.provider['openagents-gateway'].models['deepseek-4-flash']);
+  });
+
+  it('leaves a corrupt opencode.json untouched', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-gw-'));
+    fs.mkdirSync(path.join(dir, '.opencode'), { recursive: true });
+    const file = path.join(dir, '.opencode', 'opencode.json');
+    fs.writeFileSync(file, '{ not json');
+    gatewayAdapter()._ensureCustomProviderConfig(dir);
+    assert.equal(fs.readFileSync(file, 'utf-8'), '{ not json');
+  });
+
+  it('does nothing when no custom base URL is configured', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-gw-'));
+    const a = makeAdapter({ agentEnv: { OPENAI_API_KEY: 'sk-test', LLM_MODEL: 'gpt-4o' } });
+    a._ensureCustomProviderConfig(dir);
+    assert.ok(!fs.existsSync(path.join(dir, '.opencode', 'opencode.json')));
+  });
+});

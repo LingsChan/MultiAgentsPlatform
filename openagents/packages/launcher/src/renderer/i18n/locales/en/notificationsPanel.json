@@ -1,0 +1,15 @@
+{
+  "kinds": {
+    "agent_error": "Agent error",
+    "agent_finished": "Agent finished",
+    "agent_mention": "Agent mention",
+    "agent_waiting_input": "Agent waiting for input",
+    "workspace_mention": "Workspace @mention",
+    "workspace_message": "Workspace message",
+    "workspace_error": "Workspace error",
+    "platform_error": "Platform error",
+    "github": "GitHub",
+    "update_available": "Updates available",
+    "system": "System"
+  }
+}

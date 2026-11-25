@@ -1,0 +1,369 @@
+/* Tailwind Core */
+@import 'tailwindcss';
+
+@import 'tw-animate-css';
+@import './shadcn-tailwind.css';
+
+/** Dark Mode Variant **/
+@custom-variant dark (&:is(.dark *));
+
+/** Colors - https://tailwindcss.com/docs/colors **/
+:root {
+  /* shadcn radix-nova, neutral base (shadcn 4.23). The app shell is black and
+     white; colour is reserved for status. */
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  /* Status colours the registry leaves to the app. Used as text and as a
+     tint (`bg-success/10 text-success`), never as a large fill. */
+  --success: var(--color-emerald-600);
+  --warning: var(--color-amber-600);
+  --info: var(--color-blue-600);
+  --chart-1: var(--color-blue-500);
+  --chart-2: var(--color-green-500);
+  --chart-3: var(--color-yellow-500);
+  --chart-4: var(--color-red-500);
+  --chart-5: var(--color-purple-500);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --radius: 0.625rem;
+
+  /** Sidebar — the inset shell sits on this, with the content card above it. **/
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.945 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+
+  /** File type accents — a folder of uploads is a wall of near-identical
+      names, so the glyph colour carries the type and the eye can sort the
+      list before reading a single filename. One hue per kind, shared by the
+      grid tiles, the list rows, the ⌘K palette and the preview header. **/
+  --file-pdf: hsl(350 75% 55%);
+  --file-doc: hsl(220 85% 58%);
+  --file-sheet: hsl(150 70% 35%);
+  --file-slides: hsl(15 85% 52%);
+  --file-markdown: hsl(280 60% 58%);
+  --file-text: hsl(220 12% 45%);
+  --file-code: hsl(190 90% 35%);
+  --file-image: hsl(280 85% 58%);
+  --file-audio: hsl(45 90% 42%);
+  --file-video: hsl(340 78% 50%);
+  --file-web: hsl(210 95% 48%);
+  --file-archive: hsl(35 65% 45%);
+  --file-unknown: hsl(0 0% 48%);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+  --success: var(--color-emerald-400);
+  --warning: var(--color-amber-400);
+  --info: var(--color-blue-400);
+  --chart-1: var(--color-blue-500);
+  --chart-2: var(--color-green-500);
+  --chart-3: var(--color-yellow-500);
+  --chart-4: var(--color-red-500);
+  --chart-5: var(--color-purple-500);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+
+  /** Sidebar **/
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.922 0 0);
+  --sidebar-primary-foreground: oklch(0.205 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+
+  /** File type accents — same hues, lifted so they hold up on zinc-950. **/
+  --file-pdf: hsl(350 80% 68%);
+  --file-doc: hsl(220 90% 70%);
+  --file-sheet: hsl(150 60% 50%);
+  --file-slides: hsl(15 85% 63%);
+  --file-markdown: hsl(280 70% 72%);
+  --file-text: hsl(220 12% 62%);
+  --file-code: hsl(190 85% 55%);
+  --file-image: hsl(280 90% 72%);
+  --file-audio: hsl(45 90% 58%);
+  --file-video: hsl(340 80% 65%);
+  --file-web: hsl(210 95% 62%);
+  --file-archive: hsl(35 70% 58%);
+  --file-unknown: hsl(0 0% 62%);
+}
+
+/** Theme Setup **/
+@theme inline {
+  /** Extra-wide screens (2100px), for grids that keep adding columns. **/
+  --breakpoint-3xl: 131.25rem;
+
+  /** Base Colors **/
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /** Sidebar **/
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /** Base Styles **/
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  /* nova's multiplicative radius scale */
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+
+  /* Headings follow the body face (preset fontHeading: inherit). */
+  --font-heading: inherit;
+
+  /** Animations **/
+  --animate-marquee: marquee var(--duration) infinite linear;
+  --animate-marquee-vertical: marquee-vertical var(--duration) linear infinite;
+
+  @keyframes marquee {
+    from {
+      transform: translateX(0);
+    }
+    to {
+      transform: translateX(calc(-100% - var(--gap)));
+    }
+  }
+  @keyframes marquee-vertical {
+    from {
+      transform: translateY(0);
+    }
+    to {
+      transform: translateY(calc(-100% - var(--gap)));
+    }
+  }
+}
+
+/** Thread completion glow **/
+@keyframes glow {
+  0%, 100% { box-shadow: 0 0 4px 0 color-mix(in oklab, var(--success) 30%, transparent); }
+  50% { box-shadow: 0 0 8px 2px color-mix(in oklab, var(--success) 40%, transparent); }
+}
+
+/** Shared thread/issue activity: a visible band sweeps across the row. **/
+@keyframes work-sweep {
+  from { background-position: 100% 0; }
+  to { background-position: 0% 0; }
+}
+@keyframes work-fade {
+  0%, 100% { background-color: var(--work-rest); }
+  50% { background-color: var(--work-highlight); }
+}
+.thread-wip {
+  --work-rest: rgba(24, 24, 27, 0.025);
+  --work-highlight: rgba(24, 24, 27, 0.09);
+  --work-band: rgba(24, 24, 27, 0.12);
+  background-color: var(--work-rest);
+  background-image: linear-gradient(90deg,
+    transparent 38%, var(--work-band) 50%, transparent 62%);
+  background-size: 220% 100%;
+  background-repeat: no-repeat;
+  animation: work-sweep 2.4s linear infinite;
+}
+.dark .thread-wip {
+  --work-rest: rgba(244, 244, 245, 0.025);
+  --work-highlight: rgba(244, 244, 245, 0.09);
+  --work-band: rgba(244, 244, 245, 0.14);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thread-wip {
+    background-image: none;
+    animation: work-fade 3s ease-in-out infinite;
+  }
+}
+
+/** Global Styles **/
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  *:focus-visible {
+    @apply outline-ring rounded-xs shadow-none outline-2 outline-offset-3 transition-none!;
+  }
+
+  /** Agent activity dot animation **/
+  @keyframes step-dot {
+    0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1); }
+  }
+
+  /** Agent "working" bubble — three lifting dots + fade-in (working-bubble.tsx) **/
+  @keyframes typing-dot {
+    0%, 60%, 100% { transform: translateY(0);    opacity: 0.45; }
+    30%           { transform: translateY(-3px); opacity: 1; }
+  }
+  .typing-dot {
+    animation: typing-dot 1s ease-in-out infinite;
+  }
+  @keyframes working-bubble-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .working-bubble {
+    animation: working-bubble-in 0.25s ease-out both;
+  }
+  /* Reduced motion: keep the dots alive with a gentle opacity pulse (no
+     vertical travel) instead of freezing them — a frozen typing indicator
+     reads as a hung agent. Only the bubble's slide-in is dropped. */
+  @keyframes typing-dot-fade {
+    0%, 60%, 100% { opacity: 0.45; }
+    30%           { opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .typing-dot { animation: typing-dot-fade 1.4s ease-in-out infinite; }
+    .working-bubble { animation: none; }
+  }
+}
+
+/** Dialog and drawer bodies scroll; their contents never get squashed **/
+@layer base {
+  /* Callers often make the body a flex column. A child that clips its own
+     overflow (Card, CodeBlock) then has a min-height of 0 and would shrink
+     and get cut off instead of the body scrolling. Kept in the base layer so
+     a child's own utility (flex-1, shrink) still overrides it. */
+  [data-slot=dialog-body] > *,
+  [data-slot=drawer-body] > * {
+    flex-shrink: 0;
+  }
+}
+
+/** Custom Scrollbar **/
+@layer base {
+  ::-webkit-scrollbar {
+    width: 5px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--input);
+    border-radius: 5px;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--input) transparent;
+  }
+}
+
+/** Smooth scroll + mobile viewport **/
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+}
+
+/** Safe area for iOS notch/home indicator **/
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/** Prevent overscroll bounce on mobile **/
+@media (max-width: 1023px) {
+  body {
+    overscroll-behavior: none;
+  }
+}
+
+/** Custom Containers **/
+@utility container {
+  @apply mx-auto max-w-none px-4 lg:px-5;
+
+  @media (width >= --theme(--breakpoint-xl)) {
+    @apply max-w-(--breakpoint-xl);
+  }
+}
+
+@utility container-fluid {
+  @apply mx-auto w-full px-4 lg:px-5;
+}
+
+/* Card Title */
+[data-slot=card-title] {
+  @apply font-medium;
+}
+
+/* Proactive routing: keep the approved traveling signal and arrival ripple. */
+.routing-flow { position: relative; display: inline-block; width: 32px; height: 16px; flex-shrink: 0; }
+.routing-flow-source, .routing-flow-destination { position: absolute; top: 6px; width: 4px; height: 4px; border-radius: 50%; background: currentColor; opacity: .35; }
+.routing-flow-source { left: 0; animation: routing-source 2.4s ease-in-out infinite; }
+.routing-flow-destination { right: 0; animation: routing-destination 2.4s ease-in-out infinite; }
+.routing-flow-track { position: absolute; left: 6px; right: 6px; top: 7.5px; height: 1px; background: currentColor; opacity: .15; }
+.routing-flow-signal { position: absolute; left: 4px; top: 6px; width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: routing-travel 2.4s cubic-bezier(.45,0,.25,1) infinite; }
+.routing-flow-signal::before { content: ''; position: absolute; right: 2px; top: 1px; width: 7px; height: 2px; border-radius: 3px; background: linear-gradient(90deg, transparent, currentColor); opacity: .4; }
+.routing-flow::after { content: ''; position: absolute; right: -4px; top: 2px; width: 12px; height: 12px; border: 1px solid currentColor; border-radius: 50%; opacity: 0; animation: routing-arrival 2.4s ease-out infinite; }
+@keyframes routing-travel { 0%,12% { transform: translateX(0); opacity: 0; } 20% { opacity: .8; } 65% { transform: translateX(23px); opacity: .8; } 74%,100% { transform: translateX(23px); opacity: 0; } }
+@keyframes routing-source { 0%,100% { opacity: .35; transform: scale(1); } 15%,28% { opacity: .8; transform: scale(1.13); } 45% { opacity: .35; transform: scale(1); } }
+@keyframes routing-destination { 0%,48%,100% { opacity: .35; transform: scale(1); } 65%,75% { opacity: .8; transform: scale(1.15); } 90% { opacity: .35; transform: scale(1); } }
+@keyframes routing-arrival { 0%,58% { opacity: 0; transform: scale(.5); } 66% { opacity: .35; transform: scale(.7); } 92%,100% { opacity: 0; transform: scale(1.4); } }

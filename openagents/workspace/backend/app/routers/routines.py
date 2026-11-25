@@ -1,0 +1,755 @@
+# -*- coding: utf-8 -*-
+"""
+Routine endpoints — recurring scheduled tasks.
+
+POST   /v1/routines          Create a routine
+GET    /v1/routines          List routines in scope
+PATCH  /v1/routines/{id}     Edit a routine (schedule, task, owner, pause/resume)
+DELETE /v1/routines/{id}     Cancel a routine
+GET    /v1/routines/{id}/runs  Recent attributable run history
+POST   /v1/routines/{id}/run   Request a scheduler run
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, Header, Path, Query
+from pydantic import BaseModel
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Channel, ChannelMember, RoutineRecord, Workspace, WorkspaceMember
+from app.response import ResponseCode, json_response, success_response
+from app.routers.network import _resolve_workspace, _verify_workspace_access
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/v1", tags=["Routines"])
+
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+class CreateRoutineRequest(BaseModel):
+    name: str
+    message: str
+    context: Optional[str] = None
+    conversation_history: Optional[str] = None
+    # Daily mode (hour + minute, optional days). interval_minutes is the other mode.
+    hour: Optional[int] = None
+    minute: Optional[int] = None
+    days: Optional[List[int]] = None
+    interval_minutes: Optional[int] = None
+    network: str
+    source: str
+    channel: Optional[str] = None
+    thread_id: Optional[str] = None
+    source_channel: Optional[str] = None
+
+
+class UpdateRoutineRequest(BaseModel):
+    """Partial edit of an existing routine — every field is optional.
+
+    Schedule edits follow the same either/or rule as creation: send
+    `interval_minutes` for interval mode, or `hour`/`minute`/`days` for daily
+    mode. Fields left out keep their current value, so a daily routine can
+    change just its `days` without repeating the time.
+    """
+
+    network: str
+    name: Optional[str] = None
+    message: Optional[str] = None
+    context: Optional[str] = None
+    conversation_history: Optional[str] = None
+    hour: Optional[int] = None
+    minute: Optional[int] = None
+    days: Optional[List[int]] = None
+    interval_minutes: Optional[int] = None
+    source: Optional[str] = None
+    source_channel: Optional[str] = None
+    status: Optional[str] = None  # active | paused (cancel goes through DELETE)
+
+
+# Minute-interval mode bounds (1 minute floor matches scheduler tick;
+# 1-day ceiling — for anything longer, use daily hour/minute mode).
+MIN_INTERVAL_MINUTES = 1
+MAX_INTERVAL_MINUTES = 1440
+
+
+# ---------------------------------------------------------------------------
+# Routine channel — one per agent, per workspace.
+# Routines from any thread always fire into the agent's routine channel.
+# ---------------------------------------------------------------------------
+
+ROUTINE_CHANNEL_PREFIX = "routines:"
+
+
+def _normalize_agent_name(source: str) -> str:
+    """Strip the `openagents:` prefix if present; routines store the bare name."""
+    if source and source.startswith("openagents:"):
+        return source[len("openagents:"):]
+    return source or ""
+
+
+def _routine_channel_name(agent: str) -> str:
+    return f"{ROUTINE_CHANNEL_PREFIX}{agent}"
+
+
+def _get_or_create_routine_channel(db: Session, workspace: Workspace, agent: str) -> Channel:
+    """Find-or-create the per-agent routine channel for this workspace.
+
+    Single channel per agent — every routine the agent owns fires into
+    this one queue. master_agent is set so the existing routing /
+    discovery code treats this as the agent's own thread. (The previous
+    per-routine `routine:<id>` design fragmented activity across many
+    threads; reverted because the product surface — Inbox tab — is
+    organized per-agent.)
+    """
+    from app.services.personal_assistant import require_group_agent
+    require_group_agent(db, workspace.id, agent)
+    name = _routine_channel_name(agent)
+    existing = db.execute(
+        select(Channel).where(
+            Channel.workspace_id == str(workspace.id),
+            Channel.name == name,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    channel = Channel(
+        workspace_id=str(workspace.id),
+        name=name,
+        title=agent,
+        master_agent=agent,
+        created_by="system:routine",
+        status="active",
+    )
+    db.add(channel)
+    db.flush()
+    db.add(ChannelMember(channel_id=channel.id, agent_name=agent))
+    return channel
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _compute_next_fires_at(
+    hour: Optional[int],
+    minute: Optional[int],
+    days: Optional[List[int]],
+    interval_minutes: Optional[int] = None,
+) -> datetime:
+    """Compute the next UTC datetime that matches the given schedule."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+
+    if interval_minutes is not None:
+        return now + timedelta(minutes=interval_minutes)
+
+    today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if days is None:
+        if today > now:
+            return today
+        return today + timedelta(days=1)
+
+    current_weekday = now.weekday()  # 0=Mon
+    for offset in range(8):
+        candidate = today + timedelta(days=offset)
+        wd = (current_weekday + offset) % 7
+        if wd in days:
+            if offset == 0 and candidate <= now:
+                continue
+            return candidate
+
+    return today + timedelta(days=1)
+
+
+def _describe_schedule(
+    hour: Optional[int],
+    minute: Optional[int],
+    days: Optional[List[int]],
+    interval_minutes: Optional[int] = None,
+) -> str:
+    """Human-readable schedule description for the LLM prompt."""
+    if interval_minutes is not None:
+        if interval_minutes >= 60:
+            h = interval_minutes // 60
+            m = interval_minutes % 60
+            return f"Every {h}h{f' {m}m' if m else ''}"
+        return f"Every {interval_minutes} minutes"
+    time_str = f"{hour:02d}:{minute:02d} UTC"
+    if days is None:
+        return f"Every day at {time_str}"
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    day_labels = [day_names[d] for d in sorted(days) if 0 <= d <= 6]
+    return f"{', '.join(day_labels)} at {time_str}"
+
+
+def _same_days(a: Optional[List[int]], b: Optional[List[int]]) -> bool:
+    """Whether two `days` values pick the same weekdays (`None` = all seven)."""
+    every_day = set(range(7))
+    return (set(a) if a is not None else every_day) == (set(b) if b is not None else every_day)
+
+
+def _fallback_context(name: str, message: str, schedule_desc: str) -> str:
+    """The context a routine gets when no LLM is available to write one."""
+    return f"Routine: {name}\n\nTask: {message}\nSchedule: {schedule_desc}"
+
+
+MAX_CONVERSATION_CHARS = 8000
+
+def _generate_routine_context_sync(
+    name: str, message: str, schedule_desc: str,
+    conversation_history: Optional[str] = None,
+) -> str:
+    """Call the LLM to expand a brief task description into comprehensive routine context."""
+    from app.mods.workspace_mod import (
+        _anthropic_text,
+        _get_llm_client,
+        _get_router_api_key,
+        _get_router_model,
+    )
+
+    fallback = _fallback_context(name, message, schedule_desc)
+
+    if not _get_router_api_key():
+        logger.warning("No LLM API key for routine context generation, using fallback")
+        return fallback
+
+    conversation_block = ""
+    if conversation_history:
+        truncated = conversation_history[:MAX_CONVERSATION_CHARS]
+        conversation_block = (
+            "\n\nRecent conversation history (use this to understand the full context "
+            "behind the task — what was discussed, any specific details, URLs, tools, "
+            "or preferences mentioned):\n"
+            "---\n"
+            f"{truncated}\n"
+            "---\n"
+        )
+
+    prompt = (
+        "You are helping set up a recurring automated task for an AI agent in a workspace. "
+        "Based on the task description and conversation context below, write comprehensive "
+        "instructions that the agent will receive each time this routine fires. The instructions "
+        "should be clear, specific, and actionable. Incorporate relevant details from the "
+        "conversation history if available.\n\n"
+        f"Task name: {name}\n"
+        f"Task description: {message}\n"
+        f"Schedule: {schedule_desc}"
+        f"{conversation_block}\n"
+        "Write the routine context (2-4 paragraphs). Be specific about what the agent should do, "
+        "what to check, and what format to use for any output. "
+        "Do not include any preamble — just the context instructions."
+    )
+
+    try:
+        client, provider = _get_llm_client()
+        model = _get_router_model()
+
+        if provider == "openai":
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+            )
+            return resp.choices[0].message.content.strip()
+        else:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return _anthropic_text(resp).strip()
+    except Exception as exc:
+        logger.warning("LLM context generation failed (%s), using fallback", exc)
+        return fallback
+
+
+def _serialize_routine(r: RoutineRecord) -> dict:
+    return {
+        "id": r.id,
+        "name": r.name,
+        "message": r.message,
+        "context": r.context,
+        "schedule_hour": r.schedule_hour,
+        "schedule_minute": r.schedule_minute,
+        "schedule_days": r.schedule_days,
+        "schedule_interval_minutes": r.schedule_interval_minutes,
+        "timezone": r.timezone,
+        "next_fires_at": r.next_fires_at.isoformat() if r.next_fires_at else None,
+        "last_fired_at": r.last_fired_at.isoformat() if r.last_fired_at else None,
+        "status": r.status,
+        "created_by": r.created_by,
+        "channel_name": r.channel_name,
+        "thread_id": r.thread_id,
+        "source_channel_name": r.source_channel_name,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/routines
+# ---------------------------------------------------------------------------
+
+@router.post("/routines")
+async def create_routine(
+    body: CreateRoutineRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Create a recurring scheduled routine."""
+    workspace = _resolve_workspace(db, body.network)
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Network not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    is_interval = body.interval_minutes is not None
+    is_daily = body.hour is not None or body.minute is not None
+    if is_interval and is_daily:
+        return json_response(
+            ResponseCode.BAD_REQUEST,
+            "Specify either interval_minutes OR hour/minute, not both",
+        )
+    if not is_interval and not is_daily:
+        return json_response(
+            ResponseCode.BAD_REQUEST,
+            "Specify either interval_minutes OR hour/minute",
+        )
+
+    if is_interval:
+        if not (MIN_INTERVAL_MINUTES <= body.interval_minutes <= MAX_INTERVAL_MINUTES):
+            return json_response(
+                ResponseCode.BAD_REQUEST,
+                f"interval_minutes must be {MIN_INTERVAL_MINUTES}-{MAX_INTERVAL_MINUTES}",
+            )
+        if body.days is not None:
+            return json_response(
+                ResponseCode.BAD_REQUEST,
+                "days is not allowed in interval mode",
+            )
+    else:
+        if body.hour is None or body.minute is None:
+            return json_response(ResponseCode.BAD_REQUEST, "hour and minute are both required in daily mode")
+        if not (0 <= body.hour <= 23):
+            return json_response(ResponseCode.BAD_REQUEST, "hour must be 0-23")
+        if not (0 <= body.minute <= 59):
+            return json_response(ResponseCode.BAD_REQUEST, "minute must be 0-59")
+        if body.days is not None:
+            if not body.days or not all(0 <= d <= 6 for d in body.days):
+                return json_response(ResponseCode.BAD_REQUEST, "days must be array of 0-6 (Mon=0, Sun=6)")
+
+    # Execution stays in the target agent's background channel. The caller's
+    # conversation is retained separately as source_channel_name, giving each
+    # (workspace, agent) pair a single canonical job queue and keeps regular
+    # conversation threads from being spammed by scheduled output.
+    target_agent = _normalize_agent_name(body.source)
+    if not target_agent:
+        return json_response(ResponseCode.BAD_REQUEST, "source is required")
+
+    # Identity check: `source` must reference an agent that is actually a
+    # member of this workspace. Routines fire under the source's identity
+    # and post into that agent's dedicated channel — accepting arbitrary
+    # source values would let any caller inject scheduled messages
+    # attributed to anyone they invented. Membership is the strongest
+    # identity guarantee available with the shared workspace-token auth
+    # model; per-agent auth is tracked separately.
+    is_member = db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.agent_name == target_agent,
+        )
+    ).scalar_one_or_none()
+    if not is_member:
+        return json_response(
+            ResponseCode.FORBIDDEN,
+            f"source '{body.source}' is not a member of this workspace",
+        )
+
+    source_channel = body.source_channel or body.channel
+    origin = db.execute(select(Channel).where(
+        Channel.workspace_id == str(workspace.id), Channel.name == source_channel,
+        Channel.status != "deleted",
+    )).scalar_one_or_none() if source_channel else None
+    if body.source_channel and (not origin or origin.name.startswith(("routine:", "routines:"))):
+        return json_response(ResponseCode.BAD_REQUEST, "Source conversation not found")
+    # Legacy callers sent arbitrary channel hints that were ignored. Only an
+    # existing workspace channel can establish a source link.
+    source_channel = origin.name if origin and not origin.name.startswith(("routine:", "routines:")) else None
+
+    # Auto-generate context via LLM if not provided (UI-created routines)
+    if not body.context:
+        import asyncio
+        schedule_desc = _describe_schedule(body.hour, body.minute, body.days, body.interval_minutes)
+        body.context = await asyncio.to_thread(
+            _generate_routine_context_sync, body.name, body.message, schedule_desc,
+            body.conversation_history,
+        )
+
+    import uuid as _uuid_mod
+    routine_id = str(_uuid_mod.uuid4())
+    routine_channel = _get_or_create_routine_channel(db, workspace, target_agent)
+    next_fire = _compute_next_fires_at(body.hour, body.minute, body.days, body.interval_minutes)
+
+    routine = RoutineRecord(
+        id=routine_id,
+        workspace_id=str(workspace.id),
+        channel_name=routine_channel.name,
+        source_channel_name=source_channel,
+        thread_id=body.thread_id,
+        created_by=target_agent,
+        name=body.name,
+        message=body.message,
+        context=body.context,
+        schedule_hour=body.hour,
+        schedule_minute=body.minute,
+        schedule_days=body.days,
+        schedule_interval_minutes=body.interval_minutes,
+        next_fires_at=next_fire,
+    )
+    db.add(routine)
+    db.commit()
+
+    return success_response(_serialize_routine(routine))
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/routines
+# ---------------------------------------------------------------------------
+
+@router.get("/routines")
+def list_routines(
+    network: str = Query(...),
+    channel: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """List routines in scope (active + paused unless `status` narrows it)."""
+    workspace = _resolve_workspace(db, network)
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Network not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    query = select(RoutineRecord).where(
+        RoutineRecord.workspace_id == str(workspace.id),
+    )
+    if status:
+        query = query.where(RoutineRecord.status == status)
+    else:
+        # Everything that still exists — active *and* paused. Filtering to
+        # "active" here would hide a paused routine from the only surfaces
+        # that could resume it. `cancelled` is terminal, so it stays hidden.
+        query = query.where(RoutineRecord.status != "cancelled")
+    if channel:
+        query = query.where(or_(RoutineRecord.source_channel_name == channel, RoutineRecord.channel_name == channel))
+
+    query = query.order_by(RoutineRecord.next_fires_at.asc())
+    rows = db.execute(query).scalars().all()
+
+    from app.services.routine_activity import routine_runs
+    return success_response({"routines": [{**_serialize_routine(r), "latest_run": next(iter(routine_runs(db, r, limit=1)), None)} for r in rows]})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v1/routines/{routine_id}
+# ---------------------------------------------------------------------------
+
+@router.patch("/routines/{routine_id}")
+async def update_routine(
+    body: UpdateRoutineRequest,
+    routine_id: str = Path(...),
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Edit a routine in place.
+
+    Everything a routine was created with can be changed — the task, the
+    schedule, the owning agent — plus `status` for pause/resume. Editing
+    used to mean cancel-and-recreate, which minted a new id and dropped the
+    `last_fired_at` history along with it.
+    """
+    workspace = _resolve_workspace(db, body.network)
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Network not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    routine = db.execute(
+        select(RoutineRecord).where(
+            RoutineRecord.id == routine_id,
+            RoutineRecord.workspace_id == str(workspace.id),
+        )
+    ).scalar_one_or_none()
+    if not routine:
+        return json_response(ResponseCode.NOT_FOUND, "Routine not found")
+    # Cancelling is terminal — a cancelled routine is a tombstone, not a draft.
+    if routine.status == "cancelled":
+        return json_response(ResponseCode.BAD_REQUEST, "Routine is cancelled")
+
+    # ── Validate the schedule edit (same either/or rule as creation) ──
+    wants_interval = body.interval_minutes is not None
+    wants_daily = body.hour is not None or body.minute is not None or body.days is not None
+    if wants_interval and wants_daily:
+        return json_response(
+            ResponseCode.BAD_REQUEST,
+            "Specify either interval_minutes OR hour/minute, not both",
+        )
+
+    hour = minute = days = None
+    if wants_interval:
+        if not (MIN_INTERVAL_MINUTES <= body.interval_minutes <= MAX_INTERVAL_MINUTES):
+            return json_response(
+                ResponseCode.BAD_REQUEST,
+                f"interval_minutes must be {MIN_INTERVAL_MINUTES}-{MAX_INTERVAL_MINUTES}",
+            )
+    elif wants_daily:
+        # Unspecified halves fall back to what the routine already has, so a
+        # days-only or minute-only edit works. Switching an interval routine
+        # to daily has nothing to fall back to and must send both.
+        hour = body.hour if body.hour is not None else routine.schedule_hour
+        minute = body.minute if body.minute is not None else routine.schedule_minute
+        if hour is None or minute is None:
+            return json_response(
+                ResponseCode.BAD_REQUEST,
+                "hour and minute are both required in daily mode",
+            )
+        if not (0 <= hour <= 23):
+            return json_response(ResponseCode.BAD_REQUEST, "hour must be 0-23")
+        if not (0 <= minute <= 59):
+            return json_response(ResponseCode.BAD_REQUEST, "minute must be 0-59")
+        if body.days is not None:
+            if not body.days or not all(0 <= d <= 6 for d in body.days):
+                return json_response(ResponseCode.BAD_REQUEST, "days must be array of 0-6 (Mon=0, Sun=6)")
+            days = body.days
+        elif routine.schedule_interval_minutes is None:
+            days = routine.schedule_days  # staying daily — keep the current days
+        # else: interval → daily with no days given means every day (None)
+
+    if body.status is not None and body.status not in ("active", "paused"):
+        return json_response(
+            ResponseCode.BAD_REQUEST,
+            "status must be 'active' or 'paused' (use DELETE to cancel)",
+        )
+
+    # ── Validate the owner edit ──
+    #
+    # Same membership check as creation: a routine fires under its source's
+    # identity, so reassigning one to an invented agent would be injection.
+    target_agent = None
+    if body.source is not None:
+        target_agent = _normalize_agent_name(body.source)
+        if not target_agent:
+            return json_response(ResponseCode.BAD_REQUEST, "source is required")
+        is_member = db.execute(
+            select(WorkspaceMember).where(
+                WorkspaceMember.workspace_id == workspace.id,
+                WorkspaceMember.agent_name == target_agent,
+            )
+        ).scalar_one_or_none()
+        if not is_member:
+            return json_response(
+                ResponseCode.FORBIDDEN,
+                f"source '{body.source}' is not a member of this workspace",
+            )
+
+    if body.source_channel is not None:
+        origin = db.execute(select(Channel).where(
+            Channel.workspace_id == str(workspace.id), Channel.name == body.source_channel,
+            Channel.status != "deleted",
+        )).scalar_one_or_none()
+        if not origin or origin.name.startswith(("routine:", "routines:")):
+            return json_response(ResponseCode.BAD_REQUEST, "Source conversation not found")
+        routine.source_channel_name = origin.name
+
+    # ── Apply ──
+    #
+    # A field being present doesn't mean it changed — the edit form resends
+    # everything it loaded on every save. Each one is compared against the
+    # stored value, so a rename isn't mistaken for a new schedule.
+
+    # What the fallback context reads for the routine as it is now, taken
+    # before anything is applied — it is how one is recognized further down.
+    previous_fallback = _fallback_context(
+        routine.name,
+        routine.message,
+        _describe_schedule(
+            routine.schedule_hour,
+            routine.schedule_minute,
+            routine.schedule_days,
+            routine.schedule_interval_minutes,
+        ),
+    )
+
+    name_changed = False
+    if body.name is not None:
+        name = body.name.strip()
+        if name and name != routine.name:
+            routine.name = name
+            name_changed = True
+
+    message_changed = False
+    if body.message is not None:
+        message = body.message.strip()
+        if message and message != routine.message:
+            routine.message = message
+            message_changed = True
+
+    if target_agent and target_agent != routine.created_by:
+        channel = _get_or_create_routine_channel(db, workspace, target_agent)
+        routine.created_by = target_agent
+        routine.channel_name = channel.name
+
+    # An interval routine's next tick is "now + interval", so re-arming on an
+    # unchanged interval would push the next fire a full interval out from
+    # every unrelated save.
+    schedule_changed = False
+    if wants_interval:
+        if body.interval_minutes != routine.schedule_interval_minutes:
+            routine.schedule_interval_minutes = body.interval_minutes
+            routine.schedule_hour = None
+            routine.schedule_minute = None
+            routine.schedule_days = None
+            schedule_changed = True
+    elif wants_daily:
+        if (
+            routine.schedule_interval_minutes is not None
+            or hour != routine.schedule_hour
+            or minute != routine.schedule_minute
+            or not _same_days(days, routine.schedule_days)
+        ):
+            routine.schedule_hour = hour
+            routine.schedule_minute = minute
+            routine.schedule_days = days
+            routine.schedule_interval_minutes = None
+            schedule_changed = True
+
+    resumed = body.status == "active" and routine.status != "active"
+    if body.status is not None:
+        routine.status = body.status
+
+    # The context is what the agent actually reads when the routine fires, so
+    # it can't keep describing the old task. An explicit context wins; a bare
+    # task edit regenerates it the same way creation does.
+    #
+    # A rename or a reschedule leaves the task alone, so a written context is
+    # kept — regenerating it from the name and the trigger message would throw
+    # away whatever detail its author put there. The fallback context is the
+    # exception: it spells the name and the schedule out, so it is re-rendered
+    # rather than left quoting the old ones.
+    schedule_desc = _describe_schedule(
+        routine.schedule_hour,
+        routine.schedule_minute,
+        routine.schedule_days,
+        routine.schedule_interval_minutes,
+    )
+    if body.context is not None:
+        routine.context = body.context
+    elif message_changed:
+        import asyncio
+        routine.context = await asyncio.to_thread(
+            _generate_routine_context_sync, routine.name, routine.message, schedule_desc,
+            body.conversation_history,
+        )
+    elif (name_changed or schedule_changed) and routine.context == previous_fallback:
+        routine.context = _fallback_context(routine.name, routine.message, schedule_desc)
+
+    # A pause leaves `next_fires_at` in the past, which would make a resumed
+    # routine fire the instant it comes back. Both a new schedule and a resume
+    # get a freshly computed next tick.
+    if schedule_changed or resumed:
+        routine.next_fires_at = _compute_next_fires_at(
+            routine.schedule_hour,
+            routine.schedule_minute,
+            routine.schedule_days,
+            routine.schedule_interval_minutes,
+        )
+
+    db.commit()
+    return success_response(_serialize_routine(routine))
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/routines/{routine_id}
+# ---------------------------------------------------------------------------
+
+@router.delete("/routines/{routine_id}")
+def cancel_routine(
+    routine_id: str = Path(...),
+    network: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Cancel a routine, active or paused."""
+    routine = db.execute(
+        select(RoutineRecord).where(RoutineRecord.id == routine_id)
+    ).scalar_one_or_none()
+    if not routine:
+        return json_response(ResponseCode.NOT_FOUND, "Routine not found")
+
+    workspace = db.execute(
+        select(Workspace).where(Workspace.id == routine.workspace_id)
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    # Only a second cancel is refused. A paused routine has to stay
+    # cancellable — pausing is not a way to make one undeletable.
+    if routine.status == "cancelled":
+        return json_response(ResponseCode.BAD_REQUEST, "Routine is already cancelled")
+
+    routine.status = "cancelled"
+    db.commit()
+
+    return success_response({"id": routine.id, "status": "cancelled"})
+
+
+@router.get("/routines/{routine_id}/runs")
+def list_routine_runs(
+    routine_id: str, network: str = Query(...), limit: int = Query(20, ge=1, le=50),
+    db: Session = Depends(get_db), x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    workspace = _resolve_workspace(db, network)
+    if not workspace or not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    routine = db.execute(select(RoutineRecord).where(RoutineRecord.id == routine_id, RoutineRecord.workspace_id == str(workspace.id))).scalar_one_or_none()
+    if not routine:
+        return json_response(ResponseCode.NOT_FOUND, "Routine not found")
+    from app.services.routine_activity import routine_runs
+    return success_response({"runs": routine_runs(db, routine, limit=limit)})
+
+
+@router.post("/routines/{routine_id}/run")
+def run_routine_now(
+    routine_id: str, network: str = Query(...), db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None), authorization: Optional[str] = Header(None),
+):
+    workspace = _resolve_workspace(db, network)
+    if not workspace or not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    routine = db.execute(select(RoutineRecord).where(RoutineRecord.id == routine_id, RoutineRecord.workspace_id == str(workspace.id)).with_for_update()).scalar_one_or_none()
+    if not routine:
+        return json_response(ResponseCode.NOT_FOUND, "Routine not found")
+    if routine.status != "active":
+        return json_response(ResponseCode.BAD_REQUEST, "Resume the routine before running it")
+    # Go through the scheduler's atomic claim and busy/backoff checks. Never
+    # bypass them by directly posting a second task into the agent's queue.
+    routine.next_fires_at = datetime.now(timezone.utc)
+    db.commit()
+    return success_response({"status": "queued"})

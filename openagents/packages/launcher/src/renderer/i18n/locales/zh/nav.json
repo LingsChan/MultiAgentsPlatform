@@ -1,0 +1,70 @@
+{
+  "items": {
+    "dashboard": {
+      "label": "连接智能体",
+      "short": "智能体",
+      "description": "安装、配置智能体，并把它们连接到工作区"
+    },
+    "install": {
+      "label": "智能体市场",
+      "description": "浏览、安装和更新智能体"
+    },
+    "agents": {
+      "label": "智能体",
+      "description": "第 2 步 · 创建智能体、设置 API 密钥、测试并连接"
+    },
+    "workspaces": {
+      "label": "本机连接的工作区",
+      "short": "工作区",
+      "description": "此电脑作为设备连接的工作区"
+    },
+    "chat": {
+      "label": "对话",
+      "description": "与本机已加入的工作区对话"
+    },
+    "connections": {
+      "label": "连接",
+      "description": "连接 GitHub、Slack 等外部平台"
+    },
+    "credentials": {
+      "label": "凭据",
+      "description": "在一处管理 API 密钥与机密信息"
+    },
+    "github": {
+      "label": "GitHub",
+      "description": "绑定仓库并查看 issue / PR"
+    },
+    "logs": {
+      "label": "日志",
+      "description": "查看运行时日志并排查问题"
+    },
+    "settings": {
+      "label": "设置",
+      "short": "设置",
+      "description": "应用设置与偏好"
+    }
+  },
+  "notifications": {
+    "tooltip": "通知",
+    "title": "通知",
+    "unread": "{{count}} 条未读",
+    "markAllRead": "全部标为已读",
+    "clear": "清空",
+    "empty": "暂无通知。"
+  },
+  "search": "搜索智能体、工作区…",
+  "themeToggle": "主题",
+  "modeLauncher": "此电脑",
+  "modeLauncherShort": "此电脑",
+  "modeWorkspace": "工作区",
+  "modeSwitch": "在此电脑与工作区之间切换",
+  "toggleSidebar": "展开或收起侧栏",
+  "agentsSummary": {
+    "running": "{{count}} 个智能体运行中",
+    "starting": "{{count}} 个智能体启动中",
+    "error": "{{count}} 个智能体异常",
+    "stopped": "智能体均未运行",
+    "none": "尚未添加智能体",
+    "connectorOff": "本地连接器已关闭"
+  }
+}

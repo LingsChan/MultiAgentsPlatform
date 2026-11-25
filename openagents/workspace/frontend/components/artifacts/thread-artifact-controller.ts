@@ -1,0 +1,52 @@
+'use client';
+import { useEffect, useRef } from 'react';
+import { useWorkspace } from '@/lib/workspace-context';
+import { useLayout } from '@/components/layout/layout-context';
+import { browserPreviewPreferenceKey, browserPreviewDismissed } from '@/lib/browser-preview-preference';
+import { workspaceApi } from '@/lib/api';
+import { ARTIFACT_OPEN_EVENT, artifactFromLink, type ArtifactReference } from '@/lib/thread-artifacts';
+
+/** Personal choices win; the owner's pin is only the first-visit default. */
+export function useThreadArtifactPreview() {
+  const { workspace, currentSessionId, currentUser, loading, files, browserTabs } = useWorkspace();
+  const { viewMode, openArtifact, hasSavedThreadView, applyThreadArtifactDefault } = useLayout();
+  const manual = useRef(0);
+  useEffect(() => {
+    if (loading || viewMode !== 'threads') return;
+    let active = true;
+    const revision = ++manual.current;
+    if (hasSavedThreadView) return;
+    if (currentSessionId && !currentSessionId.startsWith('dm:')) {
+      void workspaceApi.getThreadArtifact(currentSessionId).then(setting => {
+        if (!active || manual.current !== revision) return;
+        if (setting.artifact) {
+          if (setting.artifact.kind === 'browser' && browserPreviewDismissed(browserPreviewPreferenceKey(workspace?.workspaceId || '', currentUser.id, currentSessionId))) return;
+          applyThreadArtifactDefault(setting.artifact);
+        }
+        else if (setting.unavailable) applyThreadArtifactDefault(null, true);
+      }).catch(() => {});
+    }
+    return () => { active = false; };
+  }, [loading, workspace?.workspaceId, currentSessionId, currentUser.id, viewMode]); // setters are stable; manual selection must not reload defaults
+
+  // Agent browser activity is shown by the thread's compact live preview.
+  // The large artifact panel opens only for pinned or explicitly selected items.
+  useEffect(() => {
+    const show = (event: Event) => {
+      const artifact = (event as CustomEvent<ArtifactReference>).detail;
+      if (!artifact || !['file','knowledge','browser'].includes(artifact.kind) || !artifact.id) return;
+      ++manual.current; openArtifact(artifact);
+    };
+    const click = (event: MouseEvent) => {
+      if (viewMode !== 'threads' || event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      const anchor = (event.target as Element).closest?.('a[href]');
+      if (!(anchor instanceof HTMLAnchorElement) || !anchor.closest('[data-thread-conversation], [data-artifact-preview]')) return;
+      const artifact = artifactFromLink(anchor.getAttribute('href') || '', files, browserTabs, workspace?.slug || workspace?.workspaceId || '');
+      if (!artifact) return;
+      event.preventDefault(); event.stopPropagation(); ++manual.current; openArtifact(artifact);
+    };
+    window.addEventListener(ARTIFACT_OPEN_EVENT, show);
+    document.addEventListener('click', click, true);
+    return () => { window.removeEventListener(ARTIFACT_OPEN_EVENT, show); document.removeEventListener('click', click, true); };
+  }, [viewMode, files, browserTabs, workspace?.slug, workspace?.workspaceId, openArtifact]);
+}

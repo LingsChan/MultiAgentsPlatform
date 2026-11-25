@@ -1,0 +1,299 @@
+/**
+ * Direct LLM API adapter — shared base for NanoClaw and Cursor.
+ *
+ * Calls OpenAI-compatible chat completions API directly with SSE streaming.
+ * No CLI binary needed — just OPENAI_API_KEY + OPENAI_BASE_URL.
+ *
+ * Port of Python: sdk/src/openagents/adapters/nanoclaw.py & cursor.py
+ */
+
+'use strict';
+
+const https = require('https');
+const http = require('http');
+
+const BaseAdapter = require('./base');
+const { classifyRunFailure, classifiedError, isClassifiedError } = require('./run-failure');
+const { formatAttachmentsForPrompt } = require('./utils');
+const { buildOpenclawSystemPrompt } = require('./workspace-prompt');
+
+const MAX_HISTORY = 50;
+
+/**
+ * What a failed API call should tell the channel, per cause. `label` is the
+ * adapter's own name (NanoClaw, Cursor, …) so the message names the agent the
+ * user configured, not the base class. `keyVar` / `urlVar` are the settings
+ * that adapter actually reads — a Kimi agent is configured through KIMI_API_KEY,
+ * and telling its user to check OPENAI_API_KEY sends them looking for a
+ * setting they never made. The classifier appends what the API said,
+ * redacted; see run-failure.js.
+ */
+function directGuidance(label, keyVar = 'OPENAI_API_KEY', urlVar = 'OPENAI_BASE_URL') {
+  return {
+    auth:
+      `${label} could not authenticate with the model endpoint. Check ` +
+      `${keyVar} for this agent, and that the key belongs to the endpoint ` +
+      `in ${urlVar}.`,
+    quota:
+      'The endpoint is rate-limiting this agent, or its quota is exhausted. ' +
+      'Wait and try again, or use a key with more quota.',
+    network:
+      `${label} could not reach the model endpoint from this device. Check ` +
+      `the device's network, or its proxy, and ${urlVar}.`,
+    model:
+      'The endpoint rejected the requested model. Check the model configured ' +
+      'for this agent — a relay often serves different model names than the ' +
+      'provider it fronts.',
+    timeout: `${label} gave up waiting for the model endpoint to answer.`,
+  };
+}
+
+class LlmDirectAdapter extends BaseAdapter {
+  /**
+   * @param {object} opts - BaseAdapter opts plus:
+   * @param {Set} [opts.disabledModules]
+   * @param {string} opts.adapterLabel - e.g. "NanoClaw" or "Cursor"
+   * @param {string} opts.modelEnvVar - e.g. "NANOCLAW_MODEL" or "CURSOR_MODEL"
+   */
+  constructor(opts) {
+    super(opts);
+    this.disabledModules = opts.disabledModules || new Set();
+    // Pin the channel's glossary into the system prompt.
+    this._usesPinnedContext = true;
+    this._adapterLabel = opts.adapterLabel || 'LLM';
+    this._modelEnvVar = opts.modelEnvVar || '';
+    // The settings a failure message should point at; see directGuidance.
+    this._apiKeyEnvVar = opts.apiKeyEnvVar || 'OPENAI_API_KEY';
+    this._baseUrlEnvVar = opts.baseUrlEnvVar || 'OPENAI_BASE_URL';
+
+    const env = this.agentEnv || process.env;
+    this._apiKey = env.OPENAI_API_KEY || '';
+    this._baseUrl = (env.OPENAI_BASE_URL || '').replace(/\/$/, '');
+    this._model = env[this._modelEnvVar] || env.OPENCLAW_MODEL || '';
+    this._directMode = !!(this._apiKey && this._baseUrl);
+
+    if (!opts.suppressConfigLog) {
+      if (this._directMode) {
+        this._log(`Direct LLM mode: ${this._baseUrl} model=${this._model || 'gpt-4o'}`);
+      } else {
+        this._log(
+          `${this._adapterLabel} adapter started without direct API config. ` +
+          'Set OPENAI_API_KEY + OPENAI_BASE_URL for direct mode.'
+        );
+      }
+    }
+
+    this._conversationHistory = [];
+    this._activeRequests = new Set();
+  }
+
+  stop() {
+    super.stop();
+    for (const req of this._activeRequests) {
+      try { req.destroy(new Error('LLM API request stopped')); } catch {}
+    }
+    this._activeRequests.clear();
+  }
+
+  /**
+   * A stop ends this channel's open completion requests, and only those —
+   * the same agent may be answering in another thread. Subclasses that also
+   * run child processes (kimi) get those stopped by super.
+   */
+  async _stopChannelWork(channel) {
+    let aborted = 0;
+    for (const req of this._activeRequests) {
+      if (req._oaChannel !== channel) continue;
+      try { req.destroy(new Error('LLM API request stopped')); } catch {}
+      this._activeRequests.delete(req);
+      aborted++;
+    }
+    const processes = await super._stopChannelWork(channel);
+    return aborted && processes === 'idle' ? 'stopped' : processes;
+  }
+
+  /** The model this runner actually calls with — see `_model` above. */
+  modelLabel() {
+    return String(this.workspaceModel || this._model || '').trim() || null;
+  }
+
+  _buildSystemPrompt(channelName) {
+    return buildOpenclawSystemPrompt({
+      agentName: this.agentName,
+      workspaceId: this.workspaceId,
+      channelName,
+      endpoint: this.endpoint,
+      token: this.token,
+      mode: this._mode,
+      model: this.modelLabel(),
+      disabledModules: this.disabledModules,
+      ...this.pinnedPromptOpts(channelName),
+    });
+  }
+
+  async _handleMessage(msg) {
+    let content = (msg.content || '').trim();
+    const attachments = msg.attachments || [];
+
+    const attText = formatAttachmentsForPrompt(attachments);
+    if (attText) content = content ? content + attText : attText.trim();
+    if (!content) return;
+
+    const msgChannel = msg.sessionId || this.channelName;
+    const sender = msg.senderName || msg.senderType || 'user';
+    this._log(`Processing message from ${sender} in ${msgChannel}: ${content.slice(0, 80)}...`);
+
+    await this._autoTitleChannel(msgChannel, content);
+    await this.sendStatus(msgChannel, 'thinking...');
+
+    try {
+      if (!this._directMode) {
+        await this.sendError(
+          msgChannel,
+          `${this._adapterLabel} direct API mode not configured. Set OPENAI_API_KEY + OPENAI_BASE_URL.`
+        );
+        return;
+      }
+
+      // Stopped while this turn was being prepared: start nothing (no tokens).
+      if (this._stoppedBeforeStart(msgChannel)) return;
+      const responseText = await this._callCompletionApi(content, msgChannel);
+
+      if (responseText) {
+        this._conversationHistory.push({ role: 'user', content });
+        this._conversationHistory.push({ role: 'assistant', content: responseText });
+        if (this._conversationHistory.length > MAX_HISTORY * 2) {
+          this._conversationHistory = this._conversationHistory.slice(-MAX_HISTORY * 2);
+        }
+        await this.sendResponse(msgChannel, responseText);
+      } else {
+        await this.sendResponse(msgChannel, 'No response generated. Please try again.');
+      }
+    } catch (e) {
+      this._log(`Error handling message: ${e.message}`);
+      await this.sendError(
+        msgChannel,
+        isClassifiedError(e) ? e.message : `Error processing message: ${this._redact(e.message)}`,
+      );
+    }
+  }
+
+  /**
+   * Call OpenAI-compatible chat completions API with SSE streaming.
+   */
+  _callCompletionApi(userMessage, channel) {
+    const systemPrompt = this._buildSystemPrompt(channel);
+
+    const messages = [{ role: 'system', content: systemPrompt }];
+    messages.push(...this._conversationHistory);
+    messages.push({ role: 'user', content: userMessage });
+
+    const url = `${this._baseUrl}/chat/completions`;
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${this._apiKey}`,
+    };
+    const payload = JSON.stringify({
+      // The model picked in the workspace, which modelLabel() reports, wins.
+      model: this.modelLabel() || 'gpt-4o',
+      messages,
+      stream: true,
+    });
+
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+
+      const req = transport.request(url, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Length': Buffer.byteLength(payload) },
+        timeout: 300000,
+      }, (res) => {
+        const cleanup = () => this._activeRequests.delete(req);
+        if (res.statusCode !== 200) {
+          let body = '';
+          res.on('data', (c) => { body += c; });
+          res.on('end', () => {
+            cleanup();
+            // The body is the provider's own error, and providers put the key
+            // fragment they rejected in it — classify on the raw text, quote
+            // only the redacted one.
+            const failure = classifyRunFailure({
+              code: res.statusCode,
+              codeLabel: `HTTP ${res.statusCode}`,
+              error: `HTTP status ${res.statusCode} ${body}`,
+              cli: this._adapterLabel,
+              guidance: directGuidance(this._adapterLabel, this._apiKeyEnvVar, this._baseUrlEnvVar),
+              skip: ['session'],
+              secrets: this._knownSecrets(),
+            });
+            this._log(`API call failed (${failure.kind}, HTTP ${res.statusCode})`, 'error');
+            reject(classifiedError(failure.message));
+          });
+          return;
+        }
+
+        let fullText = '';
+        let lineBuf = '';
+
+        res.on('data', (chunk) => {
+          lineBuf += chunk.toString('utf-8');
+          const lines = lineBuf.split('\n');
+          lineBuf = lines.pop(); // keep incomplete line
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith('data: ')) continue;
+
+            const data = trimmed.slice(6);
+            if (data === '[DONE]') continue;
+
+            try {
+              const parsed = JSON.parse(data);
+              const choices = parsed.choices || [];
+              if (choices.length > 0) {
+                const delta = choices[0].delta || {};
+                if (delta.content) fullText += delta.content;
+              }
+            } catch {}
+          }
+        });
+
+        res.on('end', () => {
+          cleanup();
+          resolve(fullText.trim());
+        });
+      });
+
+      req._oaChannel = channel;
+      this._activeRequests.add(req);
+      req.on('error', (err) => {
+        this._activeRequests.delete(req);
+        // A stop destroys the request on purpose — that is not a failure to
+        // explain, and `_handleUserStop` has already told the channel.
+        if (this._stoppingChannels.has(channel)) {
+          reject(err);
+          return;
+        }
+        const failure = classifyRunFailure({
+          code: null,
+          codeLabel: 'connection failed',
+          error: err && err.message,
+          cli: this._adapterLabel,
+          guidance: directGuidance(this._adapterLabel, this._apiKeyEnvVar, this._baseUrlEnvVar),
+          skip: ['session'],
+          secrets: this._knownSecrets(),
+        });
+        this._log(`API call failed (${failure.kind}, no response)`, 'error');
+        reject(classifiedError(failure.message));
+      });
+      req.on('timeout', () => {
+        req.destroy(new Error('LLM API request timed out'));
+      });
+      req.write(payload);
+      req.end();
+    });
+  }
+}
+
+module.exports = LlmDirectAdapter;

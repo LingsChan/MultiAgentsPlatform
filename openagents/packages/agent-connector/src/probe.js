@@ -1,0 +1,1026 @@
+'use strict';
+
+/**
+ * Agent smoke test ("probe") — answers the question static health checks
+ * can't: does this agent actually produce a response on this device?
+ *
+ * healthCheck() proves a binary exists and credentials LOOK present; users
+ * still hit "No response generated", invalid-key errors, and silent hangs at
+ * message time. The probe closes that gap by running one tiny end-to-end
+ * prompt ("hi") the same way the adapter would, then classifying whatever
+ * came back into a machine code plus human guidance ("run `claude login` on
+ * the device", "the API key is invalid", ...).
+ *
+ * Tiering (cheapest thing that proves liveness):
+ *   1. healthCheck gate — not installed / not configured fails fast with the
+ *      existing auth guidance, no process spawned, no tokens spent. An agent
+ *      that declares a live CLI check still runs it: static sign-in checks
+ *      miss keychains and CLI-side settings, and the run is the authority.
+ *   2. Live check, picked from the registry entry:
+ *      - `probe.args`            → run the agent CLI itself (e.g. --print hi)
+ *      - `check_ready.alt_check` → run the entry's declared liveness command
+ *      - saved API key           → one direct LLM API call (testLLMConnection)
+ *      - none of the above       → report static checks only (never guess a
+ *        CLI invocation; a wrong flag would misreport a healthy agent).
+ *
+ * Results carry NO environment values. CLI output is truncated and scrubbed
+ * of anything key-shaped before it leaves this module.
+ */
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+// spawn() here is the WSL bridge from ./wsl: same signature as
+// child_process.spawn, and a straight pass-through unless the resolved CLI
+// lives on the other side of the Windows/WSL boundary.
+const { spawn } = require('./wsl');
+const { getEnhancedEnv } = require('./paths');
+const { shouldUseShellForBinary, REASON } = require('./adapters/health-status');
+const { decodeConsoleOutput, BENIGN_CLI_OUTPUT, CREDIT_EXHAUSTED, REGION_BLOCKED, stripCliNoise, redactSecrets } = require('./adapters/utils');
+const { formatAuthGuidance } = require('./auth-guidance');
+const { isCliLogin, stripForCliLogin, typeEnvFor } = require('./env');
+const { configuredModel } = require('./agent-model');
+const { codexPlanRefusedModel, codexAccountModels, codexPlanFallback } = require('./cli-models');
+
+const PROBE_PROMPT = 'hi';
+const DEFAULT_TIMEOUT_MS = 90_000;
+const OUTPUT_CAP = 400;      // max chars of CLI output kept for diagnostics
+const REPLY_CAP = 160;       // max chars of a successful reply echoed back
+
+/** Failure codes, ordered roughly by how actionable they are for the user. */
+const CODE = {
+  OK: 'ok',
+  STATIC_ONLY: 'static_only',
+  UNKNOWN_TYPE: 'unknown_type',
+  NOT_INSTALLED: 'not_installed',
+  NOT_READY: 'not_ready',
+  VERSION_INCOMPATIBLE: 'version_incompatible',
+  INVALID_API_KEY: 'invalid_api_key',
+  MISSING_API_KEY: 'missing_api_key',
+  NOT_LOGGED_IN: 'not_logged_in',
+  SESSION_EXPIRED: 'session_expired',
+  OUT_OF_CREDIT: 'out_of_credit',
+  RATE_LIMITED: 'rate_limited',
+  NETWORK: 'network',
+  TIMEOUT: 'timeout',
+  EMPTY_RESPONSE: 'empty_response',
+  BAD_MODEL: 'bad_model',
+  SERVICE_UNAVAILABLE: 'service_unavailable',
+  CLI_ERROR: 'cli_error',
+  INSTALL_INCOMPLETE: 'install_incomplete',
+  ENDPOINT_INCOMPATIBLE: 'endpoint_incompatible',
+  CLIENT_ONLY: 'client_only',
+  ACCOUNT_INELIGIBLE: 'account_ineligible',
+  REGION_BLOCKED: 'region_blocked',
+};
+
+const BENIGN_OUTPUT = BENIGN_CLI_OUTPUT;
+const withoutNoise = stripCliNoise;
+
+/**
+ * The install command for THIS device's platform.
+ *
+ * `entry.install_command` comes off the catalog API, which picks macOS → Linux
+ * → Windows with no idea who is asking — so a Windows user was told to fix a
+ * missing CLI by running a `curl … | bash` one-liner that cannot work there.
+ * The entry's own per-platform `install` block is the authority (same rule as
+ * Installer._getInstallCommand); the flat field stays as the fallback for
+ * catalog entries that carry nothing else.
+ */
+function installCommandFor(entry) {
+  const inst = (entry && entry.install) || {};
+  const plat = process.platform === 'darwin' ? 'macos'
+    : process.platform === 'win32' ? 'windows'
+      : 'linux';
+  return inst[plat] || inst.command || inst.npm || (entry && entry.install_command) || null;
+}
+
+/** Redact anything that looks like a secret before output leaves the device. */
+function scrub(text) {
+  if (!text) return '';
+  const masked = String(text)
+    .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-****')
+    // Not a plain word: "Incorrect API key provided: sk-…" lost "provided".
+    .replace(/(api[-_ ]?key["':\s=]+)([A-Za-z0-9_-]{8,})/gi, (m, p, v) => (/^[a-z]+$/.test(v) ? m : `${p}****`))
+    .replace(/Bearer\s+[A-Za-z0-9._-]{8,}/gi, 'Bearer ****');
+  // Then everything the adapters strip from quoted CLI text: a Codex probe
+  // that failed after printing a token-shaped blob showed that blob as its
+  // reason, on the device card in the workspace.
+  return redactSecrets(masked);
+}
+
+function tail(text, cap) {
+  const s = scrub(String(text || '').trim());
+  return s.length > cap ? '…' + s.slice(-cap) : s;
+}
+
+/**
+ * Whether this agent authenticates via API key (configured/expected) rather
+ * than a CLI login. Steers the wording for auth-flavored failures.
+ */
+function authFlavor(entry, agentEnv) {
+  const cr = (entry && entry.check_ready) || {};
+  const envCfg = (entry && entry.env_config) || [];
+  const hasKeyField = envCfg.some((f) => f && /key/i.test(f.name || ''));
+  // The type's own key names count too: a Kimi agent on KIMI_API_KEY whose
+  // key was rejected was told its sign-in had expired and to run kimi login.
+  const keyNames = [
+    'LLM_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', cr.saved_env_key,
+    ...(cr.env_vars || []).filter((k) => /_API_KEY$/.test(k)),
+    ...envCfg.filter((f) => f && f.password).map((f) => f.name),
+  ];
+  const hasSavedKey = !!agentEnv && keyNames.some((k) => k && agentEnv[k]);
+  if (hasSavedKey || (hasKeyField && !cr.login_command)) return 'api_key';
+  if (cr.login_command) return 'cli_login';
+  return hasKeyField ? 'api_key' : 'cli_login';
+}
+
+/**
+ * Classify a failed live check into a code. Pattern-matches the combined
+ * output; callers turn the code into guidance via buildGuidance().
+ */
+/** Classify an error by its OUTPUT TEXT alone; null when nothing matches. */
+function classifyOutputText(text) {
+  // npm left out the per-platform package holding the native build (codex:
+  // "Missing optional dependency @openai/codex-win32-x64"), or the package's
+  // placeholder is what ran. Reinstalling fixes it; read as a CLI error it
+  // was a stack trace with no next step.
+  if (/missing optional dependency|native binary not installed|postinstall (script )?(was|did) not run/.test(text)) return CODE.INSTALL_INCOMPLETE;
+  // Gemini CLI signed in with a personal Google account: Google ended that
+  // free Code Assist tier, and the CLI says "IneligibleTierError: This client
+  // is no longer supported for Gemini Code Assist for individuals". Read as a
+  // CLI error it told people to debug it in a terminal; signing in again does
+  // not help either. Ahead of the credit rule: the account record Gemini
+  // dumps before it can mention billing.
+  if (/ineligibletier|no longer supported for gemini code assist/.test(text)) return CODE.ACCOUNT_INELIGIBLE;
+  // Relays word this their own way and answer 403 rather than 402, so the
+  // English-and-402 pattern alone read "out of credit" as "bad credentials"
+  // — the one misreading that sends a user to re-authenticate a working key.
+  // new-api relays say "Insufficient user quota" (see CREDIT_EXHAUSTED).
+  // A plan's own cap reads the same way to the user: Claude Code's "You've
+  // hit your monthly spend limit", Codex's "You've hit your usage limit.
+  // Upgrade to Plus…", or a coding plan that lapsed ("does not have a valid
+  // AgentPlan subscription, or your subscription has expired"). Each was
+  // reported as an unknown CLI error.
+  if (CREDIT_EXHAUSTED.test(text) || /credit balance|\b402\b|billing|quota[_ ]?exceeded|exceeded your current quota|额度|余额/.test(text)
+    || /\bspend(?:ing)? limit\b|hit your (?:[a-z]+ )?usage limit|subscription (?:has )?expired|(?:does not|doesn't) have an? (?:valid|active) [\w -]{0,24}subscription/.test(text)) return CODE.OUT_OF_CREDIT;
+  if (/rate[- ]?limit|too many requests|\b429\b|overloaded|\b529\b/.test(text)) return CODE.RATE_LIMITED;
+  // Ahead of the 403 rule below (see REGION_BLOCKED).
+  if (REGION_BLOCKED.test(text)) return CODE.REGION_BLOCKED;
+  // "error sending request for url (…)" is how Codex (Rust) says the host
+  // was unreachable; a Codex that could not reach chatgpt.com ran out the
+  // probe clock and was reported as waiting for interactive input. "Request
+  // to <host> timed out" is the direct API test's own deadline (utils.js).
+  // Codex (Rust) also says "Connection failed", "stream disconnected before
+  // completion" or, refreshing its model list, "failed to refresh available
+  // models: request timed out" — on a device that cannot reach chatgpt.com
+  // that was all the probe saw before its clock ran out, and it was reported
+  // as a CLI waiting for a login prompt. With no route at all it prints
+  // "Reconnecting... waiting for network" until the clock runs out.
+  if (/enotfound|econnrefused|econnreset|etimedout|eai_again|fetch failed|socket hang up|network error|error sending request|request to \S+ timed out|self[- ]signed certificate|unable to get local issuer|connection failed|stream disconnected before completion|failed to lookup address|dns error|tls handshake|failed to refresh available models: request timed out|reconnecting\.{3} waiting for network/.test(text)) return CODE.NETWORK;
+  if (/api key.{0,24}(not set|not found|missing)|no api key|missing api key|environment variable.{0,40}(is )?(not set|required)/.test(text)) return CODE.MISSING_API_KEY;
+  // Codex with no sign-in at all sends no credential: "401 Unauthorized:
+  // Missing bearer … authentication", or for a ChatGPT workspace "workspace
+  // routing discovery unauthorized (401)". Nothing to re-enter, a sign-in.
+  if (/missing bearer|workspace routing discovery unauthorized/.test(text)) return CODE.NOT_LOGGED_IN;
+  // "Invalid credential" (singular) and "This API key has expired" (or
+  // api_key_expired) are how OpenCode's providers say it; both read as
+  // "undetermined".
+  if (/invalid.{0,12}(api.?key|x-api-key|token)|incorrect api key|authentication[_ ]?error|invalid credentials?\b|api[ _-]?key.{0,20}expired|\b401\b|unauthorized|forbidden|\b403\b/.test(text)) return CODE.INVALID_API_KEY;
+  // A sign-in that exists but has run out — Claude Code: "Failed to
+  // authenticate: OAuth session expired and could not be refreshed", or "this
+  // login reached its time limit and cannot be renewed".
+  if (/session expired|could not be refreshed|login reached its time limit|login .{0,30}cannot be renewed|(token|sign-?in|login) (has )?expired|run \/logout and \/login/.test(text)) return CODE.SESSION_EXPIRED;
+  if (/not logged in|not authenticated|login required|authentication required|please (log ?in|sign ?in|authenticate)|(run|use) .{0,40}login|no credentials/.test(text)) return CODE.NOT_LOGGED_IN;
+  // "Model 'x' is not available. This gateway only allows: …" is how the
+  // OpenAgents gateway refuses a model; read as a CLI error it sent people to
+  // a terminal to debug a model name.
+  // Relays also retire a model: "模型 gpt-5.6-sol 已下线，请改用 …", "该模型已下线",
+  // "The model gpt-5.6-sol has been retired", behind a 404. The English form
+  // wants an id with a digit in it, so "the model provider has been removed"
+  // stays a provider error.
+  if (/模型.{0,40}已下线|the model [\w.:/-]*\d[\w.:/-]* has been (?:retired|discontinued|removed)|unrecognized_model|model_not_found|invalid model|no such model|model must be a (?:valid )?model id|issue with the selected model|unknown model|model.{0,40}(does not exist|not found|not exist|is not supported|is not available)/.test(text)) return CODE.BAD_MODEL;
+  if (/\b50[234]\b|service (is )?(temporarily )?unavailable|temporarily unavailable|bad gateway|gateway time-?out/.test(text)) return CODE.SERVICE_UNAVAILABLE;
+  return null;
+}
+
+function classifyFailure(output, { timedOut = false, spawnError = null } = {}) {
+  if (spawnError && /ENOENT/.test(String(spawnError))) return CODE.NOT_INSTALLED;
+  // Notices (see PROBE_NOISE) never decide the verdict: Claude Code's "this
+  // sign-in ends between …, run claude auth login before then" read as
+  // "not logged in" on a sign-in that still worked.
+  const text = withoutProbeNotices(output).toLowerCase();
+  // Codex retrying its model stream says only "ERROR: Reconnecting... 5/5":
+  // the connection to the model kept dropping, not a prompt waiting for input
+  // or an unknown CLI error. Only when nothing else is named, so a reason it
+  // gives wins.
+  const reconnecting = /reconnecting\.{3} \d+\/\d+/.test(text);
+  if (timedOut) {
+    // A CLI that retries a hard API error (bad key, unknown model, quota)
+    // until the probe clock runs out is NOT "waiting for interactive input" —
+    // the collected output already names the real problem. Only an output
+    // with no recognizable error is a genuine timeout.
+    return (text && classifyOutputText(text)) || (reconnecting ? CODE.NETWORK : CODE.TIMEOUT);
+  }
+  if (!text && spawnError) return CODE.CLI_ERROR;
+  return classifyOutputText(text) || (reconnecting ? CODE.NETWORK : CODE.CLI_ERROR);
+}
+
+/** Human next-steps for a code. Plain strings, no markup, no secrets. */
+function buildGuidance(code, entry, agentEnv, extra = {}) {
+  const label = (entry && (entry.label || entry.name)) || 'This agent';
+  const type = (entry && entry.name) || 'agent';
+  const login = entry && entry.check_ready && entry.check_ready.login_command;
+  const flavor = authFlavor(entry, agentEnv);
+  const lines = [];
+  switch (code) {
+    case CODE.NOT_INSTALLED:
+      lines.push(`${label} is not installed on this device. Install it from the launcher's Install page.`);
+      {
+        const cmd = installCommandFor(entry);
+        if (cmd) lines.push(`Or install manually: ${cmd}`);
+      }
+      break;
+    case CODE.INVALID_API_KEY:
+    case CODE.MISSING_API_KEY:
+      if (flavor === 'cli_login' && login) {
+        lines.push(`${label}'s sign-in looks invalid or expired. On the device, run: ${login}`);
+      } else {
+        lines.push(code === CODE.MISSING_API_KEY
+          ? `${label} has no API key configured. Add one in the launcher (Agents → ${label} → Configure) or edit the agent in the workspace and enter a key.`
+          : `${label}'s API key was rejected by the provider. Replace it in the launcher (Agents → ${label} → Configure) or edit the agent in the workspace.`);
+        lines.push(`To verify a key on the device: agn test-llm ${type}`);
+      }
+      break;
+    case CODE.NOT_LOGGED_IN:
+      lines.push(login
+        ? `${label} is not signed in on this device. In a terminal there, run: ${login}`
+        : `${label} is not signed in on this device. Sign in with its CLI, then re-run the test.`);
+      break;
+    case CODE.SESSION_EXPIRED:
+      lines.push(login
+        ? `${label}'s sign-in on this device has expired. In a terminal there, run: ${login}`
+        : `${label}'s sign-in on this device has expired. Sign in again with its CLI, then re-run the test.`);
+      break;
+    case CODE.OUT_OF_CREDIT:
+      lines.push(`The provider account for ${label} is out of credit, or has reached its plan's usage limit. Add credit or wait for the limit to reset (the provider's message says when), or switch the agent to a different API key or model.`);
+      break;
+    case CODE.RATE_LIMITED:
+      lines.push(`The provider is rate-limiting ${label}. Wait a few minutes and test again.`);
+      break;
+    case CODE.NETWORK:
+      lines.push(`The device could not reach the model provider. Check the device's network, proxy, and firewall, then test again.`);
+      break;
+    case CODE.TIMEOUT:
+      lines.push(`${label} did not answer within ${Math.round((extra.timeoutMs || DEFAULT_TIMEOUT_MS) / 1000)}s. It may be waiting for interactive input (a first-run consent or login prompt).`);
+      lines.push(`On the device, run the agent's CLI once in a terminal to clear any prompt, then test again.`);
+      break;
+    case CODE.EMPTY_RESPONSE:
+      lines.push(`${label} exited without producing a response. Run its CLI manually on the device to see what it prints.`);
+      break;
+    case CODE.BAD_MODEL:
+      lines.push(`The configured model isn't recognized or isn't served by ${label}'s endpoint. Pick a different model in the launcher (Agents → ${label} → Configure) or edit the agent in the workspace.`);
+      break;
+    case CODE.SERVICE_UNAVAILABLE:
+      lines.push(`The model provider for ${label} is temporarily unavailable. Wait a few minutes and test again.`);
+      break;
+    case CODE.ACCOUNT_INELIGIBLE:
+      lines.push(`Google no longer serves ${label} to personal Google accounts (the free Gemini Code Assist for individuals tier), so signing in again will not help.`);
+      lines.push(`Set GEMINI_API_KEY for this agent (a key from Google AI Studio) in the launcher (Agents → ${label} → Configure), or switch to the Antigravity agent. With a Gemini Code Assist license, sign in with that account instead.`);
+      break;
+    case CODE.REGION_BLOCKED:
+      lines.push(`The model provider refused requests from this device's network, usually because it does not serve this region. Your key or sign-in was not the problem.`);
+      lines.push(`Route ${label} through a proxy in a supported region (HTTPS_PROXY), or point the agent at a different endpoint.`);
+      break;
+    case CODE.ENDPOINT_INCOMPATIBLE:
+      lines.push(`${label}'s endpoint takes Responses API requests but refuses ${extra.param ? `the "${extra.param}" field` : 'a field'} that ${label} sends with every one of them, so every run fails there. ${label} has no setting to leave it out.`);
+      lines.push(type === 'codex'
+        ? 'Point the agent at an endpoint that supports the full Responses API, or edit the agent and set Agent capabilities to "Chat only · Chat Completions API" (it then answers without running tools on the device).'
+        : 'Point the agent at an endpoint that supports the full Responses API.');
+      break;
+    case CODE.INSTALL_INCOMPLETE:
+      lines.push(`${label} is installed, but not completely: the part that holds its native program for this computer is missing (npm can leave it out without failing the install). Reinstall ${label} from the launcher's Install page.`);
+      {
+        const cmd = installCommandFor(entry);
+        if (cmd) lines.push(`Or reinstall manually: ${cmd}`);
+      }
+      break;
+    case CODE.VERSION_INCOMPATIBLE:
+      lines.push(`The installed ${label} version is not the one OpenAgents supports. Reinstall it from the launcher's Install page.`);
+      {
+        const cmd = installCommandFor(entry);
+        if (cmd) lines.push(`Or reinstall manually: ${cmd}`);
+      }
+      break;
+    case CODE.NOT_READY:
+      // Caller supplies the static-auth guidance lines instead.
+      break;
+    default:
+      lines.push(`${label} failed to respond. Run its CLI manually on the device to inspect the error.`);
+      break;
+  }
+  return lines;
+}
+
+/**
+ * Ask the model endpoint directly why an agent is not answering.
+ *
+ * Only ever used to REPLACE a verdict that explains nothing, and only when it
+ * can do better: a successful call means the endpoint is healthy and whatever
+ * ails the CLI is the CLI's own, which the caller's vaguer answer already says
+ * more honestly than "everything is fine" would. Likewise an unclassifiable
+ * error — swapping one shrug for another helps nobody.
+ */
+async function directApiVerdict(agentEnv, entry, model, baseUrl, protocol) {
+  const res = await callLLM(agentEnv, model, baseUrl, protocol);
+  if (!res || res.success) return null;
+  // The endpoint turned the test away for not being the agent's CLI; that
+  // says nothing about the CLI's own run.
+  if (clientOnlyRefusal(res.error)) return null;
+  const code = directFailureCode(res.error, protocol);
+  if (code === CODE.CLI_ERROR) return null;
+  return {
+    ok: false,
+    method: 'llm_api',
+    code,
+    message: tail(res.error, OUTPUT_CAP),
+    guidance: buildGuidance(code, entry, agentEnv, { param: refusedParam(res.error) }),
+  };
+}
+
+/**
+ * Where a direct test must call for the key the agent holds. The client reads
+ * LLM_BASE_URL, OPENAI_BASE_URL and KIMI_BASE_URL, else calls OpenAI (or
+ * Anthropic, Moonshot): right for a key of theirs, wrong for a type that
+ * takes the generic key under a name of its own (DEEPSEEK_API_KEY,
+ * PI_API_KEY) and keeps its endpoint under one too. A DeepSeek key with no
+ * endpoint set went to OpenAI and came back "invalid key" from an agent that
+ * works. Returns that endpoint; undefined to leave it to the client; null
+ * when none is known, and there is nothing worth calling.
+ */
+function directBaseUrl(entry, env) {
+  if (!env.LLM_API_KEY || env.LLM_BASE_URL) return undefined;
+  const rules = (entry && entry.resolve_env && entry.resolve_env.rules) || [];
+  const keyTo = rules.filter((r) => r && r.from === 'LLM_API_KEY' && r.to).map((r) => r.to);
+  if (!keyTo.length || keyTo.some((k) => /^(OPENAI|ANTHROPIC|KIMI|MOONSHOT)_/.test(k))) return undefined;
+  const own = [
+    ...rules.filter((r) => r && r.from === 'LLM_BASE_URL' && r.to).map((r) => r.to),
+    ...((entry && entry.env_config) || []).map((f) => f && f.name).filter((n) => n && /(BASE_URL|API_BASE)$/.test(n)),
+  ];
+  const found = own.find((k) => String(env[k] || '').trim());
+  return found ? String(env[found]).trim() : null;
+}
+
+/**
+ * The API a direct test must speak, where the agent's own config names it
+ * rather than its endpoint or key: 'anthropic' or 'openai'; undefined to
+ * leave it to the client; null for a format the test does not speak. A Pi
+ * agent on anthropic-messages behind a relay whose host says nothing was
+ * sent /chat/completions and reported broken.
+ */
+function directProtocol(type, env) {
+  // A Codex agent on a third-party endpoint in Responses mode runs the CLI
+  // against <base>/responses (adapters/codex.js); a chat/completions test
+  // passed for endpoints that then refused every run.
+  if (type === 'codex') return codexResponsesMode(env) ? 'responses' : undefined;
+  if (type === 'deepseek') {
+    // dsh calls a gateway in the format its URL says (see classifyDshEndpoint);
+    // DeepSeek's own host is left to the client, which knows it.
+    const { classifyDshEndpoint } = require('./adapters/deepseek-runtime');
+    const api = classifyDshEndpoint(env.DEEPSEEK_BASE_URL || env.LLM_BASE_URL);
+    return api === 'native' ? undefined : api;
+  }
+  if (type !== 'pi') return undefined;
+  const { piApiFormat } = require('./adapters/pi-stream');
+  const format = piApiFormat(env);
+  if (!format) return undefined;
+  if (format === 'anthropic-messages') return 'anthropic';
+  if (format === 'openai-completions') return 'openai';
+  return null;
+}
+
+/** Whether a Codex agent runs the CLI on a custom Responses provider (as adapters/codex.js decides it). */
+function codexResponsesMode(env) {
+  if (String(env.CODEX_WIRE_API || '').toLowerCase() !== 'responses') return false;
+  const base = String(env.OPENAI_BASE_URL || env.LLM_BASE_URL || '').trim();
+  return !!base && !base.includes('api.openai.com');
+}
+
+// The Responses test sends what the Codex CLI sends (utils.js). An endpoint
+// that refuses one of those fields will refuse every Codex turn: that is not
+// a bad key or a bad model. Only read so for that test — the chat test's own
+// fields (max_completion_tokens) are not the agent's.
+const RESPONSES_PARAM_REFUSED = /unsupported .{0,40}parameter|unsupported_parameter|unknown parameter|unrecognized request argument|unrecognized (key|field)|additional properties|extra (inputs|fields) are not permitted/i;
+
+// The one field the Responses test adds that the CLI never sends (utils.js
+// asks again without it when it is refused). A refusal of it is about the
+// test, not about every Codex turn.
+const RESPONSES_PROBE_ONLY = 'max_output_tokens';
+
+/** The code for a failed direct test: the general reading, or the Responses-only one above. */
+function directFailureCode(error, protocol) {
+  const text = String(error || '');
+  if (protocol === 'responses' && RESPONSES_PARAM_REFUSED.test(text) && !/with this model|reasoning[._]/i.test(text)) {
+    // The field the refusal names, or — when it names none — its text.
+    const param = refusedParam(text);
+    const probeOnly = param ? param === RESPONSES_PROBE_ONLY : text.includes(RESPONSES_PROBE_ONLY);
+    if (!probeOnly) return CODE.ENDPOINT_INCOMPATIBLE;
+  }
+  return classifyFailure(error, {});
+}
+
+/**
+ * A relay that serves only the coding CLIs it recognises, and refused the
+ * direct test for not being one: `HTTP 403: {"error":{"code":
+ * "client_not_allowed","message":"本站仅支持编程客户端使用：Codex、Claude Code、
+ * OpenCode、…"}}`. Read as any 403, it came back "invalid API key" — eight
+ * times in a minute for one OpenCode agent on the daily errors dashboard of
+ * 2026-11-18 — for a key the CLI itself may well be let through with. Only
+ * these words: an English "only allows authorized clients" is as likely a
+ * key refused for real.
+ */
+const CLIENT_ONLY_REFUSAL = /client_not_allowed|仅支持[^。.\n]{0,24}客户端/i;
+
+/** The start of a refusal, where its code and reason are, scrubbed and capped. */
+function head(text, cap) {
+  const s = scrub(String(text || '').trim());
+  return s.length > cap ? `${s.slice(0, cap)}…` : s;
+}
+
+function clientOnlyRefusal(error) {
+  return CLIENT_ONLY_REFUSAL.test(String(error || ''));
+}
+
+/** The field a refusing endpoint named (`"param":"client_metadata"`), or ''. */
+function refusedParam(error) {
+  const m = /"param"\s*:\s*"([^"]{1,64})"/.exec(String(error || ''));
+  return m ? m[1] : '';
+}
+
+/**
+ * One direct call to the agent's endpoint, on the model the agent runs on.
+ * Never rejects.
+ */
+async function callLLM(agentEnv, model, baseUrl, protocol) {
+  // Required here rather than at the top so a test can stand in for it, and
+  // so a probe that never reaches this path never loads the HTTP client.
+  const { testLLMConnection } = require('./utils');
+  try {
+    return await testLLMConnection(agentEnv, { model, ...(baseUrl ? { baseUrl } : {}), ...(protocol ? { protocol } : {}) });
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Stop a CLI that ran too long. On Windows a .cmd shim runs under cmd.exe, and
+ * killing that leaves the node process it started alive (see cli-models.js).
+ */
+function killTree(child) {
+  if (process.platform === 'win32' && child.pid) {
+    try {
+      const killer = spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true, stdio: 'ignore' });
+      if (killer && typeof killer.on === 'function') killer.on('error', () => {});
+    } catch {}
+  }
+  try { child.kill('SIGKILL'); } catch {}
+}
+
+/**
+ * A resolved binary as cmd.exe must see it. Node hands a shell: true spawn to
+ * cmd.exe as one unquoted line, so a CLI under "F:\Program Files\…" or a
+ * profile folder with a space in it was cut at the space and the probe read
+ * "'F:\Program' is not recognized" (in GBK, as mojibake).
+ */
+function shellQuoted(binary, shell) {
+  return shell && !/^".*"$/.test(binary) ? `"${binary}"` : binary;
+}
+
+/**
+ * Whether a line is an encoded blob rather than words. A whole-line run of
+ * base64/base64url characters is one; so is a line where mixed-case
+ * alphanumeric runs (and already-redacted spans) make up half of it — a
+ * Codex timeout reported a fragment of a dumped object, `…849-1.0.1.
+ * [REDACTED]\",md: '3P2K.…`, as its reason. Hex ids, paths and URL paths
+ * have no mixed-case runs and are not counted.
+ */
+function mostlyEncoded(line) {
+  if (/^[A-Za-z0-9+/=._-]{24,}$/.test(line)) return true;
+  const body = line.replace(/\s+/g, '');
+  const unredacted = line.replace(/\[REDACTED\]/g, '');
+  let encoded = line.length - unredacted.length;
+  for (const run of unredacted.match(/[A-Za-z0-9+/=_.-]{16,}/g) || []) {
+    if (/\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run)) encoded += run.length;
+  }
+  return encoded * 2 >= body.length;
+}
+
+/**
+ * Lines a CLI prints on a run that say nothing about why it failed, so a
+ * failed test never quotes them as the reason, and the classifier never reads
+ * them. Each was quoted as the reason on the daily errors dashboard:
+ * - the `codex exec` banner (version, workdir, model, sandbox, session id)
+ *   and its echo of the prompt;
+ * - Codex's notices about the user's own config.toml (settings it ignores,
+ *   under-development features, a skill file it could not load);
+ * - Gemini's "Ripgrep is not available" and duplicate-skill notices;
+ * - Claude Code's untrusted-folder permissions notice, and its "this sign-in
+ *   ends between …" reminder, which read as "not logged in" though the
+ *   sign-in still worked.
+ */
+const PROBE_NOISE = new RegExp([
+  /^OpenAI Codex v\d/,
+  /^-{4,}$/,
+  /^(workdir|model|provider|approval|sandbox|reasoning effort|reasoning summaries|session id): \S+$/,
+  /^(user|hi)$/,
+  /^hook: /,
+  /^mcp startup:/,
+  /^warning: Codex is ignoring \d+ unrecognized configuration setting/i,
+  /^(user|project|session-flags)\b.*: `[^`]+` is ignored\.?$/,
+  /Under-development features (enabled|are incomplete)/,
+  /\bfailed to load skill\b/,
+  /^warning: Codex could not find bubblewrap/i,
+  /^WARNING: proceeding, even though we could not create PATH aliases/,
+  /^Ripgrep is not available/,
+  /is overriding the same skill from/,
+  /^Ignoring \d+ permissions\.\w+ entries/,
+  /^Warning: this sign-in ends between/,
+  // Newer Claude Code: "this sign-in can end at any time from now until
+  // 2026-11-25 … Run claude auth login now" (daily errors dashboard, 2026-11-23).
+  /^Warning: this sign-in can end at any time\b/,
+].map((r) => r.source).join('|'), 'i');
+
+/**
+ * Codex prefixes a failed WebSocket attempt's reason with this notice ("…
+ * transport. unexpected status 401 Unauthorized: Missing bearer …"); the
+ * reason after it is what matters.
+ */
+const CODEX_WS_FALLBACK = /^\s*warning: Falling back from WebSockets to HTTPS transport\.\s*/i;
+
+/** One line of CLI output with the notices above taken off; '' when it was only notice. */
+function probeLine(line) {
+  const l = String(line).replace(CODEX_WS_FALLBACK, '').trim();
+  return l && !PROBE_NOISE.test(l) ? l : '';
+}
+
+/** CLI output without the notices above. */
+function withoutProbeNotices(text) {
+  return String(text || '').split(/\r?\n/).map(probeLine).filter(Boolean).join('\n');
+}
+
+/** CLI output without the known-harmless lines (shared and probe-only). */
+function withoutProbeNoise(text) {
+  return withoutProbeNotices(withoutNoise(text));
+}
+
+/** A line that reads as the error itself, when the classifier knows none. */
+const ERRORISH = /\b(error|fatal|failed|failure|denied|refused|unauthorized|forbidden|not supported|no longer supported|invalid|exception)\b/i;
+
+/**
+ * The one line worth reporting from a failed run.
+ *
+ * Stderr used to win outright, so a harmless warning there hid the real error
+ * on stdout, and a timeout with any output never said it timed out. Now: the
+ * line that the classifier recognised, else the output minus known noise,
+ * with the timeout named first.
+ */
+function failureMessage(res, code, timeoutMs) {
+  // A line that is mostly encoded blob (a token, encrypted reasoning) never
+  // says why the CLI failed, and neither does a stack frame: a crashed Node
+  // shim showed only its last frames, `…(file:///C:/…/codex.js:108:9) at
+  // file:///…`, with the `Error:` line above them cut off. JSON and URLs stay.
+  // Each line is scrubbed before that test: a provider that echoes the whole
+  // key (`401 Incorrect API key provided: sk-proj-…`) had the one line that
+  // explains the failure dropped as encoded.
+  //
+  // A CLI's own log records (`2026-11-08T05:37:58Z ERROR module: …`) are kept,
+  // shorn of the timestamp, but rank after what it said in plain words. Codex's
+  // built-in ChatGPT connector (`rmcp::…`) is left out altogether: its lines
+  // are about that side service, and they were quoted as the reason a Codex
+  // probe failed in place of the model-list error underneath them. Only when
+  // nothing else was said do they stand, rather than no reason at all.
+  const LOG_RECORD = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z?\s+(?=(TRACE|DEBUG|INFO|WARN|ERROR)\s)/;
+  const SIDE_SERVICE = /\brmcp::|\bcodex_mcp::/;
+  // `codex exec` opens with a banner (version, workdir, model, sandbox,
+  // session id) and echoes the prompt. On a probe that timed out with nothing
+  // else said, that banner was quoted as the reason — "Timed out after 120s:
+  // OpenAI Codex v0.165.0 -------- workdir: …" — which explains nothing.
+  // Noise lines (see PROBE_NOISE) are dropped as well.
+  const grouped = (s) => {
+    const said = String(s || '').split(/\r?\n/).map((l) => scrub(probeLine(l)))
+      .filter((l) => l && !BENIGN_OUTPUT.test(l) && !mostlyEncoded(l) && !/^at\s+\S/.test(l));
+    const own = said.filter((l) => !SIDE_SERVICE.test(l));
+    const kept = own.length ? own : said;
+    const plain = kept.filter((l) => !LOG_RECORD.test(l));
+    const logged = kept.filter((l) => LOG_RECORD.test(l)).map((l) => l.replace(LOG_RECORD, ''));
+    return { plain, logged };
+  };
+  const lines = (s) => { const g = grouped(s); return [...g.plain, ...g.logged]; };
+  const all = [...lines(res.stderr), ...lines(res.stdout)];
+  const telling = all.find((l) => classifyOutputText(l.toLowerCase()) === code);
+  // Nothing the classifier knows: the last line that reads as an error, not
+  // the tail of everything. Gemini dumps its account record before
+  // "IneligibleTierError: This client is no longer supported…", and the tail
+  // began mid-dump.
+  // Plain words rank ahead of log records here too.
+  const lastErrorish = (ls) => [...ls].reverse().find((l) => ERRORISH.test(l));
+  const errorish = (s) => { const g = grouped(s); return lastErrorish(g.plain) || lastErrorish(g.logged); };
+  const fallback = errorish(res.stderr) || errorish(res.stdout)
+    || lines(res.stderr).join('\n') || lines(res.stdout).join('\n');
+  const detail = tail(telling || fallback, OUTPUT_CAP);
+  if (res.timedOut) {
+    const prefix = `Timed out after ${Math.round(timeoutMs / 1000)}s`;
+    return detail ? `${prefix}: ${detail}` : prefix;
+  }
+  if (detail) return detail;
+  // "Exited with code 0" said only that the CLI finished.
+  return res.code === 0 ? 'The CLI finished without replying' : `Exited with code ${res.code}`;
+}
+
+/** A model id safe to pass on a command line, through a Windows shell too. */
+const CODEX_MODEL_ARG = /^[\w.:@/-]{1,128}$/;
+
+/**
+ * Codex's probe run, cut down to the one question it asks.
+ *
+ * `codex exec hi` starts everything the user's ~/.codex/config.toml sets up
+ * before it sends "hi": every MCP server (a Figma connector whose host does
+ * not answer), every hook, and the built-in ChatGPT apps connector. On a slow
+ * or blocked network those alone ran the 120s probe clock out, and the test
+ * reported Codex broken when sign-in and model were fine. The real chat run
+ * still loads all of it; only the probe leaves it out.
+ *
+ * Only `-c` overrides, never newer flags: an older Codex rejects a flag it
+ * does not know, but ignores (with a warning) a feature it does not know.
+ * Server names are taken from the `[mcp_servers.<name>]` tables and only
+ * bare names are used, so nothing needs quoting through a Windows shell.
+ */
+function codexProbeArgs(args, env = {}, model = null) {
+  if (!Array.isArray(args) || args[0] !== 'exec') return args;
+  const home = env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  let text = '';
+  try { text = fs.readFileSync(path.join(home, 'config.toml'), 'utf8'); } catch {}
+  const names = new Set();
+  for (const m of text.matchAll(/^[ \t]*\[[ \t]*mcp_servers\.([A-Za-z0-9_-]+)[ \t]*[.\]]/gm)) names.add(m[1]);
+  const extra = ['-c', 'features.hooks=false', '-c', 'features.apps=false'];
+  for (const name of names) extra.push('-c', `mcp_servers.${name}.enabled=false`);
+  // The model the agent's chat runs on (the adapter passes `-m`). Without it
+  // the test ran Codex's own default: an agent set to gpt-5.6-luna failed
+  // its test on gpt-6.1-sol, which its ChatGPT plan does not include.
+  if (model && CODEX_MODEL_ARG.test(model)) extra.push('-m', model);
+  // After the subcommand: `codex exec -c … hi`.
+  return [args[0], ...extra, ...args.slice(1)];
+}
+
+/** Run a CLI to completion with a hard timeout. Never rejects. */
+function runCommand(cmd, args, { env, timeoutMs, shell = false }) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        env,
+        cwd: os.homedir(),
+        shell,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      resolve({ code: 1, stdout: '', stderr: '', spawnError: e.message, timedOut: false });
+      return;
+    }
+    // Bytes, decoded once at the end: a multi-byte character can straddle two
+    // chunks, and cmd.exe's own errors are in the console code page.
+    const stdout = [];
+    const stderr = [];
+    let timedOut = false;
+    let settled = false;
+    const finish = (code, spawnError) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        code,
+        stdout: decodeConsoleOutput(Buffer.concat(stdout)),
+        stderr: decodeConsoleOutput(Buffer.concat(stderr)),
+        spawnError: spawnError || null,
+        timedOut,
+      });
+    };
+    // Settles here and not on 'close' alone: a grandchild that survives the
+    // kill can hold stdout open, and 'close' then never comes.
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child);
+      finish(1);
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { stdout.push(Buffer.from(d)); });
+    child.stderr.on('data', (d) => { stderr.push(Buffer.from(d)); });
+    child.on('error', (e) => finish(1, e.message));
+    child.on('close', (code) => finish(code == null ? 1 : code));
+  });
+}
+
+/**
+ * Smoke-test one agent type end to end. Returns a result object; never throws.
+ *
+ * @param {object} connector AgentConnector (registry/installer/env access)
+ * @param {string} type      agent type name (registry entry name)
+ * @param {object} [opts]    { timeoutMs }
+ */
+async function probeAgentType(connector, type, opts = {}) {
+  const startedAt = Date.now();
+  const done = (fields) => ({
+    type,
+    at: new Date().toISOString(),
+    durationMs: Date.now() - startedAt,
+    guidance: [],
+    ...fields,
+  });
+
+  const entry = connector.registry.getEntry(type);
+  if (!entry) {
+    return done({ ok: false, method: 'none', code: CODE.UNKNOWN_TYPE, message: `Unknown agent type '${type}'` });
+  }
+
+  // A signed-in agent is ready on its sign-in alone: judged on the type, a
+  // key it will never be given made it "pass" with no login at all.
+  const cliLogin = isCliLogin(opts.agentEnv);
+  let health = {};
+  try { health = connector.healthCheck(type, { cliLogin, agentEnv: opts.agentEnv }) || {}; } catch (e) {
+    health = { installed: false, ready: false, message: e.message };
+  }
+
+  // opts.agentEnv is one agent's own env, layered over the type's the way
+  // the daemon builds it; a signed-in agent then carries no key from either.
+  let agentEnv = {};
+  try {
+    const typeEnv = typeEnvFor(type, connector.getAgentEnv(type) || {}, connector.registry, opts.agentEnv);
+    const saved = { ...typeEnv, ...(opts.agentEnv || {}) };
+    const resolved = connector.resolveAgentEnv(type, saved) || {};
+    agentEnv = stripForCliLogin(type, { ...saved, ...resolved }, connector.registry, opts.agentEnv);
+  } catch {}
+  // Where the adapter reads it (CODEX_MODEL for codex), not LLM_MODEL alone.
+  const model = configuredModel(type, agentEnv, connector.registry);
+
+  if (!health.installed) {
+    return done({
+      ok: false, method: 'none', code: CODE.NOT_INSTALLED,
+      message: 'Not installed',
+      guidance: buildGuidance(CODE.NOT_INSTALLED, entry, agentEnv),
+    });
+  }
+
+  // Installed, but not a version this integration supports. Not a sign-in
+  // problem, so the sign-in guidance would only send the user the wrong way.
+  if (health.reason === REASON.VERSION_INCOMPATIBLE || health.compatible === false) {
+    return done({
+      ok: false, method: 'none', code: CODE.VERSION_INCOMPATIBLE,
+      message: health.message || 'Unsupported version',
+      guidance: buildGuidance(CODE.VERSION_INCOMPATIBLE, entry, agentEnv),
+    });
+  }
+
+  // Hoisted above the CLI tier: a failing CLI probe consults it too (below),
+  // and `skip_cli_with_key` hands keyed agents straight to it.
+  // `probe.api_test: false` opts out for an agent whose key is not a model
+  // API key (Cursor's is for Cursor's own service): an OpenAI-style call with
+  // it proves nothing either way.
+  const apiTestable = !(entry.probe && entry.probe.api_test === false);
+  const hasApiKey = apiTestable && !!(agentEnv.LLM_API_KEY || agentEnv.OPENAI_API_KEY || agentEnv.ANTHROPIC_API_KEY
+    || agentEnv.ANTHROPIC_AUTH_TOKEN || agentEnv.KIMI_API_KEY || agentEnv.MOONSHOT_API_KEY);
+
+  // `probe.skip_cli_with_key`: the adapter points the CLI at a key's endpoint
+  // with launch flags (Codex's `-c model_providers…`) that a bare probe run
+  // does not carry, so with a key the CLI would test the wrong endpoint.
+  const cliProbeApplies = !(entry.probe && entry.probe.skip_cli_with_key && hasApiKey);
+  const probeArgs = cliProbeApplies && entry.probe && Array.isArray(entry.probe.args) ? entry.probe.args : null;
+  const altCheck = entry.check_ready && entry.check_ready.alt_check;
+  const hasLiveCli = !!((probeArgs && health.binary) || altCheck);
+
+  // Definitively unconfigured (auth_status 'unknown' still gets a live try:
+  // the real run is the final authority for unverifiable logins).
+  let staticVerdict = null;
+  if (!health.ready && health.auth_status !== 'unknown') {
+    let lines = [];
+    try { lines = formatAuthGuidance(entry, health).lines; } catch {}
+    staticVerdict = {
+      ok: false, method: 'none', code: CODE.NOT_READY,
+      message: health.message || 'Not configured',
+      guidance: lines.length ? lines : buildGuidance(CODE.NOT_LOGGED_IN, entry, agentEnv),
+    };
+    // A sign-in kept where the static checks cannot see it (a keychain, a
+    // relay set up in the CLI's own settings) answered fine and was still
+    // reported "Not logged in". Where the agent declares a live check, that
+    // run decides; the static verdict only stands in when the run explains
+    // nothing.
+    if (!hasLiveCli) return done(staticVerdict);
+  }
+
+  const timeoutMs = opts.timeoutMs
+    || (entry.probe && entry.probe.timeout_s ? entry.probe.timeout_s * 1000 : DEFAULT_TIMEOUT_MS);
+  const env = stripForCliLogin(type, { ...getEnhancedEnv(), ...agentEnv }, connector.registry, opts.agentEnv);
+  // What the CLI needs set to answer headless at all, declared per agent
+  // (Gemini refuses to run in a folder it does not trust, and the probe runs
+  // in the home directory). The agent's own value, if any, stands.
+  const probeEnv = (entry.probe && entry.probe.env) || {};
+  for (const [name, value] of Object.entries(probeEnv)) {
+    if (env[name] == null) env[name] = String(value);
+  }
+
+  const baseUrl = directBaseUrl(entry, agentEnv);
+  const protocol = directProtocol(type, agentEnv);
+  const reachable = baseUrl !== null && protocol !== null;
+  const canCallDirect = hasApiKey && reachable;
+
+  // ── Live tier 1: the agent's own CLI, when the registry declares how ──
+  if (hasLiveCli) {
+    const shell = probeArgs && health.binary ? shouldUseShellForBinary(health.binary) : true;
+    const runProbeCli = (m) => runCommand(shellQuoted(health.binary, shell),
+      type === 'codex' ? codexProbeArgs(probeArgs, env, m) : probeArgs, { env, timeoutMs, shell });
+    let res = probeArgs && health.binary
+      // Node refuses to spawn .cmd/.bat without a shell (EINVAL since the
+      // CVE-2024-27980 hardening), which made every Windows CLI probe of an
+      // npm-shim binary fail as "Exited with code 1" with no output.
+      ? await runProbeCli(model)
+      : await runCommand(altCheck, [], { env, timeoutMs, shell: true });
+    // A ChatGPT sign-in refusing the model Codex ran on. With no model
+    // chosen that is Codex's default, and the chat adapter then runs the
+    // first model the account lists (adapters/codex.js); test that one. With
+    // a model chosen, say which models the account does list.
+    let planNote = '';
+    const refused = type === 'codex' && probeArgs && health.binary
+      ? codexPlanRefusedModel(`${res.stdout}\n${res.stderr}`) : null;
+    if (refused && !model) {
+      let fallback = null;
+      try { fallback = await codexPlanFallback(health.binary, env, refused); } catch {}
+      if (fallback && CODEX_MODEL_ARG.test(fallback)) {
+        res = await runProbeCli(fallback);
+        planNote = ` on ${fallback}: Codex's default model (${refused}) isn't included in this ChatGPT plan, so chats use ${fallback}`;
+      }
+    } else if (refused) {
+      let listed = [];
+      // Codex can list the very model the plan just refused ("glm-5.3 isn't
+      // included in this ChatGPT plan. Models this account lists: …, glm-5.3,
+      // …", daily errors dashboard, 2026-11-25); offering it back says nothing.
+      try {
+        listed = (await codexAccountModels(health.binary, env)).map((m) => m.id).filter((id) => id !== refused);
+      } catch {}
+      return done({
+        ok: false, method: 'cli', code: CODE.BAD_MODEL,
+        message: `${refused} isn't included in this ChatGPT plan.`
+          + (listed.length ? ` Models this account lists: ${listed.slice(0, 8).join(', ')}.` : ''),
+        guidance: buildGuidance(CODE.BAD_MODEL, entry, agentEnv),
+      });
+    }
+    const output = withoutProbeNoise(`${res.stdout}\n${res.stderr}`);
+    const reply = withoutProbeNoise(res.stdout).trim();
+    if (!res.timedOut && !res.spawnError && res.code === 0 && reply) {
+      return done({
+        ok: true, method: 'cli', code: CODE.OK,
+        message: `Responded${planNote}`,
+        reply: tail(reply, REPLY_CAP),
+      });
+    }
+    // The model answered and the CLI then failed to exit — Claude Code held
+    // open by a hook or an MCP server reads "Timed out after 120s: Hi! What
+    // can I help you with?". Sign-in, endpoint and model all just worked, and
+    // chat runs the CLI as a long-lived process where exiting never matters.
+    // Only for output that reads as an answer, never as a retry or an error.
+    const looksLikeAnswer = reply && !classifyOutputText(output.toLowerCase())
+      && !/\b(error|errors|failed|failure|retrying|exception)\b/i.test(reply);
+    if (res.timedOut && !res.spawnError && looksLikeAnswer) {
+      return done({
+        ok: true, method: 'cli', code: CODE.OK,
+        message: `Responded${planNote} (the CLI did not exit within ${Math.round(timeoutMs / 1000)}s)`,
+        reply: tail(reply, REPLY_CAP),
+      });
+    }
+    let code = res.code === 0 && !res.timedOut && !res.spawnError
+      ? CODE.EMPTY_RESPONSE
+      : classifyFailure(output, res);
+    // A CLI probe spawn-ENOENT despite installed=true means the binary went
+    // away between checks — report it as not installed, not a mystery error.
+    if (code === CODE.NOT_INSTALLED) {
+      return done({
+        ok: false, method: 'cli', code,
+        message: 'The agent binary could not be executed',
+        guidance: buildGuidance(code, entry, agentEnv),
+      });
+    }
+    // A CLI verdict is not always the true one. A relay answering 403 "out of
+    // credit" makes Claude Code retry in silence until the probe's clock runs
+    // out, and all that reaches here is a timeout with an unrelated warning on
+    // stderr — which the guidance then reads as "it may be waiting for a login
+    // prompt", sending the user to a terminal to fix something that is not
+    // broken. Where the agent carries an endpoint and a key, ask the API the
+    // same question directly: one round trip, and it says why.
+    const unexplained = code === CODE.TIMEOUT || code === CODE.CLI_ERROR || code === CODE.EMPTY_RESPONSE;
+    if (unexplained && canCallDirect) {
+      // `[1m]` is Claude Code's own 1M-context switch (`deepseek-v4-pro[1m]`),
+      // taken off before its requests go out; sent as part of the name, the
+      // relay would reject a model the agent actually runs on.
+      const wireModel = model ? String(model).replace(/\[1m\]$/i, '') : model;
+      const direct = await directApiVerdict(agentEnv, entry, wireModel, baseUrl, protocol);
+      if (direct) return done(direct);
+    }
+    if (unexplained && staticVerdict) return done(staticVerdict);
+
+    return done({
+      ok: false, method: 'cli', code,
+      message: failureMessage(res, code, timeoutMs),
+      guidance: buildGuidance(code, entry, agentEnv, { timeoutMs }),
+    });
+  }
+
+  // ── Live tier 2: direct LLM API call for API-key agents (e.g. OpenClaw) ──
+  if (canCallDirect || (entry.install && entry.install.api_only && reachable)) {
+    let apiEnv = agentEnv;
+    let apiModel = model;
+    let apiBaseUrl = baseUrl;
+    if (type === 'mimo-code' && agentEnv.LLM_API_KEY) {
+      // The runtime owns MiMo's defaults and provider/model normalization.
+      // Generic API defaults would send a MiMo key/model to OpenAI instead.
+      const { resolveMimoRoute, parseMimoModelList, pickMimoModel } = require('./adapters/mimo-code-runtime');
+      let route = resolveMimoRoute(agentEnv);
+      if (!route.model && route.providerId === 'xiaomi' && health.binary) {
+        const listEnv = { ...env };
+        delete listEnv.LLM_API_KEY;
+        delete listEnv.XIAOMI_API_KEY;
+        const shell = shouldUseShellForBinary(health.binary);
+        const command = shell ? '"' + health.binary + '"' : health.binary;
+        const listed = await runCommand(command, ['models', 'xiaomi'], {
+          env: {
+            ...listEnv,
+            MIMOCODE_AUTH_CONTENT: '{}',
+            MIMOCODE_CONFIG_CONTENT: JSON.stringify({ enabled_providers: ['xiaomi'], disabled_providers: [] }),
+            MIMOCODE_DISABLE_AUTOUPDATE: '1',
+          },
+          timeoutMs,
+          shell,
+        });
+        if (!listed.timedOut && !listed.spawnError && listed.code === 0) {
+          route = resolveMimoRoute(agentEnv, null, {
+            fallbackModel: pickMimoModel(parseMimoModelList(listed.stdout)),
+          });
+        }
+      }
+      if (!route.model) {
+        return done({
+          ok: false, method: 'none', code: CODE.BAD_MODEL,
+          message: 'No model is configured and no default model could be resolved. Select a model and test again.',
+          guidance: buildGuidance(CODE.BAD_MODEL, entry, agentEnv),
+        });
+      }
+      // Match the runtime's credential choice, even if unrelated provider
+      // variables were saved alongside this agent's LLM_* configuration.
+      apiEnv = { LLM_API_KEY: route.apiKey, LLM_BASE_URL: route.baseURL, LLM_MODEL: route.model };
+      apiModel = route.model;
+      apiBaseUrl = route.baseURL;
+    }
+    // Aider's model names its provider ("deepseek/deepseek-flash"), which
+    // LiteLLM takes off before the call; sent whole, DeepSeek refused a model
+    // it serves as "deepseek-flash" (daily errors dashboard, 2026-11-23).
+    if (type === 'aider' && apiModel) {
+      apiModel = require('./adapters/aider').aiderWireModel(agentEnv, apiModel) || apiModel;
+    }
+    const res = await callLLM(apiEnv, apiModel, apiBaseUrl, protocol);
+    if (res && res.success) {
+      return done({
+        ok: true, method: 'llm_api', code: CODE.OK,
+        message: 'Responded',
+        reply: tail(res.response || '', REPLY_CAP),
+      });
+    }
+    // Could not be checked, not failed: the endpoint only answers the coding
+    // CLIs it recognises, and this test is not one of them.
+    if (res && clientOnlyRefusal(res.error)) {
+      return done({
+        ok: null, method: 'llm_api', code: CODE.CLIENT_ONLY,
+        message: 'This endpoint only takes requests from the coding tools it recognises, and it turned away the '
+          + `connection test, which calls it directly (${head(res.error, 240)}). The key and model could not be `
+          + 'checked ahead of time; send the agent a message, and a normal reply confirms it works.',
+      });
+    }
+    const code = directFailureCode(res && res.error, protocol);
+    return done({
+      ok: false, method: 'llm_api', code,
+      message: tail(res && res.error, OUTPUT_CAP) || 'LLM API test failed',
+      guidance: buildGuidance(code, entry, agentEnv, { param: refusedParam(res && res.error) }),
+    });
+  }
+
+  // ── No safe live probe — report the static result honestly rather than
+  // inventing a CLI invocation that could misfire. Reaching here not ready
+  // means the sign-in could not be checked (auth_status 'unknown'): that is
+  // ok: null, not a failure — counted as one, every signed-in Codex or Cursor
+  // whose status command was slow read as "Not configured". ──
+  return done({
+    ok: health.ready === true ? true : null, method: 'none', code: CODE.STATIC_ONLY,
+    auth_status: health.auth_status || null,
+    message: health.ready
+      ? 'Static checks passed (no live probe is defined for this agent type)'
+      : (health.message || 'Not configured'),
+  });
+}
+
+module.exports = { probeAgentType, codexProbeArgs, classifyFailure, buildGuidance, authFlavor, installCommandFor, scrub, failureMessage, CODE, DEFAULT_TIMEOUT_MS };

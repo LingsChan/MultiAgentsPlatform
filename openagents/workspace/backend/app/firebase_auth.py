@@ -1,0 +1,484 @@
+# -*- coding: utf-8 -*-
+"""
+Identity token verification for workspace user authentication.
+
+Verifies the ID token an end user obtained from their login provider — either
+Google (via Firebase, used on workspace.openagents.org) or Sign in with Apple
+(used by the OpenAgents Go iOS app for App Store guideline 4.8 login parity) —
+and resolves it to the user's email. Used alongside workspace-token auth, not
+as a replacement.
+
+Call `verify_identity_token()` for the provider-agnostic path; the
+`verify_firebase_token()` / `verify_apple_token()` helpers remain for callers
+that already know which provider issued the token.
+"""
+
+import json
+import logging
+import secrets
+import threading
+import time
+from typing import Optional
+
+from app.config import config
+from app.request_auth import request_cached
+
+logger = logging.getLogger(__name__)
+
+_firebase_initialized = False
+
+# Apple's JWKS endpoint + issuer for Sign in with Apple identity tokens.
+_APPLE_ISSUER = "https://appleid.apple.com"
+_APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+_apple_jwk_client = None
+_apple_jwk_lock = threading.Lock()
+
+
+def _make_noop_credential():
+    """Create a minimal Firebase credential for token verification only.
+
+    verify_id_token fetches Google's public certs via HTTP and doesn't need
+    real credentials. This avoids ADC lookup failures in Docker/non-GCP envs.
+    """
+    from firebase_admin import credentials as fb_credentials
+    import google.auth.credentials
+
+    class _Cred(fb_credentials.Base):
+        def get_credential(self):
+            return google.auth.credentials.AnonymousCredentials()
+
+    return _Cred()
+
+
+def _init_firebase() -> bool:
+    """Initialize Firebase Admin SDK. Returns True if successful."""
+    global _firebase_initialized
+    if _firebase_initialized:
+        return True
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+
+        # Check if already initialized
+        try:
+            firebase_admin.get_app()
+            _firebase_initialized = True
+            return True
+        except ValueError:
+            pass
+
+        if config.FIREBASE_CREDENTIALS_JSON:
+            cred_dict = json.loads(config.FIREBASE_CREDENTIALS_JSON)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+        elif config.FIREBASE_PROJECT_ID:
+            # No service account — use no-op credential.
+            # verify_id_token only needs the project ID + Google's public certs.
+            firebase_admin.initialize_app(_make_noop_credential(), options={
+                "projectId": config.FIREBASE_PROJECT_ID,
+            })
+        else:
+            logger.info("firebase_auth: No Firebase config, skipping init")
+            return False
+
+        _firebase_initialized = True
+        logger.info("firebase_auth: Firebase Admin SDK initialized (project=%s)", config.FIREBASE_PROJECT_ID)
+        return True
+    except Exception as e:
+        logger.warning("firebase_auth: Firebase init failed: %s", e)
+        return False
+
+
+@request_cached
+def _verified_firebase_token(token: str) -> Optional[dict]:
+    """One SDK verification supplies both email and the other identity claims."""
+    if not _init_firebase():
+        logger.warning("firebase_auth: Firebase not initialized, cannot verify token")
+        return None
+    try:
+        from firebase_admin import auth
+        decoded = auth.verify_id_token(token, check_revoked=False)
+        if not decoded.get("email"):
+            logger.warning("firebase_auth: Token valid but no email claim")
+            return None
+        return decoded
+    except Exception as e:
+        logger.warning("firebase_auth: Token verification failed: %s", e)
+        return None
+
+
+def verify_firebase_token(token: str) -> Optional[str]:
+    """Verify a Firebase ID token and return its email, or None."""
+    decoded = _verified_firebase_token(token)
+    return decoded["email"] if decoded else None
+
+
+def _apple_client_ids() -> list:
+    """Allowed `aud` values for Apple identity tokens (native bundle id + any
+    Services IDs), parsed from the comma-separated APPLE_CLIENT_IDS config."""
+    return [c.strip() for c in config.APPLE_CLIENT_IDS.split(",") if c.strip()]
+
+
+def _get_apple_jwk_client():
+    """Lazily build (and cache) a PyJWKClient for Apple's signing keys.
+
+    PyJWKClient caches fetched keys in-process and re-fetches on a cache miss
+    (e.g. after Apple rotates keys), so one client instance is reused for the
+    life of the process."""
+    global _apple_jwk_client
+    if _apple_jwk_client is None:
+        with _apple_jwk_lock:
+            if _apple_jwk_client is None:
+                from jwt import PyJWKClient
+                _apple_jwk_client = PyJWKClient(_APPLE_JWKS_URL)
+    return _apple_jwk_client
+
+
+def verify_apple_token(token: str) -> Optional[str]:
+    """
+    Verify a Sign in with Apple identity token and return the user's email.
+
+    Validates the RS256 signature against Apple's published JWKS, the issuer
+    (`https://appleid.apple.com`) and the audience (the app's bundle id /
+    Services ID from APPLE_CLIENT_IDS). Returns None on any failure.
+
+    Note: Apple only includes the `email` claim when the app requested the
+    email scope at first consent; it continues to return it on later sign-ins.
+    A user who chose "Hide My Email" gets a private relay address, which is
+    still a stable per-app identifier we can key on.
+    """
+    client_ids = _apple_client_ids()
+    if not client_ids:
+        logger.warning("firebase_auth: APPLE_CLIENT_IDS not configured, cannot verify Apple token")
+        return None
+
+    try:
+        import jwt
+
+        signing_key = _get_apple_jwk_client().get_signing_key_from_jwt(token)
+        decoded = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=client_ids,
+            issuer=_APPLE_ISSUER,
+            options={"require": ["exp", "iss", "aud"]},
+        )
+        email = decoded.get("email")
+        if not email:
+            logger.warning("firebase_auth: Apple token valid but no email claim")
+            return None
+        logger.info("firebase_auth: Verified Apple token for %s", email)
+        return email
+    except Exception as e:
+        logger.warning("firebase_auth: Apple token verification failed: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Workspace-issued login session
+# ---------------------------------------------------------------------------
+#
+# The browser normally turns the openagents.org login-handoff custom token into
+# a Firebase session itself (signInWithCustomToken) and then keeps refreshing
+# Firebase ID tokens. Both steps need Google (identitytoolkit / securetoken),
+# which is blocked in mainland China, so such users could register but never
+# enter the workspace. This server-side alternative exchanges the custom token
+# from Railway (which can reach Google), verifies the resulting ID token with
+# the Admin SDK exactly like a browser-obtained one, and mints a workspace
+# session JWT the client can present as its identity bearer without ever
+# contacting Google.
+
+_SESSION_ISSUER = "openagents-workspace"
+_SESSION_ALG = "HS256"
+_IDENTITY_TOOLKIT_SIGN_IN_URL = (
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken"
+)
+
+
+def workspace_session_enabled() -> bool:
+    return bool(config.WORKSPACE_SESSION_SECRET)
+
+
+def exchange_custom_token(custom_token: str) -> Optional[dict]:
+    """Exchange a Firebase custom token for verified identity claims.
+
+    Calls Identity Toolkit's signInWithCustomToken with the project's web API
+    key (the same public key the browser would use), then verifies the returned
+    ID token through verify_firebase_claims so revocation, project binding and
+    signature checks are identical to the browser path. Returns the claims dict
+    ({"provider", "email", "firebase_uid", "display_name"}) or None on any
+    failure. Never raises.
+    """
+    if not custom_token or not config.FIREBASE_WEB_API_KEY:
+        return None
+    try:
+        import httpx
+
+        resp = httpx.post(
+            _IDENTITY_TOOLKIT_SIGN_IN_URL,
+            params={"key": config.FIREBASE_WEB_API_KEY},
+            json={"token": custom_token, "returnSecureToken": True},
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            detail = ""
+            try:
+                detail = (resp.json().get("error") or {}).get("message", "")
+            except Exception:
+                pass
+            logger.warning(
+                "firebase_auth: custom token exchange rejected (%s %s)",
+                resp.status_code, detail,
+            )
+            return None
+        id_token = resp.json().get("idToken")
+        if not id_token:
+            logger.warning("firebase_auth: custom token exchange returned no idToken")
+            return None
+    except Exception as e:
+        logger.warning("firebase_auth: custom token exchange failed: %s", e)
+        return None
+
+    return verify_firebase_claims(id_token)
+
+
+def mint_workspace_session(claims: dict, auth_time: Optional[int] = None, ttl_seconds: Optional[int] = None) -> tuple:
+    """Mint a workspace session JWT for verified identity claims.
+
+    `auth_time` is when the user actually signed in (epoch seconds). A fresh
+    sign-in leaves it unset and it becomes now; a renewal carries the original
+    forward, which is what lets renew_workspace_session cap a session's total
+    life.
+    `ttl_seconds` overrides the configured lifetime (the agent hub mints
+    minutes-long sessions to call the workspace API on a person's behalf).
+
+    Returns (token, expires_at_epoch_seconds). Raises RuntimeError when no
+    WORKSPACE_SESSION_SECRET is configured — callers must check
+    workspace_session_enabled() first and respond 503 instead.
+    """
+    if not workspace_session_enabled():
+        raise RuntimeError("WORKSPACE_SESSION_SECRET is not configured")
+    import jwt
+
+    now = int(time.time())
+    exp = now + (ttl_seconds if ttl_seconds else max(1, config.WORKSPACE_SESSION_TTL_DAYS) * 86400)
+    payload = {
+        "iss": _SESSION_ISSUER,
+        "sub": claims.get("firebase_uid") or claims["email"],
+        "email": claims["email"],
+        "iat": now,
+        "exp": exp,
+        "auth_time": auth_time if auth_time is not None else now,
+        "jti": secrets.token_urlsafe(16),
+    }
+    if claims.get("firebase_uid"):
+        payload["firebase_uid"] = claims["firebase_uid"]
+    if claims.get("display_name"):
+        payload["name"] = claims["display_name"]
+    if claims.get("email_verified"):
+        payload["email_verified"] = True
+    token = jwt.encode(payload, config.WORKSPACE_SESSION_SECRET, algorithm=_SESSION_ALG)
+    return token, exp
+
+
+def renew_workspace_session(token: str) -> Optional[tuple]:
+    """Trade a still-valid workspace session for a fresh one.
+
+    The new session carries the same identity and the original sign-in time,
+    with a full TTL from now — so a client that renews while it is in use never
+    reaches the expiry and never has to ask the user to sign in again.
+
+    Returns (token, expires_at_epoch_seconds, claims), or None when the session
+    is not ours, fails verification, has expired, or was started more than
+    WORKSPACE_SESSION_MAX_AGE_DAYS ago.
+    """
+    if not workspace_session_enabled():
+        return None
+    try:
+        import jwt
+
+        decoded = jwt.decode(
+            token,
+            config.WORKSPACE_SESSION_SECRET,
+            algorithms=[_SESSION_ALG],
+            issuer=_SESSION_ISSUER,
+            options={"require": ["exp", "iss", "email"]},
+        )
+    except Exception as e:
+        logger.warning("firebase_auth: workspace session renewal rejected: %s", e)
+        return None
+    email = (decoded.get("email") or "").strip().lower()
+    if not email:
+        return None
+
+    # Sessions minted before auth_time existed fall back to their own iat.
+    auth_time = decoded.get("auth_time") or decoded.get("iat")
+    if not isinstance(auth_time, int):
+        return None
+    max_age = max(1, config.WORKSPACE_SESSION_MAX_AGE_DAYS) * 86400
+    if int(time.time()) - auth_time > max_age:
+        logger.info("firebase_auth: workspace session for %s is past its maximum age", email)
+        return None
+
+    claims = {
+        "email": email,
+        "firebase_uid": decoded.get("firebase_uid"),
+        "display_name": decoded.get("name"),
+        "email_verified": decoded.get("email_verified") is True,
+    }
+    new_token, exp = mint_workspace_session(claims, auth_time=auth_time)
+    return new_token, exp, claims
+
+
+def looks_like_workspace_session(token: str) -> bool:
+    """Cheap, signature-free check of the `iss` claim so the provider-agnostic
+    verifiers can route a workspace session without first paying for (and
+    logging a warning from) a doomed Firebase verification. Any parse failure
+    means "not ours"."""
+    if not token or token.count(".") != 2:
+        return False
+    try:
+        import jwt
+
+        claims = jwt.decode(token, options={"verify_signature": False})
+        return claims.get("iss") == _SESSION_ISSUER
+    except Exception:
+        return False
+
+
+def verify_workspace_session(token: str) -> Optional[dict]:
+    """Verify a workspace session JWT and return persisted identity claims
+    ({"provider": "workspace_session", "email", "firebase_uid", "display_name"}),
+    or None if the secret is unset, the signature/expiry fails, or the email
+    claim is missing."""
+    if not workspace_session_enabled():
+        return None
+    try:
+        import jwt
+
+        decoded = jwt.decode(
+            token,
+            config.WORKSPACE_SESSION_SECRET,
+            algorithms=[_SESSION_ALG],
+            issuer=_SESSION_ISSUER,
+            options={"require": ["exp", "iss", "email"]},
+        )
+    except Exception as e:
+        logger.warning("firebase_auth: workspace session verification failed: %s", e)
+        return None
+    email = (decoded.get("email") or "").strip().lower()
+    if not email:
+        return None
+    return {
+        "provider": "workspace_session",
+        "email": email,
+        "firebase_uid": decoded.get("firebase_uid"),
+        "display_name": decoded.get("name"),
+        "email_verified": decoded.get("email_verified") is True,
+    }
+
+
+def verify_identity_token(token: str) -> Optional[str]:
+    """
+    Verify an end-user identity token from any supported login provider and
+    return the user's email.
+
+    A workspace-issued session (see mint_workspace_session) is recognised by
+    its issuer and verified locally; otherwise tries Firebase/Google first (the
+    existing web + Google-Sign-In path), then Sign in with Apple. Returns None
+    if no provider accepts the token. This is the provider-agnostic entry point
+    new callers should use.
+    """
+    claims = verify_identity_claims(token)
+    return claims["email"] if claims else None
+
+
+def verify_firebase_claims(token: str) -> Optional[dict]:
+    """Return identity claims from a single successful SDK verification."""
+    decoded = _verified_firebase_token(token)
+    if decoded is None:
+        return None
+    claims = {
+        "provider": "firebase",
+        "email": decoded["email"],
+        "firebase_uid": decoded.get("uid"),
+        "display_name": decoded.get("name") or decoded.get("displayName"),
+        "email_verified": _firebase_email_verified(decoded),
+    }
+    picture = decoded.get("picture")
+    if isinstance(picture, str) and picture.startswith("https://") and len(picture) <= 5000:
+        claims["avatar_url"] = picture
+    return claims
+
+
+def _firebase_email_verified(decoded: dict) -> bool:
+    """Is the address in this Firebase ID token verified?
+
+    True for Google/Apple sign-in (the provider vouches for the address, and
+    Firebase sets `email_verified`), and for email/password accounts that
+    confirmed the welcome-email link — openagents.org's workspace handoff
+    carries that as the `oa_email_verified` custom claim (custom claims cannot
+    set the reserved `email_verified`). Anything else is unverified.
+    """
+    if decoded.get("email_verified") is True:
+        return True
+    if decoded.get("oa_email_verified") is True:
+        return True
+    provider = ((decoded.get("firebase") or {}).get("sign_in_provider") or "")
+    return provider in ("google.com", "apple.com")
+
+
+def verify_apple_claims(token: str) -> Optional[dict]:
+    """Verify a Sign in with Apple identity token and return persisted claims.
+
+    Returns {"provider", "email", "apple_sub", "display_name"} or None. Apple
+    identity tokens carry no name claim (the name is only returned once, in the
+    authorization response, not the token), so display_name is always None here.
+    """
+    client_ids = _apple_client_ids()
+    if not client_ids:
+        return None
+    try:
+        import jwt
+
+        signing_key = _get_apple_jwk_client().get_signing_key_from_jwt(token)
+        decoded = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=client_ids,
+            issuer=_APPLE_ISSUER,
+            options={"require": ["exp", "iss", "aud"]},
+        )
+        email = decoded.get("email")
+        if not email:
+            return None
+        return {
+            "provider": "apple",
+            "email": email,
+            "apple_sub": decoded.get("sub"),
+            "display_name": None,
+            # Apple relays or verifies every address it hands out.
+            "email_verified": True,
+        }
+    except Exception as e:
+        logger.warning("firebase_auth: Apple claims verification failed: %s", e)
+        return None
+
+
+@request_cached
+def verify_identity_claims(token: str) -> Optional[dict]:
+    """Provider-agnostic identity verification returning persisted claims.
+
+    Tries Firebase/Google then Sign in with Apple. Returns a dict with keys
+    email, firebase_uid, apple_sub, display_name, provider (missing-provider
+    ids are None), or None if neither provider accepts the token. This is the
+    entry point for user-row resolution (app/access.py)."""
+    if looks_like_workspace_session(token):
+        return verify_workspace_session(token)
+    claims = verify_firebase_claims(token)
+    if claims:
+        return claims
+    return verify_apple_claims(token)

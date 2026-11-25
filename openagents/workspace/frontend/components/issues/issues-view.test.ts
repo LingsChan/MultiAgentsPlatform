@@ -1,0 +1,1086 @@
+// @vitest-environment jsdom
+import { act, createElement } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { messages } from '@/lib/i18n/messages/en-US';
+import { translate } from '@/lib/i18n/translate';
+import type { IssueDetail, KanbanTask } from '@/lib/types';
+
+const mocks = vi.hoisted(() => ({
+  confirm: vi.fn(),
+  toast: { error: vi.fn(), success: vi.fn() },
+  layout: { openView: vi.fn(), pendingIssueId: null as string | null, setPendingIssueId: vi.fn() },
+  ws: {
+    workspace: { workspaceId: 'workspace-1' },
+    currentUser: { id: 'alice-id', name: 'Alice' },
+    agents: [] as unknown[],
+    sessions: [] as { sessionId: string; title: string; status: string }[],
+    activeSessionIds: new Set<string>(),
+    completedSessionIds: new Set<string>(),
+    tasks: [] as KanbanTask[],
+    workflows: [], knowledge: [] as {id: string; title: string; description: string}[], files: [],
+    createTask: vi.fn(), runTask: vi.fn(), updateTask: vi.fn(), stopTask: vi.fn(), deleteTask: vi.fn(),
+    refreshTasks: vi.fn(), refreshAgents: vi.fn(), setCurrentSessionId: vi.fn(),
+  },
+  api: {
+    getTeam: vi.fn(),
+    uploadFile: vi.fn(),
+    listIssues: vi.fn(),
+    listIssueLabels: vi.fn(),
+    listIssueBoards: vi.fn(() => Promise.resolve([{ id: 'team', name: 'Team issues', default: true, active_count: 0, can_manage: false }])),
+    createIssueBoard: vi.fn(),
+    renameIssueBoard: vi.fn(),
+    deleteIssueBoard: vi.fn(),
+    getIssue: vi.fn(),
+    createIssue: vi.fn(),
+    updateIssue: vi.fn(),
+    commentOnIssue: vi.fn(),
+    removeIssueAgent: vi.fn(),
+    linkIssueThread: vi.fn(),
+    addIssueParticipants: vi.fn(),
+    deleteIssue: vi.fn(),
+    discover: vi.fn(),
+  },
+}));
+vi.mock('@/components/ui/dialogs-provider', () => ({ useConfirm: () => mocks.confirm, usePrompt: () => vi.fn() }));
+vi.mock('sonner', () => ({ toast: mocks.toast }));
+vi.mock('@/lib/workspace-context', () => ({ useWorkspace: () => mocks.ws }));
+vi.mock('@/hooks/use-me', () => ({ useMe: () => ({ email: 'alice-id' }) }));
+vi.mock('@/lib/api', () => ({ workspaceApi: mocks.api }));
+vi.mock('@/hooks/use-polling', () => ({ useMessagePolling: () => ({ messages: [] }) }));
+vi.mock('@/components/layout/layout-context', () => ({
+  useLayout: () => mocks.layout,
+}));
+const t = (key: string, params?: Record<string, string | number>) => translate(messages, messages, 'en-US', key, params);
+vi.mock('@/lib/i18n', async () => {
+  const { formatDateTime } = await import('@/lib/i18n/format');
+  return {
+    useT: () => t,
+    useI18n: () => ({ locale: 'en-US' }),
+    useFormatters: () => ({
+      timeAgo: () => 'just now',
+      formatDateTime: (value: string, options?: Intl.DateTimeFormatOptions) => formatDateTime(value, 'en-US', options),
+    }),
+  };
+});
+vi.mock('@/components/layout/app-header', () => ({
+  DetailHeader: ({
+    title,
+    children,
+  }: {
+    title: React.ReactNode;
+    children: React.ReactNode;
+  }) => createElement('header', {}, title, children),
+}));
+vi.mock('@/components/chat/markdown-content', () => ({
+  MarkdownContent: ({ content }: { content: string }) =>
+    createElement('div', {}, content),
+}));
+vi.mock('@/components/files/authenticated-image', () => ({ AuthenticatedImage: () => null }));
+vi.mock('@/components/ui/responsive-dialog', () => ({
+  Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
+    open ? createElement('div', { role: 'dialog' }, children) : null,
+  DialogBody: ({ children }: { children: React.ReactNode }) =>
+    createElement('div', {}, children),
+  DialogFooter: ({ children }: { children: React.ReactNode }) =>
+    createElement('div', {}, children),
+  DialogContent: ({ children }: { children: React.ReactNode }) =>
+    createElement('div', {}, children),
+  DialogHeader: ({ children }: { children: React.ReactNode }) =>
+    createElement('div', {}, children),
+  DialogDescription: ({ children }: { children: React.ReactNode }) => createElement('p', {}, children),
+  DialogTitle: ({ children }: { children: React.ReactNode }) =>
+    createElement('h2', {}, children),
+}));
+import { IssuesView } from './issues-view';
+
+const issue: IssueDetail = {
+  id: 'issue-1',
+  title: 'Improve onboarding',
+  description: 'Discuss the first screen.',
+  status: 'open',
+  created_by: 'human:alice-id',
+  created_by_name: 'Alice',
+  created_at: '2026-10-07T12:00:00Z',
+  updated_at: '2026-10-07T12:00:00Z',
+  comments: [],
+  threads: [],
+  participants: [{ source: 'human:alice-id', name: 'Alice' }, { source: 'openagents:research-agent', name: 'Research agent' }],
+};
+let root: Root;
+let host: HTMLDivElement;
+const button = (text: string) =>
+  Array.from(host.querySelectorAll('button')).find(
+    (b) => b.textContent === text,
+  )!;
+async function click(element: HTMLElement) {
+  await act(async () => element.click());
+}
+async function fill(
+  element: HTMLInputElement | HTMLTextAreaElement,
+  value: string,
+) {
+  await act(async () => {
+    const prototype =
+      element instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype, 'value')!.set!.call(
+      element,
+      value,
+    );
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+async function openIssue() {
+  await act(async () => {
+    root.render(createElement(IssuesView));
+  });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(250);
+  });
+  await click(
+    Array.from(host.querySelectorAll('button')).find((b) =>
+      b.textContent?.includes('Improve onboarding'),
+    )!,
+  );
+}
+
+beforeEach(() => {
+  const stored = new Map<string, string>();
+  Object.defineProperty(window, 'localStorage', { configurable: true, value: {
+    getItem: (key: string) => stored.get(key) ?? null,
+    setItem: (key: string, value: string) => stored.set(key, value),
+  } });
+  mocks.layout.pendingIssueId = null;
+  mocks.ws.tasks = [];
+  mocks.ws.sessions = [];
+  mocks.ws.activeSessionIds = new Set();
+  mocks.ws.completedSessionIds = new Set();
+  mocks.ws.knowledge = [];
+  vi.useFakeTimers();
+  vi.clearAllMocks();
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true, ResizeObserver: class { observe() {} unobserve() {} disconnect() {} } });
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+  window.history.replaceState(null, '', '/workspace-1?token=private-token');
+  mocks.ws.agents = [];
+  mocks.api.getTeam.mockResolvedValue([]);
+  mocks.api.listIssueBoards.mockResolvedValue([{ id: 'team', name: 'Team issues', default: true, active_count: 0, can_manage: false }]);
+  mocks.api.listIssueLabels.mockResolvedValue([]);
+  mocks.api.discover.mockResolvedValue({ agents: [] });
+  mocks.api.addIssueParticipants.mockResolvedValue(undefined);
+  mocks.api.listIssues.mockResolvedValue({
+    issues: [issue],
+    next_offset: null,
+  });
+  mocks.api.getIssue.mockResolvedValue(issue);
+  mocks.api.createIssue.mockResolvedValue(issue);
+  mocks.api.commentOnIssue.mockResolvedValue({ id: 'comment-1' });
+  mocks.api.removeIssueAgent.mockResolvedValue(undefined);
+  mocks.api.deleteIssue.mockResolvedValue(undefined);
+  mocks.confirm.mockResolvedValue(true);
+  host = document.createElement('div');
+  document.body.appendChild(host);
+  root = createRoot(host);
+});
+afterEach(async () => {
+  await act(async () => root.unmount());
+  host.remove();
+  vi.useRealTimers();
+});
+
+describe('shared issues', () => {
+  it('shows issue boards, Team issues first, with no My agent tasks tab', async () => {
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(host.textContent).not.toContain('My agent tasks');
+    const tabs = [...host.querySelectorAll('[role="tab"]')].map(tab => tab.textContent);
+    expect(tabs[0]).toContain('Team issues');
+    expect(host.textContent).toContain('New board');
+    expect(button('Active issues')).toBeTruthy();
+    expect(mocks.api.listIssues).toHaveBeenCalledWith(expect.objectContaining({ board: 'team' }));
+  });
+
+  it('filters the list by a person, an agent, or nobody', async () => {
+    mocks.ws.agents = [{ agentName: 'scout', displayName: 'Scout', builtin: false }];
+    mocks.api.getTeam.mockResolvedValue([{ email: 'Ben@acme.test', displayName: 'Ben' }]);
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    const choose = async (name: string) => {
+      const trigger = [...host.querySelectorAll('button')].find((b) => /assignee/i.test(b.getAttribute('aria-label') || ''))!;
+      await click(trigger);
+      const option = [...document.querySelectorAll('[cmdk-item]')].find((el) => el.textContent?.trim() === name) as HTMLElement;
+      await click(option);
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      return mocks.api.listIssues.mock.calls.at(-1)![0];
+    };
+    expect(mocks.api.listIssues.mock.calls.at(-1)![0].assignee).toBeUndefined();
+    expect((await choose('Scout')).assignee).toBe('openagents:scout');
+    expect((await choose('Ben')).assignee).toBe('human:ben@acme.test');
+    expect((await choose('Unassigned')).assignee).toBe('none');
+    expect((await choose('Anyone')).assignee).toBeUndefined();
+  });
+
+  it('loads the selected board when switching boards', async () => {
+    mocks.api.listIssueBoards.mockResolvedValue([
+      { id: 'team', name: 'Team issues', default: true, active_count: 1, can_manage: false },
+      { id: 'b-dev', name: 'Development', default: false, active_count: 0, can_manage: true },
+    ]);
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    const dev = [...host.querySelectorAll('[role="tab"]')].find(tab => tab.textContent?.includes('Development')) as HTMLButtonElement;
+    expect(dev).toBeTruthy();
+    await act(async () => { dev.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 })); await vi.advanceTimersByTimeAsync(250); });
+    expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ board: 'b-dev' }));
+    expect(dev.getAttribute('aria-selected')).toBe('true');
+    expect(new URL(window.location.href).searchParams.get('board')).toBe('b-dev');
+    await click(host.querySelector('button[aria-label="Improve onboarding · Open"]')!);
+    expect(new URL(window.location.href).searchParams.get('board')).toBe('b-dev');
+    await click(button('Issues'));
+    expect(new URL(window.location.href).searchParams.get('board')).toBe('b-dev');
+  });
+
+  it('opens a linked board even when a different board was remembered', async () => {
+    window.localStorage.setItem('oa:issue-board:workspace-1', 'team');
+    window.history.replaceState(null, '', '/workspace-1/issues?board=b-dev');
+    mocks.api.listIssueBoards.mockResolvedValueOnce([
+      { id: 'team', name: 'Team issues', default: true, active_count: 1, can_manage: false },
+      { id: 'b-dev', name: 'Development', default: false, active_count: 0, can_manage: false },
+    ]);
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ board: 'b-dev' }));
+    expect(host.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain('Development');
+  });
+
+  it('falls back to Team issues for a deleted board link and fixes the URL', async () => {
+    window.history.replaceState(null, '', '/workspace-1/issues?board=deleted');
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ board: 'team' }));
+    expect(new URL(window.location.href).searchParams.get('board')).toBe('team');
+  });
+
+  it.each(['team', 'b-dev'])('lets readers copy a clean link to board %s', async (id) => {
+    window.history.replaceState(null, '', `/workspace-1/issues/issue-1?token=private-token&board=${id}`);
+    mocks.api.listIssueBoards.mockResolvedValueOnce([
+      { id: 'team', name: 'Team issues', default: true, active_count: 1, can_manage: false },
+      { id: 'b-dev', name: 'Development', default: false, active_count: 0, can_manage: false },
+    ]);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    await act(async () => root.render(createElement(IssuesView)));
+    const menu = host.querySelector<HTMLButtonElement>('button[aria-label^="Actions for"]')!;
+    await act(async () => menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+    const copy = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(item => item.textContent === 'Copy board link')!;
+    expect(copy).toBeTruthy();
+    await click(copy);
+    const copied = new URL(writeText.mock.calls[0][0]);
+    expect(copied.pathname).toBe('/workspace-1/issues');
+    expect([...copied.searchParams]).toEqual([['board', id]]);
+    expect(mocks.toast.success).toHaveBeenCalledWith('Board link copied');
+  });
+
+  it('copies an issue link from its row without opening it or copying authentication tokens', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    await click(host.querySelector('button[aria-label="Copy link to issue “Improve onboarding”"]')!);
+    const copied = new URL(writeText.mock.calls[0][0]);
+    expect(copied.pathname).toBe('/workspace-1/issues/issue-1');
+    expect([...copied.searchParams]).toEqual([['board', 'team']]);
+    expect(host.querySelector('section[aria-label="Discussion"]')).toBeNull();
+    expect(mocks.api.getIssue).not.toHaveBeenCalled();
+  });
+
+  it.each(['Active issues', 'Assigned to me', 'Open', 'In progress', 'Paused', 'Closed'].flatMap(label => [1, 2].map(pages => ({ label, pages }))))(
+    'keeps $pages loaded pages when clicking the selected $label filter again',
+    async ({ label, pages }) => {
+      mocks.api.listIssues.mockResolvedValueOnce({ issues: [issue], next_offset: 100 });
+      await act(async () => root.render(createElement(IssuesView)));
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      if (label !== 'Active issues') {
+        mocks.api.listIssues.mockResolvedValueOnce({ issues: [issue], next_offset: 100 });
+        await click(button(label));
+        await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      }
+      mocks.api.listIssues.mockImplementation(({ offset }) => Promise.resolve({
+        issues: [offset ? { ...issue, id: 'issue-2', title: 'Second page issue' } : issue],
+        next_offset: 200,
+      }));
+      if (pages === 2) {
+        await click(button(t('issues.loadMore')));
+        await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      }
+      const requestCount = mocks.api.listIssues.mock.calls.length;
+      await click(button(label));
+      expect(host.textContent).toContain(issue.title);
+      if (pages === 2) expect(host.textContent).toContain('Second page issue');
+      expect(button(t('issues.loadMore'))).toBeDefined();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+      expect(mocks.api.listIssues).toHaveBeenCalledTimes(requestCount);
+    },
+  );
+
+  it('deletes an issue only after confirmation, then returns to the list', async () => {
+    mocks.api.getIssue.mockResolvedValue({ ...issue, can_delete: true });
+    await openIssue();
+    mocks.confirm.mockResolvedValueOnce(false);
+    await click(button('Delete'));
+    expect(mocks.confirm).toHaveBeenCalledWith(expect.objectContaining({ title: 'Delete “Improve onboarding”?', destructive: true }));
+    expect(mocks.api.deleteIssue).not.toHaveBeenCalled();
+    mocks.api.listIssues.mockResolvedValue({ issues: [], next_offset: null });
+    await click(button('Delete'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(mocks.api.deleteIssue).toHaveBeenCalledWith('issue-1');
+    expect(host.querySelector('h1')?.textContent).toBe('Issues');
+    expect(host.textContent).not.toContain('Improve onboarding');
+  });
+
+  it('does not offer Delete to people who may not delete the issue', async () => {
+    await openIssue();
+    expect(host.querySelector('section[aria-label="Discussion"] h1')?.textContent).toBe('Improve onboarding');
+    expect(button('Delete')).toBeUndefined();
+  });
+
+  it('stays on the issue and shows why when deletion fails', async () => {
+    mocks.api.getIssue.mockResolvedValue({ ...issue, can_delete: true });
+    mocks.api.deleteIssue.mockRejectedValueOnce(new Error('Only the person who opened this issue or a workspace admin can delete it'));
+    await openIssue();
+    await click(button('Delete'));
+    expect(host.textContent).toContain('Only the person who opened this issue or a workspace admin can delete it');
+    expect(host.querySelector('section[aria-label="Discussion"] h1')?.textContent).toBe('Improve onboarding');
+    expect(button('Delete').disabled).toBe(false);
+  });
+
+  it('dates issues from the past week relatively and older ones to the minute', async () => {
+    vi.setSystemTime(new Date('2026-11-02T12:00:00Z'));
+    mocks.api.listIssues.mockResolvedValue({ next_offset: null, issues: [
+      { ...issue, id: 'recent', updated_at: '2026-10-30T12:00:00Z' },
+      { ...issue, id: 'older', created_at: '2026-10-01T12:00:00Z', updated_at: '2026-10-07T12:00:00Z' },
+      { ...issue, id: 'last-year', updated_at: '2025-12-20T12:00:00Z' },
+    ] });
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    const times = Array.from(host.querySelectorAll('time'));
+    expect(times.map(time => time.textContent)).toEqual([
+      'just now',
+      expect.stringMatching(/^Oct 7, \d{1,2}:\d{2}\s[AP]M$/),
+      expect.stringMatching(/^Dec 20, 2025, \d{1,2}:\d{2}\s[AP]M$/),
+    ]);
+    expect(times[1].title).toMatch(/^Opened Oct 1, 2026, .+ · Updated Oct 7, 2026, /);
+  });
+
+  it.each([false, true])('deletes an issue from the list after confirmation (board: %s)', async (board) => {
+    const other = { ...issue, id: 'issue-2', title: 'Someone else’s issue', can_delete: false };
+    mocks.api.listIssues.mockResolvedValue({ issues: [{ ...issue, can_delete: true }, other], next_offset: null });
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    if (board) await click(host.querySelector<HTMLButtonElement>(`button[aria-label="${t('issues.board')}"]`)!);
+    const remove = () => host.querySelector<HTMLButtonElement>('button[aria-label="Delete issue “Improve onboarding”"]');
+    expect(remove()).not.toBeNull();
+    expect(host.querySelector('button[aria-label^="Delete issue “Someone"]')).toBeNull();
+
+    mocks.confirm.mockResolvedValueOnce(false);
+    await click(remove()!);
+    expect(mocks.confirm).toHaveBeenCalledWith(expect.objectContaining({ title: 'Delete “Improve onboarding”?', destructive: true }));
+    expect(mocks.api.deleteIssue).not.toHaveBeenCalled();
+
+    mocks.api.listIssues.mockResolvedValue({ issues: [other], next_offset: null });
+    await click(remove()!);
+    expect(mocks.api.deleteIssue).toHaveBeenCalledWith('issue-1');
+    // Gone at once, without opening the issue.
+    expect(host.querySelector('h1')?.textContent).toBe('Issues');
+    expect(host.textContent).not.toContain('Improve onboarding');
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(host.textContent).not.toContain('Improve onboarding');
+    expect(host.textContent).toContain('Someone else’s issue');
+  });
+
+  it('keeps the issue in the list and says why when deleting from the list fails', async () => {
+    mocks.api.listIssues.mockResolvedValue({ issues: [{ ...issue, can_delete: true }], next_offset: null });
+    mocks.api.deleteIssue.mockRejectedValueOnce(new Error('Only the person who opened this issue or a workspace admin can delete it'));
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    const remove = host.querySelector<HTMLButtonElement>('button[aria-label="Delete issue “Improve onboarding”"]')!;
+    await click(remove);
+    expect(mocks.toast.error).toHaveBeenCalledWith('Only the person who opened this issue or a workspace admin can delete it');
+    expect(host.textContent).toContain('Improve onboarding');
+    expect(remove.disabled).toBe(false);
+  });
+
+  it('creates an issue without agents or an execution request', async () => {
+    mocks.ws.sessions = [{ sessionId: 'existing-thread', title: 'Existing thread', status: 'active' }];
+    mocks.api.listIssues.mockResolvedValue({ issues: [], next_offset: null });
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    await click(button('New issue'));
+    expect(host.textContent).not.toContain('Related thread (optional)');
+    await fill(host.querySelector('input[required]')!, 'Improve onboarding');
+    await click(button('Create issue'));
+    expect(mocks.api.createIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Improve onboarding',
+        source: 'human:alice-id',
+        source_name: 'Alice',
+      }),
+    );
+    expect(mocks.api.createIssue.mock.lastCall![0]).not.toHaveProperty('channel_name');
+
+    expect(host.textContent).toContain('Add to the discussion');
+    expect(window.location.pathname).toBe('/workspace-1/issues/issue-1');
+    expect(window.location.search).not.toContain('issue=');
+  });
+
+  it('keeps discussion passive and retains the draft on a failed comment', async () => {
+    await openIssue();
+    const textarea = host.querySelector('textarea')!;
+    await fill(textarea, '@agent-alpha Please consider this idea.');
+    mocks.api.commentOnIssue.mockRejectedValueOnce(
+      new Error('Connection interrupted'),
+    );
+    await click(button('Comment'));
+    expect(textarea.value).toBe('@agent-alpha Please consider this idea.');
+    expect(host.textContent).toContain('Connection interrupted');
+    await click(button('Comment'));
+    expect(textarea.value).toBe('');
+
+  });
+
+  it('does not reset edits when a collaborator update is polled', async () => {
+    await openIssue();
+    await click(button('Edit'));
+    const title = host.querySelector('input[required]')! as HTMLInputElement;
+    await fill(title, 'My unsaved title');
+    mocks.api.getIssue.mockResolvedValue({
+      ...issue,
+      description: 'Updated remotely',
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(title.value).toBe('My unsaved title');
+  });
+
+  it('selects a human and an offline agent by keyboard and saves their identities', async () => {
+    mocks.api.getTeam.mockResolvedValue([
+      { email: 'bob@example.com', displayName: 'Bob', role: 'member' },
+    ]);
+    mocks.ws.agents = [
+      {
+        agentName: 'research-agent',
+        displayName: 'Research agent',
+        status: 'offline',
+      },
+    ];
+    await openIssue();
+    const input = host.querySelector('textarea')!;
+    await fill(input, 'Ask @Bo');
+    expect(host.querySelector('[role=option]')?.textContent).toContain('Bob');
+    await act(async () => {
+      input.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+    });
+    expect(input.value).toBe('Ask @Bob ');
+    expect(mocks.api.commentOnIssue).not.toHaveBeenCalled();
+    await fill(input, input.value + 'and @Res');
+    await act(async () => {
+      input.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+    });
+    expect(input.value).toBe('Ask @Bob and @Research agent ');
+    await click(button('Comment'));
+    expect(mocks.api.commentOnIssue).toHaveBeenCalledWith(
+      'issue-1',
+      expect.objectContaining({
+        content: 'Ask @bob@example.com and @research-agent ',
+      }),
+    );
+
+  });
+
+  it('dismisses mention suggestions with Escape without losing the draft', async () => {
+    await openIssue();
+    const input = host.querySelector('textarea')!;
+    await fill(input, 'Hello @');
+    expect(host.querySelector('[role=listbox]')).not.toBeNull();
+    await act(async () =>
+      input.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+      ),
+    );
+    expect(host.querySelector('[role=listbox]')).toBeNull();
+    expect(input.value).toBe('Hello @');
+  });
+
+  it('removes an agent from the issue and has no start-work button', async () => {
+    await openIssue();
+    expect(host.textContent).not.toContain('Start agent work');
+    await click(host.querySelector('[aria-label="Remove Research agent from issue"]')!);
+    expect(mocks.api.removeIssueAgent).toHaveBeenCalledWith('issue-1', 'research-agent');
+  });
+
+  it('clears a temporary loading error when polling recovers', async () => {
+    window.history.replaceState(null, '', '/workspace-1?issue=issue-1');
+    mocks.api.getIssue.mockRejectedValueOnce(new Error('Temporarily offline'));
+    await act(async () => root.render(createElement(IssuesView)));
+    expect(host.textContent).toContain('Temporarily offline');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(host.textContent).not.toContain('Temporarily offline');
+    expect(host.textContent).toContain('Discuss the first screen.');
+  });
+
+  it('opens a numbered issue link and keeps the short number in the URL', async () => {
+    const numbered = { ...issue, number: 7 };
+    mocks.api.listIssues.mockResolvedValue({ issues: [numbered], next_offset: null });
+    mocks.api.getIssue.mockResolvedValue(numbered);
+    window.history.replaceState(null, '', '/workspace-1/issues/7');
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(mocks.api.getIssue).toHaveBeenCalledWith('7');
+    expect(host.textContent).toContain('Discuss the first screen.');
+    expect([...host.querySelectorAll('h1')].some(h => h.textContent?.endsWith('#7'))).toBe(true);
+    expect(window.location.pathname).toBe('/workspace-1/issues/7');
+  });
+
+  it('links an issue by its number once known', async () => {
+    window.history.replaceState(null, '', '/workspace-1/issues/issue-1');
+    const numbered = { ...issue, number: 12 };
+    mocks.api.listIssues.mockResolvedValue({ issues: [numbered], next_offset: null });
+    mocks.api.getIssue.mockResolvedValue(numbered);
+    await act(async () => root.render(createElement(IssuesView)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(window.location.pathname).toBe('/workspace-1/issues/12');
+  });
+
+  it('opens a directly linked issue', async () => {
+    window.history.replaceState(null, '', '/workspace-1?issue=issue-1');
+    await act(async () => root.render(createElement(IssuesView)));
+    expect(mocks.api.getIssue).toHaveBeenCalledWith('issue-1');
+    expect(host.textContent).toContain('Discuss the first screen.');
+  });
+});
+
+it('adds people and agents without starting work, and omits the issue Tasks section', async () => {
+  mocks.api.getTeam.mockResolvedValue([{ email: 'bob@example.com', displayName: 'Bob', role: 'member' }]);
+  mocks.api.discover.mockResolvedValue({ agents: [{ address: 'openagents:new-agent', display_name: 'New agent', status: 'online' }, { address: 'openagents:offline-agent', status: 'offline' }] });
+  await openIssue();
+  expect(host.textContent).not.toContain('Break out a task');
+  const header = host.querySelector('main > header')!;
+  const participants = header.querySelector('section[aria-label="Participants"]')!;
+  expect(participants.textContent).toContain('Alice');
+  expect(participants.textContent).toContain('Research agent');
+  await click([...participants.querySelectorAll('button')].find(button => button.textContent === 'Add people or agents')!);
+  const dialog = host.querySelector('[role=dialog]')!;
+  await click(Array.from(dialog.querySelectorAll<HTMLElement>('[role=checkbox]')).find((b) => b.closest('label')?.textContent?.includes('Bob'))!);
+  await click(Array.from(dialog.querySelectorAll<HTMLElement>('[role=checkbox]')).find((b) => b.closest('label')?.textContent?.includes('New agent'))!);
+  mocks.api.getIssue.mockResolvedValue({ ...issue, participants: [...issue.participants,
+    { source: 'human:bob@example.com', name: 'Bob' }, { source: 'openagents:new-agent', name: 'New agent' },
+  ] });
+  await click(button('Add to issue'));
+  expect(mocks.api.addIssueParticipants).toHaveBeenCalledWith('issue-1', [
+    expect.objectContaining({ kind: 'human', id: 'bob@example.com' }),
+    expect.objectContaining({ kind: 'agent', id: 'new-agent' }),
+  ]);
+  expect(participants.textContent).toContain('Bob');
+  expect(participants.textContent).toContain('New agent');
+  expect(mocks.ws.createTask).not.toHaveBeenCalled();
+  expect(mocks.ws.runTask).not.toHaveBeenCalled();
+});
+
+it.each([
+  { assignee: 'human:bob@example.com', assignee_name: 'Bob', name: 'Bob' },
+  { assignee: 'openagents:research-agent', assignee_name: null, name: 'Research agent' },
+  { assignee: null, assignee_name: null, name: 'Unassigned' },
+])('shows $name and issue settings inline without a Details toggle', async ({ assignee, assignee_name, name }) => {
+  mocks.api.getIssue.mockResolvedValue({ ...issue, assignee, assignee_name });
+  await openIssue();
+  const header = host.querySelector('main > header')!;
+  expect(header.querySelector('[aria-labelledby="issue-assignee-issue-1"]')?.textContent).toBe(name);
+  expect(header.querySelector('[role="combobox"][aria-label="Status"]')).not.toBeNull();
+  expect(header.textContent).toContain('Due date');
+  expect(header.textContent).toContain('Labels');
+  expect(button('Details')).toBeUndefined();
+  expect(host.querySelector('aside')).toBeNull();
+  expect(host.textContent).not.toContain('Workspace issue');
+  expect(host.textContent).not.toContain(t('issues.commentHint'));
+});
+
+it('clears a saved comment and reports delivery failure without inviting a duplicate submission', async () => {
+  await openIssue();
+  mocks.api.commentOnIssue.mockResolvedValueOnce({ id: 'saved', dispatch_error: 'Comment saved; delivery failed' });
+  await fill(host.querySelector('textarea')!, '@research-agent investigate');
+  await click(button('Comment'));
+  expect(host.querySelector('textarea')!.value).toBe('');
+  expect(host.textContent).toContain('Comment saved; delivery failed');
+});
+
+it('can save again after closing the editor mid-upload', async () => {
+  mocks.api.listIssues.mockResolvedValue({ issues: [], next_offset: null });
+  await act(async () => root.render(createElement(IssuesView)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  await click(button('New issue'));
+  mocks.api.uploadFile.mockImplementationOnce(() => new Promise(() => {}));
+  const input = host.querySelector('input[type="file"]')!;
+  await act(async () => {
+    Object.defineProperty(input, 'files', { value: [new File(['clip'], 'clip.mp4', { type: 'video/mp4' })] });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  await click(button('Cancel'));
+  await click(button('New issue'));
+  await fill(host.querySelector('input[required]')!, 'Retry later');
+  expect(button('Create issue').disabled).toBe(false);
+});
+
+it('keeps issue signals unread while the tab is in the background and reads them on return', async () => {
+  const markChannelSignalsRead = vi.fn();
+  const hasFocus = vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+  Object.assign(mocks.ws, { unreadSignals: { 'issue:issue-1': { mentions: 1, dms: 0, latest: {} } }, markChannelSignalsRead });
+  try {
+    await openIssue();
+    expect(markChannelSignalsRead).not.toHaveBeenCalled();
+    hasFocus.mockReturnValue(true);
+    await act(async () => { window.dispatchEvent(new Event('focus')); });
+    expect(markChannelSignalsRead).toHaveBeenCalledWith('issue:issue-1');
+  } finally {
+    hasFocus.mockRestore();
+    Object.assign(mocks.ws, { unreadSignals: undefined, markChannelSignalsRead: undefined });
+  }
+});
+
+it('adds a usable shared agent the comment mentions before posting, but not one the viewer cannot use', async () => {
+  mocks.ws.agents = [
+    { agentName: 'shared-agent', displayName: 'Shared agent', ownerEmail: 'bob@example.com', status: 'online', canStartThread: true },
+    { agentName: 'private-agent', displayName: 'Private agent', ownerEmail: 'bob@example.com', status: 'online', canStartThread: false },
+  ];
+  try {
+    await openIssue();
+    await fill(host.querySelector('textarea')!, '@shared-agent and @private-agent please look');
+    await click(button('Comment'));
+    expect(mocks.api.addIssueParticipants).toHaveBeenCalledWith('issue-1', [{ kind: 'agent', id: 'shared-agent' }]);
+    expect(mocks.api.addIssueParticipants.mock.invocationCallOrder[0]).toBeLessThan(mocks.api.commentOnIssue.mock.invocationCallOrder[0]);
+  } finally { mocks.ws.agents = []; }
+});
+
+it('posts images with a comment and keeps them out of the next draft', async () => {
+  await openIssue();
+  mocks.api.uploadFile.mockResolvedValueOnce({ id: 'shot-1', filename: 'shot.png', contentType: 'image/png' });
+  const input = host.querySelector<HTMLInputElement>('input[type="file"][aria-label="Attach files"]')!;
+  // Comments take the same files as task and issue attachments, not only images and videos.
+  expect(input.accept.split(',')).toEqual(expect.arrayContaining(['image/*', 'video/*', '.pdf', '.csv', '.xlsx', '.docx', '.zip']));
+  await act(async () => {
+    Object.defineProperty(input, 'files', { value: [new File(['png'], 'shot.png', { type: 'image/png' })] });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  await click(button('Comment'));
+  expect(mocks.api.commentOnIssue).toHaveBeenLastCalledWith('issue-1', expect.objectContaining({ content: '', file_ids: ['shot-1'] }));
+  await fill(host.querySelector('textarea')!, 'follow-up');
+  await click(button('Comment'));
+  expect(mocks.api.commentOnIssue.mock.lastCall![1]).not.toHaveProperty('file_ids');
+});
+
+it.each(['metaKey', 'ctrlKey'] as const)('sends an issue comment with %s + Enter, but not plain Enter or IME confirmation', async (modifier) => {
+  await openIssue();
+  const textarea = host.querySelector('textarea')!;
+  await fill(textarea, 'Please review this');
+  await act(async () => { textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); });
+  expect(mocks.api.commentOnIssue).not.toHaveBeenCalled();
+  await act(async () => { textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', [modifier]: true, isComposing: true, bubbles: true })); });
+  expect(mocks.api.commentOnIssue).not.toHaveBeenCalled();
+  await act(async () => { textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', [modifier]: true, bubbles: true })); });
+  expect(mocks.api.commentOnIssue).toHaveBeenCalledTimes(1);
+  expect(mocks.api.commentOnIssue).toHaveBeenCalledWith('issue-1', expect.objectContaining({ content: 'Please review this' }));
+  expect(textarea.value).toBe('');
+  await act(async () => { textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', [modifier]: true, bubbles: true })); });
+  expect(mocks.api.commentOnIssue).toHaveBeenCalledTimes(1);
+});
+
+it('saves labels and paused status in issue details', async () => {
+  await openIssue();
+  const status = host.querySelector('button[role="combobox"][id^="issue-status-"]') as HTMLButtonElement;
+  await act(async () => status.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+  const paused = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(option => option.textContent === 'Paused')!;
+  expect(paused).toBeTruthy();
+  await click(paused);
+  expect(mocks.api.updateIssue).toHaveBeenCalledWith('issue-1', expect.objectContaining({ status: 'paused' }));
+  await click(host.querySelector<HTMLButtonElement>('button[aria-label="Add a label"]')!);
+  const input = document.querySelector('input[aria-label="Add a label"]') as HTMLInputElement;
+  await fill(input, 'Bug');
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })));
+  expect(mocks.api.updateIssue).toHaveBeenCalledWith('issue-1', expect.objectContaining({ labels: ['Bug'] }));
+});
+
+it('searches the assignee picker and saves a selected person', async () => {
+  mocks.api.getTeam.mockResolvedValue([{ email: 'bob@example.com', displayName: 'Bob', role: 'member' }]);
+  await openIssue();
+  await click(host.querySelector<HTMLButtonElement>('button[aria-labelledby="issue-assignee-issue-1"]')!);
+  const search = document.querySelector<HTMLInputElement>('input[aria-label="Search people…"]')!;
+  expect(search).not.toBeNull();
+  await fill(search, 'Bob');
+  const choice = Array.from(document.querySelectorAll<HTMLElement>('[cmdk-item]')).find(item => item.textContent === 'Bob')!;
+  await click(choice);
+  expect(mocks.api.updateIssue).toHaveBeenCalledWith('issue-1', expect.objectContaining({ assignee: 'human:bob@example.com' }));
+  expect(document.querySelector('input[aria-label="Search people…"]')).toBeNull();
+});
+
+
+it('creates a human-assigned issue and waits for attachments to upload', async () => {
+  mocks.ws.agents = [{ agentName: 'research-agent', displayName: 'Research agent', ownerEmail: 'alice-id', status: 'offline' },
+    { agentName: 'other-agent', displayName: 'Other agent', ownerEmail: 'someone-else', status: 'online' }];
+  mocks.ws.knowledge = [{ id: 'guide-1', title: 'Support guide', description: 'Reference notes' }];
+  mocks.api.listIssues.mockResolvedValue({ issues: [], next_offset: null });
+  await act(async () => root.render(createElement(IssuesView)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  await click(button('New issue'));
+  await fill(host.querySelector('input[required]')!, 'Review evidence');
+  await click(host.querySelector('button[aria-label="Assignee"]')!);
+  expect(document.querySelector('[cmdk-list]')?.textContent).not.toContain('Other agent');
+  expect(document.querySelector('[cmdk-list]')?.textContent).not.toContain('Research agent');
+  await click(document.querySelector('[cmdk-item][data-value="human:alice-id"]')!);
+  let finish!: (value: unknown) => void;
+  mocks.api.uploadFile.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const input = host.querySelector('input[type="file"]')!;
+  await act(async () => {
+    Object.defineProperty(input, 'files', { value: [new File(['evidence'], 'evidence.txt', { type: 'text/plain' })] });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  expect(button('Uploading…').disabled).toBe(true);
+  expect(button('Cancel').disabled).toBe(false);
+  expect(mocks.api.createIssue).not.toHaveBeenCalled();
+  await act(async () => finish({ id: 'file-1', filename: 'evidence.txt', contentType: 'text/plain' }));
+  mocks.api.createIssue.mockRejectedValueOnce(new Error('Try again'));
+  await click(button('Create issue'));
+  expect(host.textContent).toContain('Try again');
+  expect(host.textContent).toContain('evidence.txt');
+  await click(button('Create issue'));
+  expect(mocks.api.createIssue).toHaveBeenLastCalledWith(expect.objectContaining({
+    assignee: 'human:alice-id', file_ids: ['file-1'],
+  }));
+  expect(mocks.ws.runTask).not.toHaveBeenCalled();
+});
+
+it('shows saved attachments and knowledge as links on the issue', async () => {
+  mocks.api.getIssue.mockResolvedValue({ ...issue,
+    attachments: [{ file_id: 'file-1', filename: 'evidence.txt', content_type: 'text/plain', size: 8 }],
+    knowledge: [{ id: 'guide-1', title: 'Support guide' }],
+  });
+  await openIssue();
+  expect(host.querySelector('a[href="/workspace-1/files/file-1"]')?.getAttribute('aria-label')).toBe('evidence.txt');
+  expect(host.querySelector('a[href="/workspace-1/knowledge/guide-1"]')?.textContent).toBe('Support guide');
+});
+
+it('offers only human assignees even when an agent is online', async () => {
+  mocks.ws.agents = [{ agentName: 'research-agent', displayName: 'Research agent', ownerEmail: 'alice-id', status: 'online' }];
+  await act(async () => root.render(createElement(IssuesView)));
+  await click(button('New issue'));
+  await fill(host.querySelector('input[required]')!, 'Investigation');
+  expect(button('Create issue').disabled).toBe(false);
+  await click(host.querySelector('button[aria-label="Assignee"]')!);
+  const list = document.querySelector('[cmdk-list]')!;
+  expect(list.textContent).toContain('Alice');
+  expect(list.textContent).toContain('Unassigned');
+  expect(list.textContent).not.toContain('Research agent');
+});
+
+it('requests assignments to the signed-in user across search, pagination, and board view', async () => {
+  await act(async () => root.render(createElement(IssuesView)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  mocks.api.listIssues.mockResolvedValue({ issues: [issue], next_offset: 100 });
+  await click(button('Assigned to me'));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ assignedToMe: true, activeOnly: true, status: undefined, offset: 0 }));
+  await click(button('Load more'));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ assignedToMe: true, offset: 100 }));
+  await fill(host.querySelector('input[aria-label="Search issues"]')!, 'follow-up');
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ assignedToMe: true, query: 'follow-up', offset: 0 }));
+  await click(host.querySelector('button[aria-label="Board view"]')!);
+  expect(host.textContent).toContain('Improve onboarding');
+  await click(button('Active issues'));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ assignedToMe: false, activeOnly: true, offset: 0 }));
+});
+
+it('autocompletes existing labels by keyboard and preserves their spelling', async () => {
+  mocks.api.listIssueLabels.mockResolvedValue(['Bug', '暂停', '待验证']);
+  mocks.api.updateIssue.mockResolvedValue({ ...issue, labels: ['暂停'] });
+  await openIssue();
+  await click(button('Add a label'));
+  const input = document.querySelector('input[role="combobox"]') as HTMLInputElement;
+  await fill(input, '暂');
+  // The typed text comes first, so plain Enter would add it as a new label.
+  expect([...document.querySelectorAll('[role="option"]')].map(option => option.textContent)).toEqual(['Create “暂”', '暂停']);
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })));
+  expect(mocks.api.updateIssue).toHaveBeenCalledWith(issue.id, expect.objectContaining({ labels: ['暂停'] }));
+});
+
+it('defaults to active issues and only requests inactive issues through their tabs', async () => {
+  await act(async () => root.render(createElement(IssuesView)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ activeOnly: true, status: undefined }));
+  await click(host.querySelector('button[aria-label="Board view"]')!);
+  expect(Array.from(host.querySelectorAll('section h2')).map(h => h.textContent)).toEqual(['Open', 'In progress']);
+  for (const [label, status] of [['Paused', 'paused'], ['Closed', 'closed']]) {
+    await click(button(label));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(mocks.api.listIssues).toHaveBeenLastCalledWith(expect.objectContaining({ activeOnly: false, status }));
+    expect(Array.from(host.querySelectorAll('section h2')).map(h => h.textContent)).toEqual([label]);
+  }
+});
+
+async function chooseWorkAgent() {
+  mocks.api.discover.mockResolvedValue({ agents: [{ address: 'openagents:research-agent', display_name: 'Research agent', status: 'online', can_start_thread: true }] });
+  await openIssue();
+  await click(button('Assign to an agent'));
+  await click(document.querySelector('button[aria-label="Agent"]')!);
+  await click(document.querySelector('[cmdk-item][data-value="openagents:research-agent"]')!);
+}
+
+it.each(['Investigate the screenshots', ''])('invites an agent and posts its mention with optional instructions: %s', async instruction => {
+  await chooseWorkAgent();
+  await fill(host.querySelector('textarea[aria-label="Instructions (optional)"]')!, instruction);
+  await click(button('Assign to agent'));
+  expect(mocks.api.addIssueParticipants).toHaveBeenCalledWith(issue.id, [{ kind: 'agent', id: 'research-agent' }]);
+  expect(mocks.api.commentOnIssue).toHaveBeenCalledWith(issue.id, expect.objectContaining({ content: '@research-agent' + (instruction ? ' ' + instruction : '') }));
+  expect(mocks.api.addIssueParticipants.mock.invocationCallOrder[0]).toBeLessThan(mocks.api.commentOnIssue.mock.invocationCallOrder[0]);
+  expect(mocks.api.updateIssue).not.toHaveBeenCalled();
+  expect(mocks.ws.createTask).not.toHaveBeenCalled();
+  expect(host.querySelector('[role="dialog"]')).toBeNull();
+});
+
+it('preserves instructions when adding the participant fails and does not post a comment', async () => {
+  await chooseWorkAgent();
+  await fill(host.querySelector('textarea[aria-label="Instructions (optional)"]')!, 'Keep these notes');
+  mocks.api.addIssueParticipants.mockRejectedValueOnce(new Error('Could not add agent'));
+  await click(button('Assign to agent'));
+  expect(mocks.api.commentOnIssue).not.toHaveBeenCalled();
+  expect(host.textContent).toContain('Could not add agent');
+  expect((host.querySelector('textarea[aria-label="Instructions (optional)"]') as HTMLTextAreaElement).value).toBe('Keep these notes');
+  await click(button('Assign to agent'));
+  expect(mocks.api.commentOnIssue).toHaveBeenCalledTimes(1);
+});
+
+it('does not offer reposting when the comment saved but dispatch failed', async () => {
+  await chooseWorkAgent();
+  mocks.api.commentOnIssue.mockResolvedValueOnce({ id: 'comment-1', dispatch_error: 'Comment saved but delivery failed' });
+  await click(button('Assign to agent'));
+  expect(host.querySelector('[role="dialog"]')).toBeNull();
+  expect(host.textContent).toContain('Comment saved but delivery failed');
+});
+
+it('shows activity only for online agents working in a linked conversation and clears it on completion', async () => {
+  mocks.api.getIssue.mockResolvedValue({ ...issue, threads: [{ channel_name: 'linked', title: 'Investigation', agents: ['research-agent'], status: 'active' }] });
+  mocks.ws.agents = [
+    { agentName: 'research-agent', displayName: 'Research agent', status: 'online', busyChannels: ['linked'] },
+    { agentName: 'unrelated', status: 'online', busyChannels: ['other'] },
+    { agentName: 'offline', status: 'offline', busyChannels: ['linked'] },
+  ];
+  await openIssue();
+  expect(host.querySelector('[role="status"]')?.getAttribute('aria-label')).toBe(t('chat.agentWorkingNamed', { name: 'Research agent' }));
+  expect(host.querySelectorAll('.thread-wip')).toHaveLength(1);
+  expect(host.querySelectorAll('.typing-dot')).toHaveLength(3);
+  mocks.ws.agents = [{ agentName: 'research-agent', status: 'online', busyChannels: [] }];
+  await act(async () => root.render(createElement(IssuesView)));
+  expect(host.querySelector('[role="status"]')).toBeNull();
+  expect(host.querySelectorAll('.thread-wip')).toHaveLength(0);
+  expect(host.textContent).not.toContain('is working');
+});
+
+it('retains the draft on comment failure and prevents duplicate submissions while pending', async () => {
+  await chooseWorkAgent();
+  await fill(host.querySelector('textarea[aria-label="Instructions (optional)"]')!, 'Investigate');
+  let reject!: (e: Error) => void;
+  mocks.api.commentOnIssue.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+  await click(button('Assign to agent'));
+  expect(button('Assign to agent').disabled).toBe(true);
+  await click(button('Assign to agent'));
+  expect(mocks.api.commentOnIssue).toHaveBeenCalledTimes(1);
+  await act(async () => reject(new Error('Comment unavailable')));
+  expect((host.querySelector('textarea[aria-label="Instructions (optional)"]') as HTMLTextAreaElement).value).toBe('Investigate');
+  expect(host.textContent).toContain('Comment unavailable');
+});
+
+it('requires reopening a closed issue before assigning an agent', async () => {
+  mocks.api.getIssue.mockResolvedValue({ ...issue, status: 'closed' });
+  await openIssue();
+  expect(button('Assign to an agent').disabled).toBe(true);
+});
+
+it('offers only online agents with global or current-issue access', async () => {
+  mocks.api.getIssue.mockResolvedValue({ ...issue, participants: [
+    ...issue.participants,
+    { source: 'openagents:issue-shared', name: 'Issue shared', request_access: 'yes' },
+    { source: 'openagents:approval-agent', name: 'Approval agent', request_access: 'approval' },
+    { source: 'openagents:blocked', name: 'Blocked', request_access: 'no' },
+  ] });
+  mocks.api.discover.mockResolvedValue({ agents: [
+    { address: 'openagents:owned', display_name: 'Owned online', status: 'online', can_start_thread: true },
+    { address: 'openagents:shared', display_name: 'Shared online', status: 'online', can_start_thread: true },
+    { address: 'openagents:offline', display_name: 'Owned offline', status: 'offline', can_start_thread: true },
+    { address: 'openagents:blocked', display_name: 'Blocked', status: 'online', can_start_thread: false },
+    { address: 'openagents:elsewhere', display_name: 'Shared elsewhere', status: 'online', can_start_thread: false, is_shared: true },
+    { address: 'openagents:issue-shared', display_name: 'Issue shared', status: 'online', can_start_thread: false },
+    { address: 'openagents:approval-agent', display_name: 'Approval agent', status: 'online', can_start_thread: false },
+  ] });
+  await openIssue();
+  await click(button('Assign to an agent'));
+  await click(document.querySelector('button[aria-label="Agent"]')!);
+  const options = Array.from(document.querySelectorAll('[cmdk-item]')).map(item => item.getAttribute('data-value'));
+  expect(options).toEqual(['openagents:owned', 'openagents:shared', 'openagents:issue-shared', 'openagents:approval-agent']);
+});
+
+it('explains when no accessible agents are online', async () => {
+  mocks.api.discover.mockResolvedValue({ agents: [{ address: 'openagents:offline', status: 'offline', can_start_thread: true }] });
+  await openIssue();
+  await click(button('Assign to an agent'));
+  expect(host.textContent).toContain('No agents you can use are online right now.');
+  expect(button('Assign to agent').disabled).toBe(true);
+});
+
+it('keeps linked conversations out of the page and opens each result in its own source thread', async () => {
+  mocks.api.getIssue.mockResolvedValue({ ...issue, threads: [{channel_name: 'work-thread', title: 'Linked conversation', agents: ['research-agent']}],
+    comments: [{id: 'result-1', kind: 'result', author: 'openagents:research-agent', content: 'Findings', source_event_id: 'event-1', reply_channel_name: 'work-thread', created_at: issue.created_at}] });
+  await openIssue();
+  expect(host.textContent).not.toContain('Linked conversations');
+  expect(host.querySelector('select[aria-label="Move to board"]')).toBeNull();
+  await click(button('Open in thread'));
+  expect(mocks.ws.setCurrentSessionId).toHaveBeenCalledWith('work-thread');
+  expect(mocks.layout.openView).toHaveBeenCalledWith('threads');
+});
+
+it('shows live issue work and requester completion, with active work taking precedence', async () => {
+  mocks.api.listIssues.mockResolvedValue({ issues: [{...issue, linked_channels: ['work-thread']}], next_offset: null });
+  mocks.ws.agents = [{ agentName: 'research-agent', displayName: 'Research agent', status: 'online', busyChannels: ['work-thread'] }];
+  mocks.ws.completedSessionIds = new Set(['work-thread']);
+  await act(async () => root.render(createElement(IssuesView)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(host.querySelector('button.thread-wip')).not.toBeNull();
+  expect(host.querySelector('[role="status"]')?.textContent).toBe('Research agent is working');
+  expect(host.textContent).not.toContain('Agent work finished');
+  mocks.ws.agents = [];
+  await act(async () => root.render(createElement(IssuesView)));
+  expect(host.querySelector('button.thread-wip')).toBeNull();
+  expect(host.querySelector('[role="status"]')?.textContent).toBe('Agent work finished');
+  expect(host.querySelector('button.bg-success\\/10')).not.toBeNull();
+  mocks.ws.completedSessionIds = new Set(['unrelated-thread']);
+  await act(async () => root.render(createElement(IssuesView)));
+  expect(host.querySelector('[role="status"]')).toBeNull();
+});
+
+
+it('opens a completion notification in the requested issue even while another issue is open', async () => {
+  window.history.replaceState(null, '', '/workspace-1/issues/old-issue');
+  await act(async () => root.render(createElement(IssuesView)));
+  mocks.layout.pendingIssueId = 'finished-issue';
+  await act(async () => root.render(createElement(IssuesView)));
+  expect(mocks.api.getIssue).toHaveBeenCalledWith('finished-issue');
+  expect(window.location.pathname).toBe('/workspace-1/issues/finished-issue');
+  expect(mocks.layout.setPendingIssueId).toHaveBeenCalledWith(null);
+});
+
+it('autocompletes knowledge context, removes selections, and sends selected ids with the request', async () => {
+  mocks.ws.knowledge = [
+    { id: 'guide', title: 'Support guide', description: 'Runtime troubleshooting' },
+    { id: 'spec', title: 'Product spec', description: 'Workspace behavior' },
+  ];
+  await chooseWorkAgent();
+  await click(button('Add knowledge'));
+  const input = document.querySelector('input[placeholder="Search knowledge…"]') as HTMLInputElement;
+  await fill(input, 'runtime');
+  expect(document.querySelector('[role="option"]')?.textContent).toContain('Support guide');
+  expect(document.querySelectorAll('[role="option"]')).toHaveLength(1);
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+  expect(mocks.api.commentOnIssue).not.toHaveBeenCalled();
+  expect(host.querySelector('[aria-label="Remove Support guide"]')).not.toBeNull();
+  await fill(input, 'product');
+  await click(document.querySelector<HTMLElement>('[role="option"]')!);
+  await click(host.querySelector('[aria-label="Remove Support guide"]')!);
+  await click(button('Assign to agent'));
+  expect(mocks.api.commentOnIssue).toHaveBeenCalledWith(issue.id, expect.objectContaining({ content: '@research-agent', knowledge_ids: ['spec'] }));
+  expect(mocks.api.updateIssue).not.toHaveBeenCalled();
+});
+
+it('keeps selected knowledge on failure and prevents empty searches from submitting the job', async () => {
+  mocks.ws.knowledge = [{ id: 'guide', title: 'Support guide', description: 'Troubleshooting' }];
+  await chooseWorkAgent();
+  await click(button('Add knowledge'));
+  const input = document.querySelector('input[placeholder="Search knowledge…"]') as HTMLInputElement;
+  await fill(input, 'guide');
+  await click(document.querySelector<HTMLElement>('[role="option"]')!);
+  await fill(input, 'missing');
+  expect(document.body.textContent).toContain('No matching knowledge entries.');
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+  expect(mocks.api.commentOnIssue).not.toHaveBeenCalled();
+  mocks.api.commentOnIssue.mockRejectedValueOnce(new Error('Network unavailable'));
+  await click(button('Assign to agent'));
+  expect(host.querySelector('[aria-label="Remove Support guide"]')).not.toBeNull();
+  await click(button('Assign to agent'));
+  expect(mocks.api.commentOnIssue).toHaveBeenLastCalledWith(issue.id, expect.objectContaining({ knowledge_ids: ['guide'] }));
+  await click(button('Assign to an agent'));
+  expect(host.querySelector('[aria-label="Remove Support guide"]')).toBeNull();
+});
+
+it('opens list issues side by side by default and preserves the filtered list while switching and closing', async () => {
+  const second = { ...issue, id: 'issue-2', title: 'Review onboarding' };
+  mocks.api.listIssues.mockResolvedValue({ issues: [issue, second], next_offset: null });
+  mocks.api.getIssue.mockImplementation(async (id: string) => id === second.id ? second : issue);
+  await act(async () => root.render(createElement(IssuesView)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(host.querySelector('button[aria-label="Split view"]')).toBeNull();
+  expect(host.querySelector('section[aria-label="Discussion"]')).toBeNull();
+  const list = host.querySelector('div[aria-label="List view"]')!;
+  const search = host.querySelector('input[aria-label="Search issues"]') as HTMLInputElement;
+  await fill(search, 'onboarding');
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  list.scrollTop = 120;
+  await click(host.querySelector('button[aria-label="Improve onboarding · Open"]')!);
+  expect(host.querySelector('div[aria-label="List view"]')).toBe(list);
+  expect(host.querySelector('section[aria-label="Discussion"] h1')?.textContent).toBe(issue.title);
+  expect(window.location.pathname).toBe('/workspace-1/issues/issue-1');
+  await click(host.querySelector('button[aria-label="Review onboarding · Open"]')!);
+  expect(host.querySelector('section[aria-label="Discussion"] h1')?.textContent).toBe(second.title);
+  expect(host.querySelector('[aria-current="true"]')?.textContent).toContain(second.title);
+  expect(window.location.pathname).toBe('/workspace-1/issues/issue-2');
+  expect(search.value).toBe('onboarding');
+  expect(list.scrollTop).toBe(120);
+  await click(button('Issues'));
+  expect(window.location.pathname).toBe('/workspace-1/issues');
+  expect(host.querySelector('div[aria-label="List view"]')).toBe(list);
+  expect(host.querySelector('[aria-current="true"]')).toBeNull();
+});
+
+it('returns to list or board view without leaving an invisible selected issue', async () => {
+  await act(async () => root.render(createElement(IssuesView)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  await click(host.querySelector('button[aria-label="Improve onboarding · Open"]')!);
+  await click(host.querySelector('button[aria-label="Board view"]')!);
+  expect(window.location.pathname).toBe('/workspace-1/issues');
+  expect(host.querySelector('section[aria-label="Discussion"]')).toBeNull();
+  expect(host.querySelector('button[aria-label="Board view"]')?.getAttribute('aria-pressed')).toBe('true');
+  await click(host.querySelector('button[aria-label="List view"]')!);
+  await click(host.querySelector('button[aria-label="Improve onboarding · Open"]')!);
+  expect(host.querySelector('input[aria-label="Search issues"]')).not.toBeNull();
+  expect(host.querySelector('section[aria-label="Discussion"] h1')?.textContent).toBe(issue.title);
+});
+
+it('clears the split detail when its issue is deleted from the list', async () => {
+  mocks.api.listIssues.mockResolvedValue({ issues: [{ ...issue, can_delete: true }], next_offset: null });
+  await act(async () => root.render(createElement(IssuesView)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  await click(host.querySelector('button[aria-label="Improve onboarding · Open"]')!);
+  await click(host.querySelector('button[aria-label="Delete issue “Improve onboarding”"]')!);
+  expect(mocks.api.deleteIssue).toHaveBeenCalledWith(issue.id);
+  expect(window.location.pathname).toBe('/workspace-1/issues');
+  expect(host.querySelector('section[aria-label="Discussion"] h1')).toBeNull();
+});

@@ -1,0 +1,93 @@
+import React from "react"
+import { useTranslation } from "react-i18next"
+import { useShallow } from "zustand/react/shallow"
+
+import { Switch } from "@renderer/components/ui/switch"
+import { ToggleGroup, ToggleGroupItem } from "@renderer/components/ui/toggle-group"
+import {
+  UI_SCALES,
+  useAppearanceStore,
+  type UiScale,
+} from "@renderer/store/appearance"
+import { SettingsCard, Row } from "../components/settings-card"
+import { ThemePicker } from "../components/theme-picker"
+
+const SCALE_SAMPLE: Record<UiScale, string> = {
+  sm: "text-xs",
+  md: "text-xs",
+  lg: "text-sm",
+}
+
+export function AppearanceSection(): React.JSX.Element {
+  const { t } = useTranslation()
+  const {
+    scale,
+    animations,
+    highContrast,
+    setScale,
+    setAnimations,
+    setHighContrast,
+  } = useAppearanceStore(
+    useShallow((s) => ({
+      scale: s.scale,
+      animations: s.animations,
+      highContrast: s.highContrast,
+      setScale: s.setScale,
+      setAnimations: s.setAnimations,
+      setHighContrast: s.setHighContrast,
+    })),
+  )
+
+  return (
+    <>
+      <SettingsCard title={t("settings.appearance.themeGroup")}>
+        <Row
+          stacked
+          label={t("settings.appearance.theme")}
+          desc={t("settings.appearance.themeDesc")}
+        >
+          <ThemePicker />
+        </Row>
+
+        <Row
+          label={t("settings.appearance.scale")}
+          desc={t("settings.appearance.scaleDesc")}
+        >
+          <ToggleGroup
+            type="single"
+            variant="outline"
+            value={scale}
+            onValueChange={(v) => v && setScale(v as UiScale)}
+            aria-label={t("settings.appearance.scale")}
+          >
+            {UI_SCALES.map((s) => (
+              // Each option is set in the size it picks.
+              <ToggleGroupItem key={s} value={s} className={SCALE_SAMPLE[s]}>
+                {t(`settings.appearance.scales.${s}`)}
+              </ToggleGroupItem>
+            ))}
+          </ToggleGroup>
+        </Row>
+      </SettingsCard>
+
+      {/* Both switches are pure CSS, applied through data attributes on <html>
+          (see the appearance blocks in globals.css), so they take effect the
+          moment they are flipped and survive a restart via localStorage. */}
+      <SettingsCard title={t("settings.appearance.behaviorGroup")}>
+        <Row
+          label={t("settings.appearance.animations")}
+          desc={t("settings.appearance.animationsDesc")}
+        >
+          <Switch checked={animations} onCheckedChange={setAnimations} />
+        </Row>
+
+        <Row
+          label={t("settings.appearance.highContrast")}
+          desc={t("settings.appearance.highContrastDesc")}
+        >
+          <Switch checked={highContrast} onCheckedChange={setHighContrast} />
+        </Row>
+      </SettingsCard>
+    </>
+  )
+}

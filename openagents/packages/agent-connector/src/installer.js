@@ -1,0 +1,3316 @@
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execSync, execFileSync, exec, execFile, spawnSync } = require('child_process');
+const {
+  whichBinary,
+  getEnhancedEnv,
+  getRuntimePrefix,
+  clearBinaryLookupCache,
+  aiderBinDirs,
+  resolveBinaryInKnownDirs,
+  resolveManagedNpmBinary,
+  resolveManagedNpmPackageBin,
+  isNodeShebangScript,
+  whereAll,
+} = require('./paths');
+const { isWslBinary, bridgedCommandString, wslHomeUnc } = require('./wsl');
+const { canBlock } = require('./probe-mode');
+const { EnvManager } = require('./env');
+const { nodeDistUrls, installRegistry, userConfiguredRegistry } = require('./mirrors');
+const { resolveInstallableVersion, fetchPackument, unpinnedPackage } = require('./node-engines');
+const { readinessReason, REASON } = require('./adapters/health-status');
+const { resolveCursorNodeEntry } = require('./adapters/cursor-node-entry');
+const { checkInstallPrereqs, missingPrereqError } = require('./install-preflight');
+const { detectShadowedNodeShims, shadowedNodeWarning } = require('./node-shims');
+const { fixSpawnHelpers } = require('./node-pty-perms');
+const { isPostinstallStub } = require('./postinstall-stub');
+const { nativeBuildFor } = require('./native-build');
+const { classifyClineAuth } = require('./adapters/cline-stream');
+
+/**
+ * OPENAGENTS_NO_SCRIPT_REPAIR=1: never run an install script npm skipped
+ * because of ignore-scripts — fail the install with the explanation instead.
+ */
+function scriptRepairDisabled() {
+  const v = String(process.env.OPENAGENTS_NO_SCRIPT_REPAIR || '').trim().toLowerCase();
+  return v !== '' && v !== '0' && v !== 'false' && v !== 'no';
+}
+
+const STATUS_CACHE_TTL_MS = 10000;
+const statusCache = new Map();
+/** Sign-in verdicts from a CLI's own status command, by command line. */
+const loginStatusCache = new Map();
+const LOGIN_STATUS_TIMEOUT_MS = 8000;
+/** Last `cmdkey /list` dump (Windows Credential Manager targets, no secrets). */
+let credentialListCache = null;
+/** True while a background (non-blocking) `cmdkey /list` refresh is running. */
+let credentialListRefreshing = false;
+/** Whether a macOS Keychain item exists, by service: { found, ts }. No secrets. */
+const keychainItemCache = new Map();
+/** Services with a background (non-blocking) Keychain lookup in flight. */
+const keychainRefreshing = new Set();
+
+/**
+ * Readers for a credential file whose content, not its existence, says whether
+ * the agent is signed in. Named by `check_ready.creds_classifier`. Each takes
+ * the parsed file (or `{ __parse_error: true }`) and returns 'ready',
+ * 'no_credentials' (the file shows no sign-in) or 'unknown' (it cannot tell).
+ * They test fields for presence only; no value is returned or logged.
+ *
+ * Reading the file for one non-empty field said "signed in" for a Cline file
+ * that only remembered which provider and model to use, with no key in it.
+ */
+const CREDS_CLASSIFIERS = {
+  // The adapter's own reading of providers.json. A key-based provider picked
+  // with no key stored is no_credentials; a Cline account sign-in keeps its
+  // credential outside the file, so without a stored key it is unknown, never
+  // "signed out". Keys in the environment are judged by env_vars before this,
+  // which lists every key the adapter takes (CLINE_AUTH_ENV_VARS).
+  cline_providers(creds) {
+    return classifyClineAuth(creds, {}).state;
+  },
+  // ~/.copilot/config.json lists the GitHub accounts `copilot` /login signed
+  // in. An empty list (or no file) is not "signed out": a GH_TOKEN or a gh
+  // sign-in works without it, so that stays for the run to decide.
+  copilot_logged_in_users(creds) {
+    const users = creds && creds.loggedInUsers;
+    return Array.isArray(users) && users.length > 0 ? 'ready' : 'unknown';
+  },
+};
+
+/**
+ * JSON that may carry `//` and `/* *\/` comments (JSONC). Copilot writes its
+ * config.json with a two-line `//` header, so a strict parse read a signed-in
+ * user's file as unparseable. Comments are removed outside strings only.
+ */
+function parseJsonLoose(raw) {
+  const text = String(raw);
+  try { return JSON.parse(text); } catch { /* fall through to JSONC */ }
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
+    } else if (c === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i++;
+      out += '\n';
+    } else if (c === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end === -1 ? text.length : end + 1;
+    } else {
+      out += c;
+    }
+  }
+  return JSON.parse(out);
+}
+
+/** The named classifier's verdict, or null when the entry names none. */
+function classifyCreds(checkReady, creds) {
+  const classify = checkReady && CREDS_CLASSIFIERS[checkReady.creds_classifier];
+  return classify ? classify(creds) : null;
+}
+
+/**
+ * Read a CLI's status output for its sign-in state: true (signed in), false
+ * (signed out), or null when the output does not say.
+ *
+ * `check_ready.logged_out_pattern` / `logged_in_pattern` are the desktop app's
+ * loggedOutPattern / loggedInPattern, and this is its loginVerdict: one is
+ * enough for a CLI that exits 0 either way, because a clean run that matched
+ * nothing then stands for the pattern's opposite.
+ */
+function loginVerdict(checkReady, out, code) {
+  const compile = (source) => {
+    try { return source ? new RegExp(source, 'i') : null; } catch { return null; }
+  };
+  const signedIn = compile(checkReady && checkReady.logged_in_pattern);
+  const signedOut = compile(checkReady && checkReady.logged_out_pattern);
+  const text = String(out || '');
+  if (signedIn && signedIn.test(text)) return true;
+  if (signedOut && signedOut.test(text)) return false;
+  if (!text.trim() || code !== 0) return null;
+  if (signedIn) return false;
+  if (signedOut) return true;
+  return null;
+}
+
+/**
+ * How long a streaming install may produce NO output before it is treated as
+ * hung and killed. Generous on purpose: a slow npm postinstall or a large
+ * extraction can legitimately go quiet for a while, and killing a working
+ * install is worse than waiting. Set OPENAGENTS_INSTALL_STALL_MS=0 to disable.
+ */
+const INSTALL_STALL_MS = (() => {
+  const raw = process.env.OPENAGENTS_INSTALL_STALL_MS;
+  if (raw === undefined || raw === '') return 10 * 60 * 1000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 10 * 60 * 1000;
+})();
+
+/**
+ * The last thing a stalled installer printed, for the stall message: its
+ * last non-empty line, terminal colours taken off, cut to a readable length.
+ * The command echo the launcher prints itself (`$ …`) does not count.
+ */
+function stallLastLine(output) {
+  const lines = String(output || '').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .split(/\r?\n|\r/).map((l) => l.trim()).filter((l) => l && !l.startsWith('$ '));
+  const last = lines[lines.length - 1] || '';
+  return last.length > 200 ? `${last.slice(0, 199)}…` : last;
+}
+
+/**
+ * How often the stall watchdog checks. Capped at half the stall budget so the
+ * poll granularity never dominates the deadline (matters for a short budget in
+ * tests; in production the 15s ceiling applies).
+ */
+const STALL_POLL_MS = Math.max(50, Math.min(15000, Math.floor(INSTALL_STALL_MS / 2) || 15000));
+
+/**
+ * Flags a runtime `npm install` takes for speed: --no-audit and --no-fund skip
+ * two registry round trips that only print advice. Not --prefer-offline: a
+ * cached packument can predate the release asked for, and npm then fails with
+ * ETARGET instead of fetching it.
+ */
+const NPM_INSTALL_SPEED_FLAGS = ['--no-audit', '--no-fund'];
+
+// Version detection is comparatively expensive (spawns `<bin> --version`), so
+// results are cached briefly and invalidated on install/uninstall.
+const VERSION_CACHE_TTL_MS = 60000;
+const versionCache = new Map();
+/** Version probes running in the background, by cache key. See probe-mode.js. */
+const versionRefresh = new Set();
+
+/** The version token in a `--version` output, or its first line. */
+function parseVersionOutput(raw) {
+  // The optional `-prerelease` tail is NOT decoration. An agent pinned to a
+  // preview release (`@deepseek-ai/dsh@0.1.0-rc.6`) is gated on the exact
+  // version, and dropping the suffix reported a correctly installed rc.6 as
+  // plain `0.1.0` — which then failed its own gate. Agents without a
+  // prerelease segment match exactly as before.
+  const match = raw.match(/(\d+[\d.]+\d+(?:-[0-9A-Za-z.-]+)?)/);
+  return match ? match[1] : (raw.split('\n')[0] || null);
+}
+
+/**
+ * Compare two dotted version strings numerically, ignoring any pre-release /
+ * build suffix (e.g. "1.2.3-beta.1" → 1.2.3). Returns -1, 0, or 1.
+ * Returns null when either side has no extractable numeric version.
+ */
+function compareVersions(a, b) {
+  const norm = (v) => {
+    const m = String(v == null ? '' : v).match(/\d+(?:\.\d+)*/);
+    return m ? m[0].split('.').map((n) => parseInt(n, 10)) : null;
+  };
+  const pa = norm(a);
+  const pb = norm(b);
+  if (!pa || !pb) return null;
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa[i] || 0;
+    const y = pb[i] || 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
+/** Drop the version and sign-in caches (called on install/uninstall). */
+function clearVersionCache() {
+  versionCache.clear();
+  loginStatusCache.clear();
+  keychainItemCache.clear();
+}
+
+/**
+ * Manages installation and uninstallation of agent runtimes.
+ *
+ * Install markers are stored in two places for compatibility with the Python SDK:
+ *   1. ~/.openagents/installed_agents.json  (JSON array of names)
+ *   2. ~/.openagents/installed/<name>       (empty marker files)
+ */
+class Installer {
+  constructor(registry, configDir) {
+    this.registry = registry;
+    this.configDir = configDir;
+    this.markersFile = path.join(configDir, 'installed_agents.json');
+    this.markersDir = path.join(configDir, 'installed');
+    this.env = new EnvManager(configDir);
+  }
+
+  /**
+   * Get the current platform key: 'macos', 'linux', or 'windows'.
+   */
+  static platform() {
+    const p = process.platform;
+    if (p === 'darwin') return 'macos';
+    if (p === 'win32') return 'windows';
+    return 'linux';
+  }
+
+  /**
+   * Check if an agent type is installed.
+   * Checks binary on PATH first, then marker files.
+   */
+  /**
+   * Check if an agent type is installed.
+   * @returns {boolean} true if installed (any location)
+   */
+  isInstalled(agentType) {
+    return this.getInstallInfo(agentType).installed;
+  }
+
+  /**
+   * Get detailed install info for an agent type.
+   * @returns {{ installed: boolean, managed: boolean, location: string|null }}
+   *   - installed: true if the agent is found anywhere
+   *   - managed: true if installed inside ~/.openagents/ (can be uninstalled by launcher)
+   *   - location: 'runtime' | 'legacy' | 'global' | null
+   */
+  getInstallInfo(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    const npmPkg = entry && entry.install ? entry.install.npm_package : null;
+    const binary = entry && entry.install ? entry.install.binary : agentType;
+    if (entry?.install?.api_only) {
+      const installed = this._hasMarker(agentType);
+      return {
+        installed,
+        managed: installed,
+        location: installed ? 'api_only' : null,
+      };
+    }
+    const installCmd = entry && entry.install ? this._getInstallCommand(entry.install) : null;
+    let npmPkgFromCmd = null;
+    if (!npmPkg && installCmd && installCmd.includes('npm install')) {
+      const match = installCmd.match(/npm install\s+(?:-g\s+)?(@?[\w-]+(?:\/[\w-]+)?)(?:@\S*)?$/);
+      if (match) npmPkgFromCmd = match[1];
+    }
+    const pkgName = npmPkg || npmPkgFromCmd || binary;
+
+    // Check isolated runtime prefix first (~/.openagents/runtimes/<type>/)
+    const runtimeModules = path.join(getRuntimePrefix(agentType), 'node_modules');
+    if (fs.existsSync(path.join(runtimeModules, pkgName, 'package.json'))) {
+      return { installed: true, managed: true, location: 'runtime' };
+    }
+
+    // Legacy: check shared prefix (~/.openagents/nodejs/node_modules/)
+    const legacyModules = path.join(os.homedir(), '.openagents', 'nodejs', 'node_modules');
+    if (fs.existsSync(path.join(legacyModules, pkgName, 'package.json'))) {
+      return { installed: true, managed: true, location: 'legacy' };
+    }
+
+    // Fallback: check if binary exists on PATH (system install)
+    const binaryPath = this._whichBinary(agentType);
+    if (!binaryPath) {
+      // Aider/Amp-only: a marker alone is NOT sufficient evidence of an install.
+      // Their CLIs live outside any npm package (aider: curl/uv/pipx → ~/.local/bin;
+      // amp: curl/ps1 installer → ~/.amp/bin), so a historical "installed" marker
+      // can outlive a missing/never-landed binary. Require a real resolvable
+      // binary; when only a stale marker remains, report not-installed with a
+      // 'cli-missing' diagnostic (carried by the existing `location` field — no
+      // new field/enum). The marker itself is left untouched.
+      if (agentType === 'aider' || agentType === 'amp') {
+        return {
+          installed: false,
+          managed: false,
+          location: this._hasMarker(agentType) ? 'cli-missing' : null,
+        };
+      }
+      // If a successful install wrote a marker, surface installed=true even
+      // when binary detection can't (yet) see the freshly-installed CLI —
+      // e.g. PATH caches not yet picking up a brand-new ~/.cursor/bin. The
+      // marker is the ground truth of what we just installed; UI was
+      // silently showing "not installed" right after a successful install
+      // because earlier code aggressively deleted the marker here.
+      if (this._hasMarker(agentType)) {
+        return { installed: true, managed: true, location: 'marker' };
+      }
+      return { installed: false, managed: false, location: null };
+    }
+
+    // Installed inside a WSL distro. Never 'managed': the launcher did not put
+    // it there and cannot uninstall it, and the isolated-runtime bookkeeping
+    // below is all about Windows paths that an in-distro binary can never match.
+    if (isWslBinary(binaryPath)) {
+      return { installed: true, managed: false, location: 'wsl' };
+    }
+
+    // Verify it's not a stale shim pointing to a missing package
+    const openagentsDir = path.join(os.homedir(), '.openagents');
+    if (binaryPath.startsWith(openagentsDir)) {
+      const hasRuntime = fs.existsSync(path.join(runtimeModules, pkgName, 'package.json'));
+      const hasLegacy = fs.existsSync(path.join(legacyModules, pkgName, 'package.json'));
+      if (!hasRuntime && !hasLegacy) {
+        // Stale shim — clean it up
+        for (const ext of ['', '.cmd', '.ps1']) {
+          try { const p = path.join(path.dirname(binaryPath), binary + ext); if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+        }
+        return { installed: false, managed: false, location: null };
+      }
+      return { installed: true, managed: true, location: 'legacy' };
+    }
+
+    // Binary found outside ~/.openagents/ — global/system install
+    return { installed: true, managed: false, location: 'global' };
+  }
+
+  /**
+   * Deep verification — runs the agent's verify command (slow, use sparingly).
+   */
+  verifyInstalled(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    const IS_WINDOWS = process.platform === 'win32';
+    const verifyCmd = entry && entry.install
+      ? (IS_WINDOWS ? entry.install.verify_win : entry.install.verify)
+      : null;
+    if (verifyCmd) {
+      try {
+        // Use the enhanced PATH so a freshly-installed CLI living in a dir the
+        // installer added (e.g. %LOCALAPPDATA%\cursor-agent) is found — otherwise
+        // `cursor-agent --version` exits "not recognized" and verify wrongly fails.
+        require('child_process').execSync(verifyCmd, {
+          stdio: 'ignore', timeout: 5000, env: getEnhancedEnv(), windowsHide: true,
+        });
+        return true;
+      } catch { return false; }
+    }
+    return this.isInstalled(agentType);
+  }
+
+  /**
+   * Aider-only post-install verification.
+   *
+   * Confirms a REAL aider binary exists on disk — AND that it is actually the
+   * Aider CLI rather than a same-named unrelated executable — before the
+   * install is recorded. The curl/uv/pipx installer can exit 0 without landing
+   * a runnable binary (blocked download, wrong $HOME, custom bin dir), which
+   * would otherwise leave a "marker says installed but CLI missing" state.
+   * Deliberately does NOT consult the install marker, so it can't be satisfied
+   * by its own about-to-be-written record.
+   *
+   * Hard condition: an absolute path resolves AND the file exists. `aider
+   * --version` is best-effort: a flaky/blocked probe does NOT fail the install,
+   * but a version string that is clearly NOT Aider (wrong same-named package)
+   * does — that is the whole point of the check.
+   *
+   * Scoped to Aider; never called for any other agent type.
+   *
+   * @returns {{ path: string, version: string|null } | null}
+   */
+  _verifyAiderBinary() {
+    try { clearBinaryLookupCache(); } catch {}
+
+    const isWin = process.platform === 'win32';
+    const names = isWin ? ['aider.exe', 'aider.cmd', 'aider'] : ['aider'];
+    const candidates = [];
+    // 1) Whatever the enhanced-PATH resolver finds (now includes the XDG and
+    //    uv-tools dirs added to paths.js).
+    const resolved = this._whichBinary('aider');
+    if (resolved) candidates.push(resolved);
+    // 2) Every real install dir the official installer can target — XDG bin,
+    //    XDG_DATA_HOME/../bin, ~/.local/bin, and the uv tools venv. This is the
+    //    fix for "install succeeded but landed outside ~/.local/bin" (e.g. the
+    //    user has XDG_* set, or only the uv-tools venv copy exists).
+    for (const dir of aiderBinDirs()) {
+      for (const name of names) candidates.push(path.join(dir, name));
+    }
+
+    let found = null;
+    for (const c of candidates) {
+      try { if (c && fs.existsSync(c)) { found = c; break; } } catch {}
+    }
+    if (!found) return null;
+
+    let version = null;
+    try {
+      const raw = require('child_process').execSync(`"${found}" --version`, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 8000,
+        env: getEnhancedEnv(),
+        windowsHide: true,
+        encoding: 'utf-8',
+      }).trim();
+      if (raw) {
+        // A confident mismatch means this `aider` is the wrong package.
+        if (!/aider/i.test(raw)) return null;
+        version = raw;
+      }
+    } catch {
+      // Best-effort only — file existence above is the hard condition.
+    }
+    return { path: found, version };
+  }
+
+  /**
+   * Aider-only: actionable message when the install command exits 0 but no
+   * runnable (and verified) aider binary can be found anywhere we look. The most
+   * common real cause is the underlying `uv` step failing to download a Python
+   * runtime on a restricted network — so we point at both the PATH/new-terminal
+   * case and a pip fallback.
+   */
+  _aiderBinaryNotFoundMessage() {
+    const isWin = process.platform === 'win32';
+    const name = isWin ? 'aider.exe' : 'aider';
+    const looked = aiderBinDirs().map((d) => `  ${path.join(d, name)}`).join('\n');
+    return (
+      'Aider install command completed, but the Aider CLI could not be located ' +
+      'afterward. The underlying installer (uv) most likely could not finish — ' +
+      'often it cannot download a Python runtime on a restricted network/proxy.\n\n' +
+      `Looked in:\n${looked}\n\n` +
+      'Try one of:\n' +
+      '  1) Open a NEW terminal and run:  aider --version\n' +
+      '     (the install dir may simply not be on this process’s PATH yet)\n' +
+      '  2) Install with pip instead, then re-run detection:\n' +
+      '       python -m pip install --upgrade aider-chat'
+    );
+  }
+
+  /**
+   * Amp-only post-install verification.
+   *
+   * Confirms a REAL amp binary exists on disk before the install is recorded.
+   * The Amp install script can exit 0 without landing a runnable binary (wrong
+   * $HOME, blocked download, custom AMP_HOME), which would otherwise leave a
+   * "marker says installed but CLI missing" state. Deliberately does NOT consult
+   * the installed marker (unlike verifyInstalled()->isInstalled()), so it can't
+   * be satisfied by its own about-to-be-written record.
+   *
+   * Hard condition for success: an absolute path resolves AND the file exists.
+   * `amp --version` is a best-effort enhancement used only for logging — a flaky
+   * or non-interactive `--version` failure does NOT fail the install.
+   *
+   * Scoped to Amp; never called for any other agent type.
+   *
+   * @returns {{ path: string, version: string|null } | null}
+   */
+  _verifyAmpBinary() {
+    // Drop the 30s PATH/whichBinary cache so we see the freshly-installed dir
+    // (e.g. ~/.amp/bin) instead of the pre-install snapshot.
+    try { clearBinaryLookupCache(); } catch {}
+
+    const isWin = process.platform === 'win32';
+    const names = isWin ? ['amp.exe', 'amp.cmd', 'amp'] : ['amp'];
+    const candidates = [];
+    // 1) Whatever the shared cross-platform resolver finds on the enhanced PATH
+    //    (already includes ~/.amp/bin).
+    const resolved = this._whichBinary('amp');
+    if (resolved) candidates.push(resolved);
+    // 2) Honor a custom AMP_HOME, then the installer's default ~/.amp/bin —
+    //    covers a binary that exists but whose dir isn't on PATH yet.
+    const binDirs = [];
+    if (process.env.AMP_HOME) binDirs.push(path.join(process.env.AMP_HOME, 'bin'));
+    binDirs.push(path.join(os.homedir(), '.amp', 'bin'));
+    for (const dir of binDirs) {
+      for (const name of names) candidates.push(path.join(dir, name));
+    }
+
+    let found = null;
+    for (const c of candidates) {
+      try { if (c && fs.existsSync(c)) { found = c; break; } } catch {}
+    }
+    if (!found) return null;
+
+    let version = null;
+    try {
+      version = require('child_process').execSync(`"${found}" --version`, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 8000,
+        env: getEnhancedEnv(),
+        windowsHide: true,
+        encoding: 'utf-8',
+      }).trim() || null;
+    } catch {
+      // Best-effort only — file existence above is the hard condition.
+    }
+    return { path: found, version };
+  }
+
+  /**
+   * Amp-only: message shown when the install command exits 0 but no runnable
+   * amp binary can be found. Points at the canonical (or AMP_HOME) location.
+   */
+  _ampBinaryNotFoundMessage() {
+    const isWin = process.platform === 'win32';
+    const baseDir = process.env.AMP_HOME
+      ? path.join(process.env.AMP_HOME, 'bin')
+      : path.join(os.homedir(), '.amp', 'bin');
+    const expected = path.join(baseDir, isWin ? 'amp.exe' : 'amp');
+    return (
+      'Amp install command completed, but the Amp CLI binary could not be found.\n\n' +
+      `Expected path:\n${expected}`
+    );
+  }
+
+  // Hermes's install.ps1 can print "[X] Installation failed" (e.g. its bundled
+  // `uv` step fails) yet still exit 0, so exit-code-only success is unreliable.
+  // Confirm a real hermes binary exists before recording the install. Mirrors
+  // the paths the HermesAdapter._findHermesBinary() searches.
+  _verifyHermesBinary() {
+    try { clearBinaryLookupCache(); } catch {}
+    const isWin = process.platform === 'win32';
+    const home = os.homedir();
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    const candidates = [];
+    const resolved = this._whichBinary('hermes');
+    if (resolved) candidates.push(resolved);
+    if (isWin) {
+      candidates.push(
+        path.join(localAppData, 'hermes', 'hermes-agent', 'venv', 'Scripts', 'hermes.exe'),
+        path.join(localAppData, 'hermes', 'hermes-agent', 'venv', 'Scripts', 'hermes.cmd'),
+        path.join(localAppData, 'hermes', 'bin', 'hermes.exe'),
+        path.join(localAppData, 'hermes', 'bin', 'hermes.cmd'),
+        path.join(home, '.hermes', 'bin', 'hermes.exe'),
+        path.join(home, '.hermes', 'bin', 'hermes.cmd'),
+        path.join(home, '.local', 'bin', 'hermes.exe'),
+        path.join(home, '.local', 'bin', 'hermes.cmd'),
+      );
+    } else {
+      candidates.push(
+        path.join(home, '.hermes', 'bin', 'hermes'),
+        path.join(home, '.local', 'bin', 'hermes'),
+        '/opt/homebrew/bin/hermes',
+        '/usr/local/bin/hermes',
+      );
+    }
+    let found = null;
+    for (const c of candidates) {
+      try { if (c && fs.existsSync(c)) { found = c; break; } } catch {}
+    }
+    return found ? { path: found } : null;
+  }
+
+  /**
+   * Confirm a real cursor-agent binary landed, for verify-before-mark.
+   *
+   * Cursor's Windows one-liner (`irm 'https://cursor.com/install?win32=true' |
+   * iex`) downloads the CLI with Invoke-WebRequest. When that download fails —
+   * an "unexpected EOF or 0 bytes" IOException is what users behind a filtering
+   * network get — PowerShell treats it as NON-terminating: the script carries
+   * on, prints "Start using Cursor Agent" and "Happy coding!", and exits 0. All
+   * that's left on disk is an empty %LOCALAPPDATA%\cursor-agent\versions\.
+   *
+   * Same defect hermes and amp already guard against here. Without this the
+   * marker gets written, the launcher reports Cursor installed, offers a
+   * sign-in, and the only way the user finds out is a terminal saying
+   * "'cursor-agent' is not recognized".
+   */
+  _verifyCursorBinary() {
+    try { clearBinaryLookupCache(); } catch {}
+    const resolved = this._whichBinary('cursor');
+    if (resolved && fs.existsSync(resolved)) return { path: resolved };
+    return null;
+  }
+
+  _cursorBinaryNotFoundMessage() {
+    const localAppData =
+      process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    const isWin = process.platform === 'win32';
+    const expected = isWin
+      ? path.join(localAppData, 'cursor-agent')
+      : path.join(os.homedir(), '.local', 'bin', 'cursor-agent');
+    return (
+      'Cursor install command completed, but the cursor-agent binary could not be found\n' +
+      "(its installer prints \"Happy coding!\" and exits 0 even when the download failed —\n" +
+      'look for "unexpected EOF" or a network error in the log above).\n\n' +
+      `Expected under:\n${expected}\n\n` +
+      'Retry the install, or check that cursor.com is reachable from this network.'
+    );
+  }
+
+  _hermesBinaryNotFoundMessage() {
+    const isWin = process.platform === 'win32';
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    const expected = isWin
+      ? path.join(localAppData, 'hermes', 'hermes-agent', 'venv', 'Scripts', 'hermes.exe')
+      : path.join(os.homedir(), '.hermes', 'bin', 'hermes');
+    return (
+      'Hermes install command completed, but the Hermes CLI binary could not be found\n' +
+      "(its installer can report a uv/setup failure yet still exit 0).\n\n" +
+      `Expected path:\n${expected}`
+    );
+  }
+
+  /**
+   * Find the binary path for an agent type.
+   */
+  which(agentType) {
+    return this._whichBinary(agentType);
+  }
+
+  /**
+   * Health check — binary existence + version.
+   * @returns {{ installed: boolean, binary: string|null, version: string|null }}
+   */
+  /**
+   * `opts.cliLogin` checks one agent that signs in through its CLI: the core
+   * drops every key for it at launch, so a key saved for the type or set in
+   * the daemon's environment must not make it ready.
+   *
+   * `opts.agentEnv` is that agent's own env. With it the agent is judged on
+   * the env the daemon launches it on, not on <type>.env alone.
+   */
+  healthCheck(agentType, opts = {}) {
+    const entry = this.registry.getEntry(agentType);
+    if (entry?.install?.api_only) {
+      const info = this.getInstallInfo(agentType);
+      if (!info.installed) {
+        return {
+          installed: false,
+          binary: null,
+          version: null,
+          compatible: null,
+          min_version: null,
+          ready: false,
+          auth_mode: null,
+          auth_status: null,
+          execution_mode: 'unavailable',
+          reason: REASON.NOT_INSTALLED,
+          message: 'Not installed',
+        };
+      }
+
+      const apiReadiness = this._evaluateReadiness(agentType, entry, null, opts);
+      return {
+        installed: true,
+        binary: null,
+        version: null,
+        compatible: true,
+        min_version: null,
+        reason: readinessReason(true, apiReadiness.ready),
+        ...apiReadiness,
+      };
+    }
+
+    const binary = this._whichBinary(agentType);
+    if (!binary) {
+      return {
+        installed: false,
+        binary: null,
+        version: null,
+        compatible: null,
+        min_version: null,
+        ready: false,
+        auth_mode: null,
+        auth_status: null,
+        execution_mode: 'unavailable',
+        reason: REASON.NOT_INSTALLED,
+        message: 'Not installed',
+      };
+    }
+
+    const checkCmd = entry && entry.install ? entry.install.check_command : null;
+    // Prefer the resolved absolute binary path (quoted) over the bare name:
+    // it's unambiguous and lets `--version` succeed for binaries resolved via
+    // the package-bin fallback (which are not on PATH).
+    const versionCmd = checkCmd || this._versionProbeCommand(binary);
+
+    const version = this._detectVersion(binary, versionCmd);
+    const readiness = this._evaluateReadiness(agentType, entry, binary, opts);
+
+    // Generic minimum-version gate (no per-agent special-casing). An entry opts
+    // in by declaring `install.min_version`. Below the floor we keep
+    // installed=true but force compatible=false + ready=false so the launcher
+    // blocks the run and prompts an upgrade (never shows "not installed"). When
+    // the version can't be parsed we report compatible=null ("unknown") rather
+    // than falsely passing the gate, and do NOT hard-block readiness.
+    const gate = this._evaluateCompatibility(entry, version);
+    if (gate.compatible === false) {
+      readiness.ready = false;
+      readiness.message = gate.message;
+    }
+
+    return {
+      installed: true,
+      binary,
+      version,
+      compatible: gate.compatible,
+      min_version: gate.minVersion,
+      // Installed is proven (binary resolved). A not-ready installed agent is a
+      // login/config state, never "not installed" — version mismatch aside.
+      reason:
+        gate.compatible === false
+          ? REASON.VERSION_INCOMPATIBLE
+          : readinessReason(true, readiness.ready),
+      ...readiness,
+    };
+  }
+
+  /**
+   * Build the `<binary> --version` probe command for a resolved binary path.
+   *
+   * When the resolved binary is a JS entry (`.mjs`/`.cjs`/`.js` — e.g. OpenClaw,
+   * whose package `bin` is `openclaw.mjs` and is what `_resolvePackageBin`
+   * returns when the `.cmd` shim isn't on PATH), it MUST be run through node.
+   * execSync goes through a shell; on Windows `cmd.exe "C:\…\openclaw.mjs"
+   * --version` finds no PATHEXT association for `.mjs`, so it ShellExecutes the
+   * file and the OS pops the "choose an app to open this .mjs file" dialog. The
+   * launcher polls health/version on a timer, so that dialog reappears over and
+   * over — even at idle, and stacked (one per poll). Prefixing node makes the
+   * probe run headless. Harmless on Unix (node runs a .mjs regardless of any
+   * shebang), so it's applied on every platform for consistency.
+   */
+  _versionProbeCommand(binary) {
+    return this._cliCommand(binary, ['--version']);
+  }
+
+  /** `<binary> <args>` as a command line, for any short probe of a resolved CLI. */
+  _cliCommand(binary, args) {
+    const tail = args.join(' ');
+    // A binary inside WSL has to be asked through wsl.exe; running the Linux
+    // path as a Windows command yields "not recognized" and the marketplace
+    // then shows an installed agent with no version at all.
+    const bridged = bridgedCommandString(binary, args);
+    if (bridged) return bridged;
+    if (/\.(mjs|cjs|js)$/i.test(binary)) {
+      return `"${this._nodeBinary()}" "${binary}" ${tail}`;
+    }
+    // Same problem, no extension to spot it by: npm's package bin is often an
+    // extensionless `#!/usr/bin/env node` script (node_modules/cline/bin/cline),
+    // which is what we resolve whenever npm wrote no .cmd shim. cmd.exe cannot
+    // run it — the probe dies with "is not recognized as an internal or external
+    // command" — and the agent then shows up in the app with no version at all.
+    if (isNodeShebangScript(binary)) {
+      return `"${this._nodeBinary()}" "${binary}" ${tail}`;
+    }
+    return `"${binary}" ${tail}`;
+  }
+
+  /**
+   * Resolve a node executable to run JS-entry CLIs with. Prefers the launcher's
+   * portable node, then a PATH lookup, then the bare name. Deliberately does NOT
+   * use process.execPath: when the core runs inside the Electron main process
+   * that path is the Electron binary, and `electron foo.mjs` would launch the
+   * app instead of running the script.
+   */
+  _nodeBinary() {
+    const isWin = process.platform === 'win32';
+    const nodeName = isWin ? 'node.exe' : 'node';
+    const portableDir = path.join(os.homedir(), '.openagents', 'nodejs');
+    for (const candidate of [
+      path.join(portableDir, nodeName),
+      path.join(portableDir, 'bin', nodeName),
+    ]) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    const found = whichBinary(nodeName, { allowWsl: false });
+    if (found) return found;
+    return 'node';
+  }
+
+  /**
+   * Detect a binary's version string, cached briefly. Returns null on failure.
+   */
+  _detectVersion(binary, versionCmd) {
+    const key = `${binary}\0${versionCmd}`;
+    const cached = versionCache.get(key);
+    if (cached && (Date.now() - cached.ts) < VERSION_CACHE_TTL_MS) return cached.version;
+
+    if (!canBlock()) {
+      // A node CLI's `--version` takes 0.5s+ (seconds for one inside WSL).
+      // Report the last known version — or unknown, which healthCheck already
+      // handles — and let the next check pick up the answer.
+      this._refreshVersion(key, versionCmd);
+      return cached ? cached.version : null;
+    }
+
+    let version = null;
+    try {
+      const raw = execSync(versionCmd, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: getEnhancedEnv(),
+        timeout: 10000,
+      }).trim();
+      version = parseVersionOutput(raw);
+    } catch {}
+
+    versionCache.set(key, { version, ts: Date.now() });
+    return version;
+  }
+
+  /** _detectVersion's probe, off the calling thread. */
+  _refreshVersion(key, versionCmd) {
+    if (versionRefresh.has(key)) return;
+    versionRefresh.add(key);
+    try {
+      const child = exec(versionCmd, {
+        encoding: 'utf-8',
+        env: getEnhancedEnv(),
+        timeout: 10000,
+        windowsHide: true,
+      }, (err, stdout) => {
+        versionRefresh.delete(key);
+        versionCache.set(key, {
+          version: err ? null : parseVersionOutput(String(stdout).trim()),
+          ts: Date.now(),
+        });
+      });
+      if (child.stdin) child.stdin.end();
+    } catch {
+      versionRefresh.delete(key);
+    }
+  }
+
+  /**
+   * Evaluate a registry version gate against a detected version. Generic for any
+   * agent. Returns { compatible: true|false|null, minVersion, message }.
+   *
+   * Two gate shapes, in priority order:
+   *
+   *   `install.supported_version` — EXACT match. For agents pinned to an
+   *   upstream preview whose configuration can change between releases, a floor
+   *   is the wrong shape: it happily admits the next preview, which is precisely
+   *   the version the adapter has not been written against. Declared by
+   *   deepseek (dsh is a developer preview).
+   *
+   *   `install.min_version` / `check_ready.min_version` — a floor (>=). The
+   *   original behaviour, unchanged for every agent that does not declare
+   *   supported_version.
+   */
+  _evaluateCompatibility(entry, version) {
+    const supported = (entry && entry.install && entry.install.supported_version) || null;
+    if (supported) {
+      // Compare the version-shaped token from each side, prerelease included.
+      // `compareVersions` cannot be used: it strips `-rc.N`, so rc.5 and rc.6
+      // would compare equal and the exact gate would admit the wrong preview.
+      const norm = (v) => {
+        const m = String(v == null ? '' : v).match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/);
+        return m ? m[0] : null;
+      };
+      const got = norm(version);
+      const want = norm(supported);
+      if (!got) {
+        return {
+          compatible: null,
+          minVersion: supported,
+          message: `Version unknown (requires exactly ${supported})`,
+        };
+      }
+      if (got !== want) {
+        return {
+          compatible: false,
+          minVersion: supported,
+          message:
+            `${(entry.label || entry.name || 'This agent')} ${got} is not supported — ` +
+            `it is pinned to ${want} exactly (upstream ships it as a developer preview).`,
+        };
+      }
+      return { compatible: true, minVersion: supported, message: null };
+    }
+
+    // Opt-in floor declared under either install.min_version or
+    // check_ready.min_version (e.g. cline pins check_ready.min_version).
+    const minVersion = (entry && (
+      (entry.install && entry.install.min_version) ||
+      (entry.check_ready && entry.check_ready.min_version)
+    )) || null;
+    if (!minVersion) return { compatible: true, minVersion: null, message: null };
+    // "0.0.0" is a placeholder, not a release: Pi prints it when it cannot
+    // find its own package.json (a standalone build, a moved install). Blocking
+    // on it told a current Pi it was too old.
+    const cmp = /^v?0\.0\.0\b/.test(String(version || '').trim()) ? null : compareVersions(version, minVersion);
+    if (cmp === null) {
+      return { compatible: null, minVersion, message: `Version unknown (requires >= ${minVersion})` };
+    }
+    if (cmp < 0) {
+      return {
+        compatible: false,
+        minVersion,
+        message: `${(entry.label || entry.name || 'This agent')} ${version} is too old — upgrade to ${minVersion} or newer.`,
+      };
+    }
+    return { compatible: true, minVersion, message: null };
+  }
+
+  _evaluateReadiness(agentType, entry, binary, opts = {}) {
+    const checkReady = entry?.check_ready;
+    if (!checkReady) {
+      return {
+        ready: true,
+        auth_mode: null,
+        auth_status: 'ready',
+        execution_mode: 'unavailable',
+        message: 'Ready',
+      };
+    }
+
+    // A key set on the agent itself (the workspace saves it there, as
+    // LLM_API_KEY) never reaches <type>.env, so judged on that file alone a
+    // Kimi agent that answered fine read "Not configured — … run: kimi login".
+    const savedEnv = opts.agentEnv
+      ? this.env.getForAgent(agentType, this.registry, opts.agentEnv)
+      : this.env.getEffective(agentType, this.registry);
+    const directEnv = this._hasAllValues(process.env, checkReady.env_all);
+    const directSaved = this._hasAllValues(savedEnv, checkReady.saved_env_all || checkReady.env_all);
+    const keyed = !opts.cliLogin;
+    const directReady = keyed && (directEnv || directSaved);
+    // env_vars must be satisfiable by the SAVED (and resolved) per-agent env,
+    // not only the daemon's own process env. The workspace configure flow
+    // saves LLM_API_KEY, which resolve rules map to e.g. ANTHROPIC_AUTH_TOKEN
+    // — the exact var the adapter launches the CLI with. Checking process.env
+    // alone made a perfectly working key-configured agent read "Not logged
+    // in" (health banner + failed smoke test) while chat answered fine, with
+    // guidance telling the user to configure the very key they had saved.
+    const envAnyReady = keyed && (
+      this._hasAnyValue(process.env, checkReady.env_vars) ||
+      this._hasAnyValue(savedEnv, checkReady.env_vars));
+    const savedAnyReady = keyed && !!(checkReady.saved_env_key && savedEnv[checkReady.saved_env_key]);
+    // A registry entry may require a non-empty JSON object rather than mere
+    // parseability. In that mode the stricter _evaluateCredsFile path below is
+    // authoritative; the legacy parser treats an empty {} as ready.
+    // Content-free credential probes (opt-in via check_ready). Detect agents
+    // whose sign-in is a local OAuth/credential FILE (e.g. Gemini's
+    // ~/.gemini/oauth_creds.json) or a service-account file path, WITHOUT
+    // parsing or logging the token. Additive: agents that don't declare
+    // creds_no_parse / creds_path_env get identical behavior to before.
+    const credsFile = this._evaluateCredsFile(checkReady, agentType, savedEnv);
+    const credsPathReady = this._checkCredsPathEnv(checkReady, savedEnv, agentType);
+
+    let cliReady = false;
+    if (checkReady.status_command && binary) {
+      cliReady = this._checkStatusCommand(checkReady.status_command);
+    }
+
+    if (directReady) {
+      return {
+        ready: true,
+        auth_mode: 'api_key',
+        auth_status: 'ready',
+        execution_mode: 'direct',
+        message: 'Ready',
+      };
+    }
+
+    if (cliReady) {
+      return {
+        ready: true,
+        auth_mode: 'cli_login',
+        auth_status: 'ready',
+        execution_mode: 'subprocess',
+        message: 'Ready',
+      };
+    }
+
+    if (envAnyReady || savedAnyReady) {
+      // Legacy single-key path (e.g. agents that only advertise env_vars / saved_env_key).
+      // An API key being present means the agent can be launched with it in the environment,
+      // so treat this as a direct-launch configuration.
+      return {
+        ready: true,
+        auth_mode: 'api_key',
+        auth_status: 'ready',
+        execution_mode: 'direct',
+        message: 'Ready',
+      };
+    }
+
+    // A model that needs no credential at all — OpenCode Zen's free
+    // `opencode/…` models. The launcher's KEYLESS_AUTH_SETTINGS already counts
+    // them as ready; judged here on keys alone the same agent read "Not
+    // configured" in every smoke test.
+    const keylessPrefixes = Array.isArray(checkReady.keyless_model_prefixes) ? checkReady.keyless_model_prefixes : [];
+    const model = String((savedEnv && savedEnv.LLM_MODEL) || '').trim();
+    if (model && keylessPrefixes.some((p) => p && model.startsWith(p))) {
+      return {
+        ready: true,
+        auth_mode: null,
+        auth_status: 'ready',
+        execution_mode: 'subprocess',
+        message: 'Ready',
+      };
+    }
+
+    // Evaluated only after every key/env path above has had its say: it may
+    // shell out (macOS keychain, Windows `cmdkey`), which a key-configured
+    // agent never needs.
+    const credsReady = checkReady.creds_json_has_entries
+      ? false
+      : this._checkCredsReady(checkReady, agentType, savedEnv);
+    if (credsReady || credsFile.ready || credsPathReady) {
+      return {
+        ready: true,
+        auth_mode: 'cli_login',
+        auth_status: 'ready',
+        execution_mode: 'subprocess',
+        message: 'Ready',
+      };
+    }
+
+    // Nothing in the env or on disk says so, but a CLI may keep its sign-in
+    // where only it looks. Cursor's is in the OS keychain on macOS, under
+    // %APPDATA% on Windows and ~/.config on Linux, and the `authInfo` read
+    // above is only a profile it caches beside them — so a signed-in user
+    // whose config lacked it read "installed but not signed in" for good.
+    const signedIn = this._checkLoginStatus(checkReady, binary);
+    if (signedIn === true) {
+      return {
+        ready: true,
+        auth_mode: 'cli_login',
+        auth_status: 'ready',
+        execution_mode: 'subprocess',
+        message: 'Ready',
+      };
+    }
+
+    // A credential file was found but could not be read (e.g. permissions).
+    // That is NOT "no credentials" — report it as 'unknown' with a distinct
+    // message so the UI never mislabels a real (if unreadable) login as
+    // "Not logged in". Only reachable for agents that opt into creds_no_parse.
+    if (credsFile.unreadable && signedIn !== false) {
+      return {
+        ready: false,
+        auth_mode: null,
+        auth_status: 'unknown',
+        execution_mode: 'unavailable',
+        message: checkReady.unreadable_message || 'Credentials were found but could not be read.',
+      };
+    }
+
+    // The credential file is there but cannot say (a Cline account sign-in
+    // keeps no key in it, or the file is in a shape this version does not
+    // know). Not "signed out": the run decides, as for unreadable above.
+    if (credsFile.unknown && signedIn !== false) {
+      return {
+        ready: false,
+        auth_mode: null,
+        auth_status: 'unknown',
+        execution_mode: 'unavailable',
+        message: checkReady.unknown_message || checkReady.not_ready_message || 'Sign-in could not be confirmed.',
+      };
+    }
+
+    // No positive signal. For agents whose auth cannot be reliably probed
+    // without running them (generic `check_ready.unverifiable`), this is
+    // 'unknown' — they may already be signed in via a CLI login / keychain /
+    // gh — NOT a definitive 'no_credentials'. The launcher can show "unknown"
+    // and still allow a launch attempt; the real run is the final authority.
+    return {
+      ready: false,
+      auth_mode: null,
+      // The CLI's own "not logged in" settles it; only its silence is unknown.
+      auth_status: checkReady.unverifiable && signedIn !== false ? 'unknown' : 'no_credentials',
+      execution_mode: 'unavailable',
+      message: checkReady.not_ready_message || 'Not configured',
+    };
+  }
+
+  _hasAllValues(source, keys) {
+    if (!keys || keys.length === 0) return false;
+    return keys.every((key) => !!(source && source[key]));
+  }
+
+  _hasAnyValue(source, keys) {
+    if (!keys || keys.length === 0) return false;
+    return keys.some((key) => !!(source && source[key]));
+  }
+
+  /**
+   * The credential file to look at on this platform. `creds_file_windows`
+   * names it for a CLI that keeps its home elsewhere on Windows — Hermes uses
+   * %LOCALAPPDATA%\hermes there, so ~/.hermes/config.yaml never existed and a
+   * configured Hermes read "not configured".
+   */
+  _credsFile(checkReady) {
+    if (!checkReady) return null;
+    if (process.platform === 'win32' && checkReady.creds_file_windows) return checkReady.creds_file_windows;
+    return checkReady.creds_file || null;
+  }
+
+  _checkCredsReady(checkReady, agentType, savedEnv = null) {
+    if (this._credsFile(checkReady)) {
+      try {
+        const credsPath = this._credsFilePath(checkReady, agentType, savedEnv);
+        if (fs.existsSync(credsPath)) {
+          const stat = fs.statSync(credsPath);
+          if (stat.isDirectory()) return fs.readdirSync(credsPath).length > 0;
+          const creds = parseJsonLoose(fs.readFileSync(credsPath, 'utf-8'));
+          const verdict = classifyCreds(checkReady, creds);
+          if (verdict) return verdict === 'ready';
+          if (checkReady.creds_key) return !!creds[checkReady.creds_key];
+          return true;
+        }
+      } catch {}
+    }
+
+    // The item's presence is the signal; creds_key cannot be checked here
+    // without reading the secret out, which is what _checkMacKeychain avoids.
+    if (checkReady.keychain_service && process.platform === 'darwin') {
+      if (this._checkMacKeychain(checkReady.keychain_service)) {
+        return true;
+      }
+    }
+
+    // An item named by service AND account. A separate field from
+    // keychain_service so an older core, which would match on the service
+    // alone, skips it rather than reading someone else's item as a sign-in.
+    // agy keeps its Google sign-in as service `gemini`, account `antigravity`:
+    // the same pair it stores on Windows as the target `gemini:antigravity`.
+    const item = checkReady.keychain_item;
+    if (item && item.service && item.account && process.platform === 'darwin') {
+      if (this._checkMacKeychain(item.service, item.account)) {
+        return true;
+      }
+    }
+
+    if (checkReady.credential_target && process.platform === 'win32') {
+      if (this._checkWindowsCredential(checkReady.credential_target)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Where `creds_file` is for this machine. A CLI that keeps its sign-in in
+   * the XDG data directory (MiMo Code's auth.json) follows XDG_DATA_HOME when
+   * it is set, so `creds_xdg_data_file` names the file under it and
+   * `creds_file` stays the default — which is also all an older core reads.
+   * `creds_home_env` + `creds_home_env_file` name a CLI home variable that
+   * overrides both. The agent's own setting (`savedEnv`, what the CLI is
+   * spawned with) comes before the daemon's. Not for a WSL install: the variable here is this
+   * side's, not the distro's.
+   */
+  _credsFilePath(checkReady, agentType, savedEnv = null) {
+    const fromEnv = (name) => String((savedEnv && savedEnv[name]) || process.env[name] || '').trim();
+    let wsl = null;
+    const isWsl = () => {
+      if (wsl === null) {
+        wsl = false;
+        try { wsl = !!agentType && isWslBinary(this._whichBinary(agentType)); } catch { /* best-effort */ }
+      }
+      return wsl;
+    };
+    // A CLI home named by its own variable comes first (MiMo Code reads
+    // $MIMOCODE_HOME/data/auth.json when MIMOCODE_HOME is set).
+    const homeVar = checkReady.creds_home_env;
+    const homeRel = checkReady.creds_home_env_file;
+    const cliHome = homeVar && homeRel ? fromEnv(homeVar) : '';
+    if (cliHome && path.isAbsolute(cliHome) && !isWsl()) return path.join(cliHome, homeRel);
+    const rel = checkReady.creds_xdg_data_file;
+    const dataHome = fromEnv('XDG_DATA_HOME');
+    if (rel && dataHome && path.isAbsolute(dataHome) && !isWsl()) return path.join(dataHome, rel);
+    return this._expandHome(this._credsFile(checkReady), agentType);
+  }
+
+  /**
+   * Expand a leading "~" to the home directory the AGENT writes its sign-in to.
+   *
+   * Normally the running user's. For an agent that resolved inside WSL it is
+   * the distro's $HOME, reached over the \\wsl.localhost mount — `claude login`
+   * run in the distro leaves ~/.claude there, and expanding against the Windows
+   * profile instead reports a signed-in agent as "Not logged in".
+   */
+  _expandHome(p, agentType) {
+    if (typeof p !== 'string' || !p) return p;
+    // A Windows location named by its variable (%LOCALAPPDATA%\hermes\…).
+    if (/^%\w+%/.test(p)) {
+      const m = /^%(\w+)%[\\/]?(.*)$/.exec(p);
+      const base = m && process.env[m[1]];
+      return base ? path.join(base, m[2]) : p;
+    }
+    const home = this._homeForAgent(agentType);
+    if (p === '~') return home;
+    if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(home, p.slice(2));
+    return p;
+  }
+
+  /**
+   * Where this agent's dotfiles live, as a path this process can read. Falls
+   * back to the running user's home for every native install — and for a WSL
+   * one whose distro home could not be resolved, which is no worse than the
+   * behaviour before the WSL tier existed.
+   */
+  _homeForAgent(agentType) {
+    if (!agentType) return os.homedir();
+    try {
+      if (isWslBinary(this._whichBinary(agentType))) {
+        return wslHomeUnc() || os.homedir();
+      }
+    } catch { /* resolution is best-effort; the host home is the safe answer */ }
+    return os.homedir();
+  }
+
+  /**
+   * Existence/readability of a credential file. Returns 'present' |
+   * 'unreadable' | 'absent', or 'unknown' when the entry's creds_classifier
+   * cannot tell from the content. A non-empty readable file (or a non-empty
+   * directory) is normally 'present'. Entries with creds_json_has_entries
+   * additionally require at least one top-level JSON entry, allowing an empty
+   * auto-created {} file to remain signed out. Credential values are never
+   * logged or returned.
+   * a path that exists but cannot be statted/read is 'unreadable'. Resolves "~"
+   * against the running user's home (the daemon/launcher user), not the
+   * renderer/browser user.
+   */
+  _credsFileState(checkReady, agentType, savedEnv = null) {
+    if (!this._credsFile(checkReady)) return 'absent';
+    const p = this._credsFilePath(checkReady, agentType, savedEnv);
+    let exists = false;
+    try { exists = fs.existsSync(p); } catch { return 'unreadable'; }
+    if (!exists) return 'absent';
+    try {
+      const st = fs.statSync(p);
+      if (st.isDirectory()) return fs.readdirSync(p).length > 0 ? 'present' : 'absent';
+      fs.accessSync(p, fs.constants.R_OK);
+      if (checkReady.creds_classifier) {
+        const raw = fs.readFileSync(p, 'utf-8');
+        let parsed;
+        try { parsed = parseJsonLoose(raw); } catch { parsed = { __parse_error: true }; }
+        const verdict = classifyCreds(checkReady, parsed);
+        if (verdict) return verdict === 'ready' ? 'present' : verdict === 'unknown' ? 'unknown' : 'absent';
+      }
+      if (checkReady.creds_json_has_entries) {
+        const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        if (Array.isArray(parsed)) return parsed.length > 0 ? 'present' : 'absent';
+        if (parsed && typeof parsed === 'object') {
+          return Object.keys(parsed).length > 0 ? 'present' : 'absent';
+        }
+        return 'absent';
+      }
+      // A named field, for a file that exists in both states. Gemini's
+      // google_accounts.json is written on install and records a signed-OUT
+      // account as `active: null`, so its existence proves nothing — only the
+      // field does. Still content-free: the value is tested for emptiness, never
+      // read out, logged or returned.
+      if (checkReady.creds_key) {
+        const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        const value = parsed && typeof parsed === 'object' ? parsed[checkReady.creds_key] : null;
+        const filled = typeof value === 'string' ? !!value.trim() : !!value;
+        return filled ? 'present' : 'absent';
+      }
+      return st.size > 0 ? 'present' : 'absent';
+    } catch {
+      return 'unreadable';
+    }
+  }
+
+  /**
+   * Opt-in, content-free creds-file readiness. Active ONLY when
+   * `check_ready.creds_no_parse` is set, so existing creds_file agents (which
+   * parse + match `creds_key` via _checkCredsReady) keep their exact behavior.
+   * Returns { ready, unreadable }, plus `unknown: true` when the entry's
+   * creds_classifier cannot tell from the file.
+   */
+  _evaluateCredsFile(checkReady, agentType, savedEnv = null) {
+    if (!this._credsFile(checkReady) || !checkReady.creds_no_parse) {
+      return { ready: false, unreadable: false };
+    }
+    const state = this._credsFileState(checkReady, agentType, savedEnv);
+    return {
+      ready: state === 'present',
+      unreadable: state === 'unreadable',
+      // Only a creds_classifier can say this; left out otherwise.
+      ...(state === 'unknown' ? { unknown: true } : {}),
+    };
+  }
+
+  /**
+   * Treat the named env vars as paths to a credential FILE (e.g.
+   * GOOGLE_APPLICATION_CREDENTIALS) and count one as ready only when its target
+   * exists and is a readable file — a non-empty value alone is NOT enough.
+   * Checks both the process env and the agent's saved env.
+   */
+  _checkCredsPathEnv(checkReady, savedEnv, agentType) {
+    const names = checkReady && checkReady.creds_path_env;
+    if (!Array.isArray(names) || !names.length) return false;
+    for (const name of names) {
+      const raw = ((process.env[name] || (savedEnv && savedEnv[name]) || '') + '').trim();
+      if (!raw) continue;
+      try {
+        const p = this._expandHome(raw, agentType);
+        if (!fs.existsSync(p)) continue;
+        fs.accessSync(p, fs.constants.R_OK);
+        if (fs.statSync(p).isFile()) return true;
+      } catch { /* unreadable / bad path → not a usable credential */ }
+    }
+    return false;
+  }
+
+  /**
+   * Whether a macOS Keychain generic-password item exists for `service`.
+   *
+   * Asks for the item's attributes only. `-w` would print the stored secret,
+   * and a background process pulling a CLI's token out of the Keychain every
+   * detection round is the credential-dumping pattern EDR tools flag
+   * (CrowdStrike Falcon raised it every two minutes, once per round). Sign-in
+   * detection only needs to know the item is there, so nothing is decrypted
+   * and no ACL prompt can appear. Spawned without a shell, so the process
+   * chain ends at `security` itself.
+   *
+   * Cached like _checkWindowsCredential, and never waited on in Electron main.
+   */
+  _checkMacKeychain(service, account = null) {
+    if (!service) return false;
+    const cacheKey = account ? `${service}\u0000${account}` : service;
+    const cached = keychainItemCache.get(cacheKey);
+    const fresh = cached && (Date.now() - cached.ts) < STATUS_CACHE_TTL_MS;
+    const args = ['find-generic-password', '-s', service, ...(account ? ['-a', account] : [])];
+    if (!fresh && canBlock()) {
+      let found = false;
+      try {
+        const run = (this._spawnSyncForTest || spawnSync)('security', args, {
+          stdio: ['ignore', 'ignore', 'ignore'],
+          timeout: 5000,
+        });
+        found = !run.error && run.status === 0;
+      } catch {}
+      keychainItemCache.set(cacheKey, { found, ts: Date.now() });
+    } else if (!fresh && !keychainRefreshing.has(cacheKey)) {
+      // Answer from the last lookup now; the refresh lands for the next call.
+      keychainRefreshing.add(cacheKey);
+      try {
+        execFile('security', args, { timeout: 5000 }, (err) => {
+          keychainRefreshing.delete(cacheKey);
+          keychainItemCache.set(cacheKey, { found: !err, ts: Date.now() });
+        });
+      } catch {
+        keychainRefreshing.delete(cacheKey);
+      }
+    }
+    return !!(keychainItemCache.get(cacheKey) || {}).found;
+  }
+
+  /**
+   * Sign-in as the agent's own CLI reports it: `check_ready.status_args` run
+   * against the resolved binary and read by loginVerdict. Returns true, false,
+   * or null when there is no answer (no such check, a timeout, a crash).
+   *
+   * Unlike status_command this reads the OUTPUT, for a CLI that exits 0
+   * whether or not anyone is signed in.
+   */
+  _checkLoginStatus(checkReady, binary) {
+    const args = checkReady.status_args;
+    if (!binary || !Array.isArray(args) || !args.length) return null;
+    if (!checkReady.logged_out_pattern && !checkReady.logged_in_pattern) return null;
+    // These can still land on a shell command line (a WSL binary, a Windows
+    // .cmd launcher); a flag or a subcommand is all a status check needs.
+    if (!args.every((a) => typeof a === 'string' && /^[\w.=:-]+$/.test(a))) return null;
+
+    const command = this._cliCommand(binary, args);
+    const cached = loginStatusCache.get(command);
+    if (cached && (Date.now() - cached.ts) < STATUS_CACHE_TTL_MS) return cached.verdict;
+    // A second or more of CLI startup — see probe-mode.js.
+    if (!canBlock()) return cached ? cached.verdict : null;
+
+    let verdict = null;
+    try {
+      const run = this._spawnLoginStatus(binary, args, command);
+      if (!run.error) {
+        verdict = loginVerdict(checkReady, `${run.stdout || ''}\n${run.stderr || ''}`, run.status);
+      }
+    } catch {}
+
+    loginStatusCache.set(command, { verdict, ts: Date.now() });
+    return verdict;
+  }
+
+  /**
+   * Run a status check without a shell wherever one is not needed. On Windows
+   * Cursor's launcher is cursor-agent.cmd → PowerShell → node.exe, the chain
+   * the adapter no longer starts a turn through; when its node.exe + index.js
+   * can be found, node is started directly here too. A WSL binary, or any
+   * other Windows launcher (.cmd shims need cmd.exe), keeps the command line.
+   */
+  _spawnLoginStatus(binary, args, command) {
+    const run = this._spawnSyncForTest || spawnSync;
+    const opts = {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: getEnhancedEnv(),
+      cwd: os.homedir(),
+      timeout: LOGIN_STATUS_TIMEOUT_MS,
+      windowsHide: true,
+    };
+    if (bridgedCommandString(binary, args)) return run(command, { ...opts, shell: true });
+    if (process.platform === 'win32') {
+      const own = resolveCursorNodeEntry(binary, opts.env);
+      if (!own) return run(command, { ...opts, shell: true });
+      const [node, entry] = own;
+      // What cursor-agent.cmd would have set before handing over to node.
+      if (!opts.env.CURSOR_INVOKED_AS) opts.env = { ...opts.env, CURSOR_INVOKED_AS: path.basename(binary) };
+      return run(node, [entry, ...args], { ...opts, shell: false });
+    }
+    if (/\.(mjs|cjs|js)$/i.test(binary) || isNodeShebangScript(binary)) {
+      return run(this._nodeBinary(), [binary, ...args], { ...opts, shell: false });
+    }
+    return run(binary, args, { ...opts, shell: false });
+  }
+
+  /**
+   * Whether Windows Credential Manager holds a credential for `target` — the
+   * Windows half of keychain_service.
+   *
+   * Antigravity is what this exists for. agy keeps its Google sign-in as the
+   * generic credential `gemini:antigravity` and writes NOTHING to disk that
+   * names the account, so every other tier here comes back empty and a user
+   * looking at their own address in the CLI's header is told they are not
+   * signed in.
+   *
+   * `cmdkey /list` is the only reader available without a native module, and
+   * unlike the macOS `security` call it never prints the secret itself — only
+   * targets and user names. Two properties of its output shape this:
+   *
+   *   目标: LegacyGeneric:target=gemini:antigravity
+   *   用户: antigravity
+   *
+   * the LABELS are localized, and the whole thing is written in the console's
+   * OEM codepage (936/GBK above), which utf-8 decoding mangles. So the output is
+   * read as latin1 — lossless for the ASCII we care about — and searched for the
+   * `target=<name>` fragment, which is neither localized nor codepage-dependent.
+   */
+  _checkWindowsCredential(target) {
+    if (!target) return false;
+    const cached = credentialListCache;
+    const fresh = cached && (Date.now() - cached.ts) < STATUS_CACHE_TTL_MS;
+    // Same rule as _checkLoginStatus: never wait on a process in Electron main.
+    if (!fresh && canBlock()) {
+      let out = null;
+      try {
+        const run = (this._spawnSyncForTest || spawnSync)('cmdkey', ['/list'], {
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 5000,
+          windowsHide: true,
+          encoding: 'latin1',
+        });
+        if (!run.error && run.status === 0) out = run.stdout || '';
+      } catch {}
+      credentialListCache = { out, ts: Date.now() };
+    } else if (!fresh && !credentialListRefreshing) {
+      // Answer from the last dump now; the refresh lands for the next call.
+      credentialListRefreshing = true;
+      try {
+        execFile('cmdkey', ['/list'], { timeout: 5000, windowsHide: true, encoding: 'latin1' }, (err, stdout) => {
+          credentialListRefreshing = false;
+          credentialListCache = { out: err ? null : String(stdout || ''), ts: Date.now() };
+        });
+      } catch {
+        credentialListRefreshing = false;
+      }
+    }
+    return !!(credentialListCache && credentialListCache.out != null
+      && credentialListHasTarget(credentialListCache.out, target));
+  }
+
+  _checkStatusCommand(command) {
+    const cached = statusCache.get(command);
+    if (cached && (Date.now() - cached.ts) < STATUS_CACHE_TTL_MS) {
+      return cached.ok;
+    }
+
+    let ok = false;
+    try {
+      execSync(command, {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: getEnhancedEnv(),
+      });
+      ok = true;
+    } catch {}
+
+    statusCache.set(command, { ok, ts: Date.now() });
+    return ok;
+  }
+
+  /**
+   * Install an agent runtime.
+   * @returns {Promise<{success: boolean, output: string}>}
+   */
+  async install(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    if (!entry || !entry.install) {
+      throw new Error(`No install definition for agent type: ${agentType}`);
+    }
+
+    if (entry.install.api_only) {
+      this._markInstalled(agentType);
+      return { success: true, output: `${entry.label || agentType} uses direct API mode; no binary install needed.` };
+    }
+
+    this._assertPrereqs(agentType, entry);
+
+    let cmd = this._getInstallCommand(entry.install);
+    if (!cmd) {
+      throw new Error(`No install command for ${agentType} on ${Installer.platform()}`);
+    }
+
+    let bootstrapEnv = this._buildShellEnv();
+    let installEnv;
+    if (['hermes', 'qoder', 'qoder-cn'].includes(agentType) && process.platform === 'win32') {
+      const prepared = this._prepareWindowsPowerShellInstall(cmd, bootstrapEnv);
+      cmd = prepared.command;
+      bootstrapEnv = prepared.env;
+      installEnv = prepared.env;
+    }
+
+    // Same uv bootstrap the streaming path does — `agn install hermes` and the
+    // workspace's remote create must not behave differently from the button.
+    await this._bootstrapManagedUv(agentType, bootstrapEnv, null);
+
+    // Use bundled node/npm if system npm not available
+    const npmPrefix = cmd.startsWith('npm install') ? getRuntimePrefix(agentType) : null;
+    if (npmPrefix) {
+      const prefixDir = npmPrefix;
+      fs.mkdirSync(prefixDir, { recursive: true });
+      const args = cmd.replace('npm install', 'install --save').replace(' -g ', ` --prefix "${prefixDir}" `);
+      cmd = this._resolveNpmCommand(args);
+    }
+
+    const output = await this._execShell(cmd, 300000, installEnv);
+    if (npmPrefix) fixSpawnHelpers(npmPrefix);
+
+    // Aider-only: the curl/uv/pipx installer can exit 0 without landing a
+    // runnable (or genuine) binary, so verify the real CLI exists BEFORE
+    // recording the install. Other agent types keep the original
+    // "exit 0 → mark installed" behavior.
+    if (agentType === 'aider') {
+      const aider = this._verifyAiderBinary();
+      if (!aider) {
+        throw new Error(this._aiderBinaryNotFoundMessage());
+      }
+      this._markInstalled(agentType);
+      return {
+        success: true,
+        output: `${output}\nAider CLI resolved: ${aider.path}${aider.version ? ` (${aider.version})` : ''}`,
+      };
+    }
+
+    // Amp-only: the install script can exit 0 without landing a runnable
+    // binary, so verify the real CLI exists BEFORE recording the install.
+    if (agentType === 'amp') {
+      const amp = this._verifyAmpBinary();
+      if (!amp) {
+        throw new Error(this._ampBinaryNotFoundMessage());
+      }
+      this._markInstalled(agentType);
+      return {
+        success: true,
+        output: `${output}\nAmp CLI resolved: ${amp.path}${amp.version ? ` (${amp.version})` : ''}`,
+      };
+    }
+
+    // An npm package whose postinstall was skipped exits 0 with a placeholder
+    // where its CLI should be. See _findPostinstallStub.
+    // No live log here, so what the repair says goes into the returned output.
+    let repairLog = '';
+    const problem = await this.finishNpmInstall(agentType, (d) => { repairLog += d; });
+    if (problem) throw new Error(problem);
+
+    this._markInstalled(agentType);
+    return { success: true, output: repairLog ? `${output}\n${repairLog.trim()}` : output };
+  }
+
+  /**
+   * Install with streaming output via callback.
+   * @param {string} agentType
+   * @param {function(string)} onData - called with each chunk of output
+   * @returns {Promise<{success: boolean, command: string}>}
+   */
+  async installStreaming(agentType, onData) {
+    const { spawn } = require('child_process');
+    const entry = this.registry.getEntry(agentType);
+    if (!entry || !entry.install) {
+      throw new Error(`No install definition for agent type: ${agentType}`);
+    }
+
+    if (entry.install.api_only) {
+      if (onData) onData(`${entry.label || agentType} uses direct API mode; no binary install needed.\n`);
+      this._markInstalled(agentType);
+      if (onData) onData(`\nDone! ${agentType} is now installed.\n`);
+      return { success: true, command: 'api-only' };
+    }
+
+    this._assertPrereqs(agentType, entry, onData);
+
+    let rawCmd = this._getInstallCommand(entry.install);
+    if (!rawCmd) {
+      throw new Error(`No install command for ${agentType} on ${Installer.platform()}`);
+    }
+
+    // Auto-install Node.js if this is an npm-based agent and Node.js is missing
+    if (rawCmd.startsWith('npm install') && !this.hasNodejs()) {
+      await this.installNodejs(onData);
+    }
+
+    let env = this._buildShellEnv();
+    const isWin = process.platform === 'win32';
+    // Nobody can answer a prompt here (stdin is closed and, on Windows, the
+    // console is hidden). A git fetch that asks for credentials — a GitHub
+    // answer it reads as "sign in", or Git Credential Manager's sign-in
+    // window — then waits until the stall watchdog kills it ten minutes
+    // later. Make git fail at once instead, with its reason in the log.
+    if (env.GIT_TERMINAL_PROMPT == null) env.GIT_TERMINAL_PROMPT = '0';
+    if (env.GCM_INTERACTIVE == null) env.GCM_INTERACTIVE = 'never';
+
+    // Resolve a compatible host and keep inherited PowerShell 7 modules out
+    // of Windows PowerShell. Qoder otherwise cannot load Get-FileHash when
+    // verifying its download, just as Hermes's uv bootstrap could not load
+    // Get-ExecutionPolicy.
+    if (['hermes', 'qoder', 'qoder-cn'].includes(agentType) && isWin) {
+      const prepared = this._prepareWindowsPowerShellInstall(rawCmd, env);
+      rawCmd = prepared.command;
+      env = prepared.env;
+    }
+
+    // Hand the installer a uv it can use, so its own fragile bootstrap is
+    // never reached. No-op for every agent but hermes on Windows.
+    await this._bootstrapManagedUv(agentType, env, onData);
+
+    // Build the spawn invocation. Three shapes:
+    //   1. npm install via bundled `node npm-cli.js` — argv array, no shell.
+    //      Path-safe under non-ASCII home dirs on Windows (preferred).
+    //   2. npm install via legacy shell string (npm.cmd / npm) — fallback only
+    //      when no node + npm-cli.js layout is found; OEM-codepage corruption
+    //      means this breaks on non-ASCII paths, but still works for ASCII.
+    //   3. pip / curl / powershell — keep the legacy shell-string behaviour.
+    let spawnFile;
+    let spawnArgs = [];
+    let useShell;
+    let installCwd;
+    let displayCmd;
+
+    if (rawCmd.startsWith('npm install')) {
+      const prefixDir = getRuntimePrefix(agentType);
+      fs.mkdirSync(prefixDir, { recursive: true });
+      installCwd = prefixDir;
+
+      // `npm install [-g] <pkg…>` → install --save --prefix <dir> <pkg…>
+      const pkgArgs = rawCmd
+        .replace(/^npm install\s*/, '')
+        .replace(/(^|\s)-g(\s|$)/, ' ')
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      // Use --save so npm tracks the package in package.json (prevents pruning
+      // on next install). --registry is added only when we'd be helping — see
+      // installRegistry(); a user's own registry choice is never overridden.
+      const registry = installRegistry();
+      const direct = this._resolveNodeNpmCli();
+      // `latest` may need a Node newer than the one that will run it.
+      if (direct) {
+        const held = await this._holdBackForNode(pkgArgs, direct.node, registry, onData);
+        pkgArgs.splice(0, pkgArgs.length, ...held);
+      }
+      // The verbose log stays: it is the install's progress, and the output the
+      // stall watchdog below waits on.
+      const npmArgs = [
+        'install', '--loglevel=verbose', ...NPM_INSTALL_SPEED_FLAGS, '--save', '--prefix', prefixDir,
+        ...(registry ? ['--registry', registry] : []),
+        ...pkgArgs,
+      ];
+      displayCmd = `npm ${npmArgs.join(' ')}`;
+
+      if (direct) {
+        spawnFile = direct.node;
+        spawnArgs = [direct.npmCli, ...npmArgs];
+        useShell = false;
+        // Ensure npm's own `node` child lookups (postinstall scripts) resolve
+        // to this same runtime by putting its dir first on PATH.
+        const pathKey = Object.keys(env).find(k => k.toLowerCase() === 'path') || 'PATH';
+        const nodeDir = path.dirname(direct.node);
+        if (!(env[pathKey] || '').includes(nodeDir)) {
+          env[pathKey] = nodeDir + (isWin ? ';' : ':') + (env[pathKey] || '');
+        }
+      } else {
+        // Legacy fallback: quoted prefix inside a shell string.
+        const registryArg = registry ? `--registry ${registry} ` : '';
+        const args = `install --loglevel=verbose ${NPM_INSTALL_SPEED_FLAGS.join(' ')} --save --prefix "${prefixDir}" ${registryArg}${pkgArgs.join(' ')}`;
+        spawnFile = this._wrapForWindowsShell(this._resolveNpmCommand(args));
+        useShell = isWin ? (env.ComSpec || 'C:\\Windows\\System32\\cmd.exe') : true;
+        displayCmd = spawnFile;
+      }
+    } else {
+      // pip / curl / powershell — unchanged shell-string behaviour.
+      spawnFile = this._wrapForWindowsShell(rawCmd);
+      useShell = isWin ? (env.ComSpec || 'C:\\Windows\\System32\\cmd.exe') : true;
+      // Set cwd outside System32 on Windows.
+      installCwd = os.homedir();
+      displayCmd = spawnFile;
+    }
+
+    if (onData) onData(`$ ${displayCmd}\n\n`);
+
+    return new Promise((resolve, reject) => {
+      // windowsHide stops a console window from flashing up on every install.
+      //
+      // detached (Unix): puts the installer in its own process group, which is
+      // what makes the stall watchdog able to stop the WHOLE tree. Without it
+      // the direct child is a shell and the actual work — curl, git, uv — runs
+      // in grandchildren that survive a signal aimed at the shell. It does not
+      // change lifetime semantics: an install was never killed by the launcher
+      // exiting, before or after this.
+      const proc = spawn(spawnFile, spawnArgs, {
+        shell: useShell,
+        env,
+        cwd: installCwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+      });
+
+      if (proc.stdout) proc.stdout.setEncoding('utf-8');
+      if (proc.stderr) proc.stderr.setEncoding('utf-8');
+
+      let outputTail = '';
+      let lastOutputAt = Date.now();
+      const captureOutput = (d) => {
+        const text = String(d);
+        lastOutputAt = Date.now();
+        outputTail = (outputTail + text).slice(-4000);
+        if (onData) onData(text);
+      };
+
+      if (proc.stdout) proc.stdout.on('data', captureOutput);
+      if (proc.stderr) proc.stderr.on('data', captureOutput);
+
+      // Stall watchdog. A third-party installer that decides to wait — hermes's
+      // install.sh polls for up to 900s after asking macOS for the developer
+      // tools — otherwise hangs this promise indefinitely, and the only visible
+      // symptom is a progress bar that stopped moving. The preflight now
+      // prevents that specific case, but the general shape (a download that
+      // never returns, a prompt on a stdin nobody is reading) is not specific
+      // to any one installer, so time is bounded here for all of them.
+      let stallTimer = null;
+      let stalled = false;
+      const clearStallTimer = () => {
+        if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
+      };
+      if (INSTALL_STALL_MS > 0) {
+        stallTimer = setInterval(() => {
+          if (Date.now() - lastOutputAt < INSTALL_STALL_MS) return;
+          stalled = true;
+          clearStallTimer();
+          const minutes = Math.round(INSTALL_STALL_MS / 60000);
+          // What the installer said last is where it stopped: "Updating
+          // https://github.com/…" is a download from GitHub that never
+          // finished. Without it the stall said nothing about which step.
+          const lastLine = stallLastLine(outputTail);
+          const msg = `Install stalled: no output for ${minutes} minutes. `
+            + 'The installer was stopped. It may be waiting on a prompt, or on a '
+            + 'download that never returns.'
+            + (lastLine ? ` Last output: ${lastLine}` : '');
+          if (onData) onData(`\n${msg}\n`);
+          this._killProcessTree(proc);
+          reject(new Error(msg));
+        }, STALL_POLL_MS);
+        // Never hold the event loop open for the watchdog alone.
+        if (typeof stallTimer.unref === 'function') stallTimer.unref();
+      }
+
+      proc.on('error', (err) => { clearStallTimer(); reject(err); });
+      proc.on('close', (code) => {
+        clearStallTimer();
+        // The watchdog already rejected; this close is the kill it performed.
+        if (stalled) return;
+        if (code === 0) {
+          // An installer that exits 0 without leaving a runnable binary is
+          // the class below (aider/amp/hermes/cursor). The "…could not be
+          // found" sentence alone says nothing about WHY, and the reason is
+          // sitting in the output we just captured — hermes's install.ps1, for
+          // one, prints "[X] Installation failed: uv installation failed" and
+          // exits 0, and without the tail the launcher could only shrug
+          // ("The installer stopped before it could finish"). Carry the tail
+          // into the rejection so the message the user sees, and the copy that
+          // classifies it, both have the real error in them.
+          const failVerify = (message) => {
+            const tail = outputTail.trim();
+            if (onData) onData(`\n${message}\n`);
+            reject(new Error(tail ? `${message}\n\nInstaller output:\n${tail}` : message));
+          };
+          // Aider-only: confirm a real, genuine binary exists before recording
+          // the install (verify-before-mark; never writes a marker on
+          // failure). Other agent types are unaffected.
+          if (agentType === 'aider') {
+            const aider = this._verifyAiderBinary();
+            if (!aider) {
+              failVerify(this._aiderBinaryNotFoundMessage());
+              return;
+            }
+            if (onData) onData(`\nAider CLI resolved: ${aider.path}${aider.version ? ` (${aider.version})` : ''}\n`);
+          }
+          // Amp-only: confirm a real binary exists before recording the
+          // install (verify-before-mark; never writes a marker on failure).
+          if (agentType === 'amp') {
+            const amp = this._verifyAmpBinary();
+            if (!amp) {
+              failVerify(this._ampBinaryNotFoundMessage());
+              return;
+            }
+            if (onData) onData(`\nAmp CLI resolved: ${amp.path}${amp.version ? ` (${amp.version})` : ''}\n`);
+          }
+          // Hermes-only: its install.ps1 can exit 0 after a failed uv/setup step,
+          // so verify a real binary exists before recording the install.
+          if (agentType === 'hermes') {
+            const hermes = this._verifyHermesBinary();
+            if (!hermes) {
+              failVerify(this._hermesBinaryNotFoundMessage());
+              return;
+            }
+            if (onData) onData(`\nHermes CLI resolved: ${hermes.path}\n`);
+            // Its installer may have repointed the machine's node/npm/npx at
+            // its own Node. See node-shims.js — we report, never rewrite.
+            const shimWarning = shadowedNodeWarning(
+              entry.label || agentType,
+              detectShadowedNodeShims(),
+            );
+            if (shimWarning && onData) onData(`${shimWarning}\n`);
+          }
+          // Cursor-only: same failure shape as hermes above — its installer
+          // exits 0 after a failed download. See _verifyCursorBinary.
+          if (agentType === 'cursor') {
+            const cursor = this._verifyCursorBinary();
+            if (!cursor) {
+              failVerify(this._cursorBinaryNotFoundMessage());
+              return;
+            }
+            if (onData) onData(`\nCursor CLI resolved: ${cursor.path}\n`);
+          }
+          if (rawCmd.startsWith('npm install')) {
+            const fixed = fixSpawnHelpers(installCwd);
+            if (fixed.length && onData) onData(`\nMade ${fixed.length} node-pty spawn-helper(s) executable.\n`);
+          }
+          const markDone = () => {
+            this._markInstalled(agentType);
+            if (onData) onData(`\nDone! ${agentType} is now installed.\n`);
+            resolve({ success: true, command: displayCmd });
+          };
+          // An npm install can exit 0 with no runnable CLI: the native build
+          // left out, or the postinstall skipped. See finishNpmInstall (null
+          // for an agent that is not an npm install).
+          this.finishNpmInstall(agentType, onData).then((problem) => {
+            if (!problem) return markDone();
+            if (onData) onData(`\n${problem}\n`);
+            reject(new Error(problem));
+          }, reject);
+        } else {
+          // A partial install can leave a placeholder stub at
+          // bin/<binary>.exe and npm-generated cmd-shims under
+          // node_modules/.bin/<name>{,.cmd,.ps1} that point to it. On
+          // Windows, anything that later tries to run the binary (a health
+          // check, a shell open) triggers a "this app can't run on your PC"
+          // dialog because the stub isn't a real PE executable. Sweep them
+          // up so the next install (or uninstall+reinstall) starts clean.
+          try {
+            this._cleanStaleShims(agentType);
+            this._cleanStubBinary(agentType);
+          } catch {}
+          const tail = outputTail.trim();
+          const msg = tail
+            ? `Install failed with exit code ${code}\nCommand: ${displayCmd}\n\n${tail}`
+            : `Install failed with exit code ${code}\nCommand: ${displayCmd}`;
+          if (onData) onData(`\n${msg}\n`);
+          reject(new Error(msg));
+        }
+      });
+    });
+  }
+
+  /**
+   * Remove the placeholder bin/<binary>.exe (and the npm package directory
+   * if it's effectively empty) left over from a failed postinstall.
+   */
+  _cleanStubBinary(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    const install = entry && entry.install;
+    if (!install) return;
+    const binary = install.binary || agentType;
+    const npmPkg = install.npm_package
+      || (() => {
+          const cmd = this._getInstallCommand(install);
+          if (!cmd || !cmd.includes('npm install')) return null;
+          const m = cmd.match(/npm install\s+(?:-g\s+)?(@?[\w-]+(?:\/[\w-]+)?)(?:@\S*)?$/);
+          return m ? m[1] : null;
+        })();
+    if (!npmPkg) return;
+
+    const prefix = getRuntimePrefix(agentType);
+    const pkgDir = path.join(prefix, 'node_modules', npmPkg);
+    const stubDir = path.join(pkgDir, 'bin');
+    for (const ext of ['', '.exe', '.cmd', '.ps1']) {
+      try {
+        const f = path.join(stubDir, binary + ext);
+        if (fs.existsSync(f) && fs.statSync(f).size < 4096) fs.unlinkSync(f);
+      } catch {}
+    }
+  }
+
+  /** The npm package an agent installs from, or null when it isn't an npm install. */
+  _npmPackageFor(install) {
+    if (!install) return null;
+    if (install.npm_package) return install.npm_package;
+    const cmd = this._getInstallCommand(install);
+    if (!cmd || !cmd.includes('npm install')) return null;
+    const m = cmd.match(/npm install\s+(?:-g\s+)?(@?[\w-]+(?:\/[\w-]+)?)(?:@\S*)?$/);
+    return m ? m[1] : null;
+  }
+
+  /**
+   * The managed copy of an agent whose executable is still the placeholder its
+   * npm package ships, or null.
+   *
+   * opencode-ai (and @anthropic-ai/claude-code) publish a few hundred bytes of
+   * shell as their `bin` and have their postinstall script swap the real
+   * native binary in. With `ignore-scripts=true` in the user's npmrc — a
+   * common hardening setting — npm skips that script and still exits 0, so
+   * "exit 0 → mark installed" recorded an agent that cannot start: the
+   * marketplace said installed, the model list would not load, and every
+   * message failed. An install is not done until the placeholder is gone.
+   *
+   * @returns {{ pkgName: string, bin: string, prefix: string } | null}
+   */
+  _findPostinstallStub(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    const install = entry && entry.install;
+    const pkgName = this._npmPackageFor(install);
+    if (!pkgName) return null;
+    const bin = resolveManagedNpmPackageBin(agentType, pkgName, install.binary || agentType);
+    if (!bin || !isPostinstallStub(bin)) return null;
+    const prefixes = [getRuntimePrefix(agentType), path.join(os.homedir(), '.openagents', 'nodejs')];
+    const prefix = prefixes.find((p) => bin.startsWith(path.join(p, 'node_modules') + path.sep));
+    return prefix ? { pkgName, bin, prefix } : null;
+  }
+
+  /**
+   * Run the install scripts npm skipped, for this one package. `npm rebuild
+   * <pkg>` is npm's own way of doing that, and a flag on the command line
+   * outranks the `ignore-scripts=true` in an npmrc — which stays in force for
+   * every other package and every other install.
+   */
+  _rebuildWithScripts(pkgName, prefix) {
+    return this._runNpmIn(prefix, ['rebuild', pkgName, '--prefix', prefix, '--ignore-scripts=false', '--foreground-scripts']);
+  }
+
+  /**
+   * Install the per-platform package that holds a wrapper's native build, on
+   * its own (see native-build.js). `--include=optional` outranks an
+   * `omit=optional` in an npmrc for this one command; `--no-save` keeps it out
+   * of the runtime's package.json, so the next update resolves it afresh with
+   * the wrapper's new version instead of pinning this one. From the registry
+   * the install itself used (installRegistry): where the official one is out
+   * of reach, the build's download is the one most likely to have failed.
+   */
+  _installNativeBuildPackage(build, prefix) {
+    const registry = installRegistry();
+    return this._runNpmIn(prefix, [
+      'install', `${build.name}@${build.spec}`, '--prefix', prefix,
+      '--no-save', '--include=optional', '--foreground-scripts',
+      ...(registry ? ['--registry', registry] : []),
+    ]);
+  }
+
+  /** Run npm with an argv (never a shell string) in `prefix`; resolves its output, rejects with it. */
+  _runNpmIn(prefix, args) {
+    const env = this._buildShellEnv();
+    const run = this._execFileForTest || execFile;
+    const runNpm = (file, argv, extra = {}) => new Promise((resolve, reject) => {
+      run(file, argv, {
+        encoding: 'utf-8',
+        timeout: 300000,
+        maxBuffer: 16 * 1024 * 1024,
+        env,
+        cwd: prefix,
+        windowsHide: true,
+        ...extra,
+      }, (error, stdout, stderr) => {
+        const output = `${stdout || ''}\n${stderr || ''}`.trim();
+        if (error) reject(new Error(output || error.message));
+        else resolve(output);
+      });
+    });
+    const direct = this._resolveNodeNpmCli();
+    if (!direct) {
+      const win = process.platform === 'win32';
+      const npm = whichBinary('npm') || (win ? 'npm.cmd' : 'npm');
+      // npm.cmd is a batch file and only runs through cmd.exe. With shell:true
+      // Node joins the argv with spaces, so quote the ones that contain any —
+      // or a character cmd.exe would act on (a `^1.2.3` version range).
+      if (win && /\.(cmd|bat)$/i.test(npm)) {
+        const q = (a) => (/[\s^&|<>()]/.test(a) ? `"${a}"` : a);
+        return runNpm(q(npm), args.map(q), { shell: true });
+      }
+      return runNpm(npm, args);
+    }
+    // As for the install itself: the script's own `node` has to resolve to the
+    // runtime npm is running on.
+    const pathKey = Object.keys(env).find((k) => k.toLowerCase() === 'path') || 'PATH';
+    const nodeDir = path.dirname(direct.node);
+    if (!(env[pathKey] || '').includes(nodeDir)) {
+      env[pathKey] = nodeDir + path.delimiter + (env[pathKey] || '');
+    }
+    return runNpm(direct.node, [direct.npmCli, ...args]);
+  }
+
+  /**
+   * The check install() and installStreaming() make once npm has exited 0, for
+   * a caller that ran npm itself — the launcher installs a version-pinned agent
+   * (opencode among them) with its own npm call. Resolves null when the CLI is
+   * real, repaired if it had to be; otherwise the message to show, with the
+   * package already taken back out.
+   */
+  async finishNpmInstall(agentType, onData) {
+    // The native build first: with it missing, claude-code's and opencode-ai's
+    // postinstall ran and had nothing to copy, and re-running the script (the
+    // placeholder repair below) cannot help until it is there.
+    const missing = this._findMissingNativeBuild(agentType);
+    let nativeRestored = false;
+    if (missing) {
+      const problem = await this._restoreNativeBuild(agentType, missing, onData);
+      if (problem) return problem;
+      nativeRestored = true;
+    }
+    const stub = this._findPostinstallStub(agentType);
+    return stub ? this._repairPostinstallStub(agentType, stub, onData, { nativeRestored }) : null;
+  }
+
+  /**
+   * The managed copy of an agent's npm package — `{ pkgName, pkgDir, prefix }`
+   * — or null when it is not an npm install or is not there.
+   */
+  _managedNpmPackage(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    const pkgName = this._npmPackageFor(entry && entry.install);
+    if (!pkgName) return null;
+    const prefixes = [getRuntimePrefix(agentType), path.join(os.homedir(), '.openagents', 'nodejs')];
+    for (const prefix of prefixes) {
+      const pkgDir = path.join(prefix, 'node_modules', ...pkgName.split('/'));
+      if (fs.existsSync(path.join(pkgDir, 'package.json'))) return { pkgName, pkgDir, prefix };
+    }
+    return null;
+  }
+
+  /**
+   * The managed copy of an agent whose per-platform native build npm left out
+   * (see native-build.js), or null — also when the package has none to check.
+   *
+   * @returns {{ pkgName: string, pkgDir: string, prefix: string, build: object } | null}
+   */
+  _findMissingNativeBuild(agentType) {
+    const managed = this._managedNpmPackage(agentType);
+    if (!managed) return null;
+    const build = nativeBuildFor(managed.pkgDir);
+    if (!build || build.installed) return null;
+    // opencode-ai's postinstall fetches the build itself when npm left it out,
+    // copies the binary over its placeholder and deletes the package again
+    // (see COPIED_INTO_BIN). Installing it once more was redundant, and when
+    // that failed the working install was removed. Read off disk, not run:
+    // on Windows the placeholder is shell text named .exe.
+    if (build.copiedIntoBin) {
+      const entry = this.registry.getEntry(agentType);
+      const binary = (entry && entry.install && entry.install.binary) || agentType;
+      const bin = resolveManagedNpmPackageBin(agentType, managed.pkgName, binary);
+      if (bin && !isPostinstallStub(bin)) return null;
+    }
+    return { ...managed, build };
+  }
+
+  /**
+   * Install the native build npm left out. Resolves null once it is in place,
+   * otherwise the message to show — with the package taken back out, as for a
+   * placeholder that cannot be repaired: left in place it reads as installed.
+   */
+  async _restoreNativeBuild(agentType, missing, onData) {
+    const entry = this.registry.getEntry(agentType);
+    const label = (entry && entry.label) || agentType;
+    const { build, prefix, pkgDir } = missing;
+    if (onData) {
+      onData(`\nnpm did not install ${build.name}, the package that holds ${label}'s native build for `
+        + `${build.target} (an optional dependency of ${build.pkgName}). Installing it on its own now.\n`);
+    }
+    let output = '';
+    try {
+      output = await this._installNativeBuildPackage(build, prefix);
+    } catch (e) {
+      output = (e && e.message) || '';
+    }
+    const now = nativeBuildFor(pkgDir);
+    if (now && now.installed) {
+      try { clearBinaryLookupCache(); } catch {}
+      if (onData) onData(`${build.name} is in place: ${now.installed}\n`);
+      return null;
+    }
+    try {
+      this._cleanStaleShims(agentType);
+      fs.rmSync(pkgDir, { recursive: true, force: true });
+    } catch {}
+    const tail = output.trim().slice(-2000);
+    return `${label} was downloaded, but not its native build for this computer: npm did not install `
+      + `${build.name} (an optional dependency of ${build.pkgName}), so ${label} cannot start. npm leaves `
+      + 'an optional dependency out without failing the install when its download fails, or when optional '
+      + 'dependencies are turned off (omit=optional in an npmrc). Installing it on its own failed too. '
+      + `Check this computer's connection to the npm registry, then install ${label} again.`
+      + (tail ? `\n\nnpm output:\n${tail}` : '');
+  }
+
+  /**
+   * Whether the CLI at `binPath` (a symlink or npm shim is followed) is the
+   * placeholder of a package whose postinstall was skipped. Check only — for
+   * a caller that updated a copy we do not manage and must not repair.
+   */
+  isPostinstallStubAt(binPath) {
+    return isPostinstallStub(binPath);
+  }
+
+  /**
+   * Finish an install that left a placeholder (see _findPostinstallStub).
+   * Resolves null once the real binary is in place, otherwise the message the
+   * user should see.
+   *
+   * When the script cannot be made to run, the package comes back out — which
+   * is what npm does itself when a postinstall fails. Left in place it reads
+   * as installed (its package.json is there), and deleting only the
+   * placeholder is worse: the next `npm install` finds the package up to date,
+   * restores nothing, and with no placeholder left to notice the install gets
+   * recorded as good.
+   */
+  async _repairPostinstallStub(agentType, stub, onData, { nativeRestored = false } = {}) {
+    const entry = this.registry.getEntry(agentType);
+    const label = (entry && entry.label) || agentType;
+    // The user asked npm to skip install scripts; this lets them say the
+    // repair must not run one either.
+    const optedOut = scriptRepairDisabled();
+    // With the native build only just restored, the script did run — it had
+    // nothing to copy. Otherwise npm skipped it.
+    const why = nativeRestored
+      ? `${stub.pkgName}'s install script ran before its native build was there, so the ${label} CLI is `
+        + 'still a placeholder.'
+      : `npm skipped ${stub.pkgName}'s install script (ignore-scripts), so the ${label} CLI is only `
+        + 'a placeholder.';
+    let output = '';
+    if (optedOut) {
+      if (onData) onData(`\n${why} OPENAGENTS_NO_SCRIPT_REPAIR=1 is set, so it is not being run.\n`);
+    } else {
+      if (onData) {
+        onData(`\n${why} Running it for this one package now — set OPENAGENTS_NO_SCRIPT_REPAIR=1 to refuse.\n`);
+      }
+      try {
+        output = await this._rebuildWithScripts(stub.pkgName, stub.prefix);
+      } catch (e) {
+        output = (e && e.message) || '';
+      }
+    }
+    if (!optedOut && !isPostinstallStub(stub.bin) && fs.existsSync(stub.bin)) {
+      try { clearBinaryLookupCache(); } catch {}
+      if (onData) onData(`${label} CLI is in place: ${stub.bin}\n`);
+      return null;
+    }
+    try {
+      this._cleanStaleShims(agentType);
+      fs.rmSync(path.join(stub.prefix, 'node_modules', stub.pkgName), { recursive: true, force: true });
+    } catch {}
+    const tail = output.trim().slice(-2000);
+    if (nativeRestored) {
+      return `${label} was downloaded, but its setup could not be finished: ${stub.pkgName}'s `
+        + 'install script did not put its native build in place, so its CLI is only a placeholder. '
+        + (optedOut
+          ? 'OPENAGENTS_NO_SCRIPT_REPAIR=1 stops OpenAgents from running the script again. '
+          : 'Running the script again did not produce the binary either. ')
+        + `Install ${label} again.`
+        + (tail ? `\n\nnpm output:\n${tail}` : '');
+    }
+    return `${label} was downloaded, but its setup could not be finished: ${stub.pkgName}'s `
+      + 'postinstall script did not run, so its CLI is only a placeholder. npm is set to skip '
+      + 'install scripts (ignore-scripts=true in an npmrc), and '
+      + (optedOut
+        ? 'OPENAGENTS_NO_SCRIPT_REPAIR=1 stops OpenAgents from running the script for this one package. '
+        : 'running the script for this one package did not produce the binary either '
+          + '(set OPENAGENTS_NO_SCRIPT_REPAIR=1 if you do not want OpenAgents to try). ')
+      + `Allow install scripts for npm, then install ${label} again.`
+      + (tail ? `\n\nnpm output:\n${tail}` : '');
+  }
+
+  /**
+   * Uninstall an agent runtime.
+   * @returns {Promise<{success: boolean, output: string}>}
+   */
+  async uninstall(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    if (!entry || !entry.install) {
+      throw new Error(`No install definition for agent type: ${agentType}`);
+    }
+
+    if (entry.install.api_only) {
+      this._markUninstalled(agentType);
+      return { success: true, output: `${entry.label || agentType} API-only install marker removed.` };
+    }
+
+    const installCmd = this._getInstallCommand(entry.install);
+    const uninstallCmd = this._deriveUninstallCommand(installCmd, agentType);
+    if (!uninstallCmd) {
+      throw new Error(`Cannot derive uninstall command for ${agentType}`);
+    }
+
+    const output = await this._execShell(uninstallCmd);
+    this._markUninstalled(agentType);
+    // Clean stale shims (npm sometimes leaves .cmd/.ps1 files behind)
+    this._cleanStaleShims(agentType);
+    return { success: true, output };
+  }
+
+  _cleanStaleShims(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    const binary = entry && entry.install ? entry.install.binary : agentType;
+    if (!binary) return;
+
+    // Clean from isolated runtime prefix
+    const runtimeBin = path.join(getRuntimePrefix(agentType), 'node_modules', '.bin');
+
+    // Clean from legacy shared prefix
+    const legacyDir = path.join(os.homedir(), '.openagents', 'nodejs');
+    const legacyBin = path.join(legacyDir, 'node_modules', '.bin');
+
+    for (const dir of [runtimeBin, legacyDir, legacyBin]) {
+      for (const ext of ['', '.cmd', '.ps1']) {
+        const shimPath = path.join(dir, binary + ext);
+        try { if (fs.existsSync(shimPath)) fs.unlinkSync(shimPath); } catch {}
+      }
+    }
+  }
+
+  /**
+   * Uninstall with streaming output via callback.
+   */
+  async uninstallStreaming(agentType, onData) {
+    const { spawn } = require('child_process');
+    const entry = this.registry.getEntry(agentType);
+    if (!entry || !entry.install) {
+      throw new Error(`No install definition for agent type: ${agentType}`);
+    }
+
+    if (entry.install.api_only) {
+      if (onData) onData(`${entry.label || agentType} uses direct API mode; removing install marker.\n`);
+      this._markUninstalled(agentType);
+      if (onData) onData(`\nDone! ${agentType} has been uninstalled.\n`);
+      return { success: true, command: 'api-only' };
+    }
+
+    const installCmd = this._getInstallCommand(entry.install);
+    let rawCmd = this._deriveUninstallCommand(installCmd, agentType);
+    if (!rawCmd) {
+      throw new Error(`Cannot derive uninstall command for ${agentType}`);
+    }
+
+    // Resolve npm to use bundled node if system npm is not available
+    let cmd = rawCmd;
+    if (rawCmd.startsWith('npm uninstall')) {
+      const args = rawCmd.replace('npm uninstall', 'uninstall --loglevel=verbose --no-save');
+      cmd = this._resolveNpmCommand(args);
+    }
+
+    cmd = this._wrapForWindowsShell(cmd);
+
+    if (onData) onData(`$ ${cmd}\n\n`);
+
+    const env = this._buildShellEnv();
+    const shell = process.platform === 'win32'
+      ? (process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe')
+      : true;
+
+    return new Promise((resolve, reject) => {
+      const proc = spawn(cmd, [], { shell, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+
+      if (proc.stdout) proc.stdout.setEncoding('utf-8');
+      if (proc.stderr) proc.stderr.setEncoding('utf-8');
+
+      if (proc.stdout) proc.stdout.on('data', (d) => { if (onData) onData(d); });
+      if (proc.stderr) proc.stderr.on('data', (d) => { if (onData) onData(d); });
+
+      proc.on('error', (err) => reject(err));
+      proc.on('close', (code) => {
+        if (code === 0) {
+          this._markUninstalled(agentType);
+          this._cleanStaleShims(agentType);
+          if (onData) onData(`\nDone! ${agentType} has been uninstalled.\n`);
+          resolve({ success: true, command: cmd });
+        } else {
+          const msg = `Uninstall failed with exit code ${code}`;
+          if (onData) onData(`\n${msg}\n`);
+          reject(new Error(msg));
+        }
+      });
+    });
+  }
+
+  /**
+   * Refuse to run a third-party installer whose hard dependencies are missing.
+   *
+   * See install-preflight.js for why this is worth doing before the spawn: the
+   * scripts we shell out to handle a missing dependency by opening OS dialogs
+   * and sleeping for minutes, which the launcher can only render as a frozen
+   * progress bar.
+   */
+  _assertPrereqs(agentType, entry, onData, check = checkInstallPrereqs) {
+    const { ok, missing } = check(entry);
+    if (ok) return;
+    const err = missingPrereqError(entry.label || agentType, missing);
+    if (onData) onData(`${err.message}\n`);
+    throw err;
+  }
+
+  /**
+   * Stop a spawned installer and everything it started.
+   *
+   * The child is usually a shell (`curl … | bash`, powershell) whose real work
+   * happens in grandchildren, so signalling the direct child alone leaves the
+   * download running. On Unix the process group is signalled; on Windows
+   * taskkill /T walks the tree.
+   */
+  _killProcessTree(proc) {
+    if (!proc || proc.exitCode !== null) return;
+    try {
+      if (process.platform === 'win32') {
+        try {
+          execSync(`taskkill /F /T /PID ${proc.pid}`, {
+            stdio: 'ignore', timeout: 5000, windowsHide: true,
+          });
+        } catch { proc.kill(); }
+        return;
+      }
+      try { process.kill(-proc.pid, 'SIGTERM'); } catch { proc.kill('SIGTERM'); }
+      setTimeout(() => {
+        if (proc.exitCode !== null) return;
+        try { process.kill(-proc.pid, 'SIGKILL'); } catch { proc.kill('SIGKILL'); }
+      }, 5000).unref();
+    } catch {
+      /* the process is already gone */
+    }
+  }
+
+  /**
+   * Get install command for current platform.
+   */
+  _getInstallCommand(installCfg) {
+    const plat = Installer.platform();
+    return installCfg[plat] || installCfg.command || installCfg.npm || null;
+  }
+
+  /**
+   * Derive uninstall command from install command.
+   * @param {string} installCmd
+   * @param {string} [agentType] - used to resolve the isolated runtime prefix
+   */
+  _deriveUninstallCommand(installCmd, agentType) {
+    if (!installCmd) return null;
+
+    // npm install -g <pkg> → npm uninstall --prefix <runtimeDir> <pkg>
+    if (installCmd.includes('npm install')) {
+      const prefixDir = agentType ? getRuntimePrefix(agentType) : path.join(os.homedir(), '.openagents', 'nodejs');
+      const cmd = installCmd
+        .replace('npm install -g', `npm uninstall --prefix "${prefixDir}"`)
+        .replace('npm install', 'npm uninstall');
+      // Drop the version spec, whatever shape it takes. This used to be two
+      // blind global replaces — `@latest` and `@[\d.]+` — and the second one
+      // understood only digits and dots, so a PRERELEASE pin was cut in half:
+      //   @deepseek-ai/dsh@0.1.0-rc.6  →  @deepseek-ai/dsh-rc.6
+      // npm exits 0 when asked to remove a package that is not installed, so
+      // the uninstall reported success, removed nothing, and left the agent
+      // looking installed forever. Anchoring to the package token at the end of
+      // the command makes the shape of the version irrelevant.
+      return cmd.replace(/(\s@?[\w-]+(?:\/[\w-]+)?)@\S+\s*$/, '$1');
+    }
+
+    // pip install <pkg> → pip uninstall -y <pkg>
+    if (installCmd.includes('pip install') || installCmd.includes('pip3 install')) {
+      return installCmd
+        .replace('pip install', 'pip uninstall -y')
+        .replace('pip3 install', 'pip3 uninstall -y');
+    }
+
+    // pipx install <pkg> → pipx uninstall <pkg>
+    if (installCmd.includes('pipx install')) {
+      return installCmd.replace('pipx install', 'pipx uninstall');
+    }
+
+    return null;
+  }
+
+  /**
+   * Find a binary on PATH (delegates to paths.js for cross-platform detection).
+   */
+  _whichBinary(agentType) {
+    const entry = this.registry.getEntry(agentType);
+    const binary = entry && entry.install ? entry.install.binary : agentType;
+    const aliases = entry && entry.install && Array.isArray(entry.install.binary_aliases)
+      ? entry.install.binary_aliases
+      : [];
+    // Tier 0: the copy THIS launcher installed, when there really is one.
+    //
+    // getInstallInfo() checks the isolated runtime prefix before anything else,
+    // so an agent with a managed install reports location:'runtime' and shows
+    // that copy's version. A PATH lookup, though, hits the user's own global
+    // copy first — /usr/local/bin and the node-manager bins all rank above
+    // ~/.openagents/runtimes/*/node_modules/.bin. The two then disagree about
+    // which binary is in play: the marketplace said "opencode 1.18.25,
+    // managed" while every run spawned the 1.17 the user had installed
+    // themselves, and pressing Update changed the number without changing the
+    // program. Gated on the package actually being present so a stale shim
+    // still falls through to a working global install.
+    const managed = this._resolveManagedBinary(agentType, entry, binary, aliases);
+    if (managed) return managed;
+
+    // allowWsl:false — whichBinary would otherwise end its own search inside
+    // the distro, and this method still has two NATIVE tiers to run below. A
+    // Windows copy must win over a WSL one; resolveBinaryInKnownDirs() reaches
+    // the distro at the very end, once everything on this side has missed.
+    for (const candidate of [binary, ...aliases]) {
+      const found = whichBinary(candidate, { allowWsl: false });
+      if (found) return found;
+    }
+    // Fallback: resolve the installed package's OWN bin from its package.json
+    // when npm did not create a node_modules/.bin/<binary> shim for the
+    // top-level package. This happens for packages whose `bin` path is
+    // declared as "./bin/x" (e.g. Cline): a local `npm install --prefix DIR`
+    // links dependency bins but not the explicitly-installed root package's,
+    // so a PATH lookup finds nothing even though the CLI is present and
+    // runnable. Generic and backward-compatible — only runs after PATH misses.
+    const pkgBin = this._resolvePackageBin(agentType, entry, binary);
+    if (pkgBin) return pkgBin;
+    // Last: check the known install dirs on disk. A PATH lookup misses a CLI
+    // whose installer only edited the *registry* PATH (Cursor, Amp, Hermes on
+    // Windows) until the process restarts, and the launcher — which resolves
+    // through here — then reports a working install as missing and offers a
+    // terminal running a bare command that cannot resolve either. Each adapter
+    // already does this search; this puts it in the one place the launcher
+    // actually calls.
+    return resolveBinaryInKnownDirs([binary, ...aliases], agentType);
+  }
+
+  /**
+   * The launcher-installed copy of an agent's CLI, or null.
+   *
+   * Only answers when the agent's npm package is really unpacked in one of our
+   * prefixes — an orphaned `.bin` shim is not a managed install, and treating
+   * it as one would shadow a perfectly good global CLI with something that
+   * cannot run.
+   */
+  _resolveManagedBinary(agentType, entry, binary, aliases) {
+    const npmPkg = entry && entry.install ? entry.install.npm_package : null;
+    const installCmd = entry && entry.install ? this._getInstallCommand(entry.install) : null;
+    let npmPkgFromCmd = null;
+    if (!npmPkg && installCmd && installCmd.includes('npm install')) {
+      const m = installCmd.match(/npm install\s+(?:-g\s+)?(@?[\w-]+(?:\/[\w-]+)?)(?:@\S*)?$/);
+      if (m) npmPkgFromCmd = m[1];
+    }
+    const pkgName = npmPkg || npmPkgFromCmd;
+    if (!pkgName) return null; // script-installed agent: nothing of ours to prefer
+
+    return resolveManagedNpmBinary(agentType, pkgName, [binary, ...aliases]);
+  }
+
+  /**
+   * Resolve the absolute path to a package's own executable from its
+   * package.json `bin` field, searched in the runtime and legacy prefixes.
+   * Returns null when not installed there or the bin file is missing.
+   */
+  _resolvePackageBin(agentType, entry, binary) {
+    // Derive the npm package name the same way getInstallInfo does.
+    const npmPkg = entry && entry.install ? entry.install.npm_package : null;
+    const installCmd = entry && entry.install ? this._getInstallCommand(entry.install) : null;
+    let npmPkgFromCmd = null;
+    if (!npmPkg && installCmd && installCmd.includes('npm install')) {
+      const m = installCmd.match(/npm install\s+(?:-g\s+)?(@?[\w-]+(?:\/[\w-]+)?)(?:@\S*)?$/);
+      if (m) npmPkgFromCmd = m[1];
+    }
+    const pkgName = npmPkg || npmPkgFromCmd || binary;
+    return resolveManagedNpmPackageBin(agentType, pkgName, binary);
+  }
+
+  // -- Markers --
+
+  _hasMarker(agentType) {
+    // Check per-agent marker file first (faster)
+    try {
+      if (fs.existsSync(path.join(this.markersDir, agentType))) return true;
+    } catch {}
+
+    // Check JSON markers file
+    try {
+      if (fs.existsSync(this.markersFile)) {
+        const data = JSON.parse(fs.readFileSync(this.markersFile, 'utf-8'));
+        if (Array.isArray(data) && data.includes(agentType)) return true;
+      }
+    } catch {}
+
+    return false;
+  }
+
+  _markInstalled(agentType) {
+    // JSON file
+    try {
+      fs.mkdirSync(this.configDir, { recursive: true });
+      let markers = [];
+      try {
+        markers = JSON.parse(fs.readFileSync(this.markersFile, 'utf-8'));
+        if (!Array.isArray(markers)) markers = [];
+      } catch {}
+      if (!markers.includes(agentType)) {
+        markers.push(agentType);
+        markers.sort();
+      }
+      fs.writeFileSync(this.markersFile, JSON.stringify(markers), 'utf-8');
+    } catch {}
+
+    // Per-agent marker file
+    try {
+      fs.mkdirSync(this.markersDir, { recursive: true });
+      fs.writeFileSync(path.join(this.markersDir, agentType), '', 'utf-8');
+    } catch {}
+
+    // Drop the 30s PATH/whichBinary caches so the very next getInstallInfo
+    // sees the freshly-created bin dir (e.g. ~/.cursor/bin) instead of the
+    // pre-install snapshot. Without this, install completes but UI keeps
+    // showing "not installed" until the cache expires. Also drop the version
+    // cache so an upgrade's new version is reflected immediately.
+    try { clearBinaryLookupCache(); } catch {}
+    try { clearVersionCache(); } catch {}
+  }
+
+  _markUninstalled(agentType) {
+    // JSON file
+    try {
+      if (fs.existsSync(this.markersFile)) {
+        let markers = JSON.parse(fs.readFileSync(this.markersFile, 'utf-8'));
+        if (Array.isArray(markers)) {
+          markers = markers.filter((m) => m !== agentType);
+          fs.writeFileSync(this.markersFile, JSON.stringify(markers), 'utf-8');
+        }
+      }
+    } catch {}
+
+    // Per-agent marker file
+    try {
+      const markerFile = path.join(this.markersDir, agentType);
+      if (fs.existsSync(markerFile)) fs.unlinkSync(markerFile);
+    } catch {}
+
+    // Symmetric with _markInstalled: invalidate so detection re-runs cleanly.
+    try { clearBinaryLookupCache(); } catch {}
+    try { clearVersionCache(); } catch {}
+  }
+
+  // -- Shell env + exec --
+
+  _buildShellEnv() {
+    const env = { ...process.env };
+    const sep = process.platform === 'win32' ? ';' : ':';
+    const extraDirs = [];
+    try { extraDirs.push(path.dirname(process.execPath)); } catch {}
+
+    // Whether a usable `node` is already reachable WITHOUT the bundled
+    // standalone node.exe. We must avoid shadowing a working system node with
+    // the launcher's bundled exe: that file is an unsigned standalone
+    // node.exe and on some Windows machines Defender/SmartScreen blocks
+    // CreateProcess on it, which surfaces as `cmd: 拒绝访问` ("Access
+    // Denied") when npm runs `node install.cjs` for packages like
+    // @anthropic-ai/claude-code, plus a "this app can't run on your PC"
+    // dialog.
+    const bundledDir = path.join(this.configDir, 'nodejs');
+    const hasSystemNode = this._hasSystemNode(bundledDir);
+
+    if (process.platform === 'win32') {
+      const appData = env.APPDATA || '';
+      if (appData) extraDirs.push(path.join(appData, 'npm'));
+      extraDirs.push(env.ProgramFiles ? path.join(env.ProgramFiles, 'nodejs') : 'C:\\Program Files\\nodejs');
+      extraDirs.push(env.SystemRoot ? path.join(env.SystemRoot, 'System32') : 'C:\\Windows\\System32');
+      extraDirs.push(env.ProgramFiles ? path.join(env.ProgramFiles, 'Git', 'cmd') : 'C:\\Program Files\\Git\\cmd');
+
+      // Bundled node — fallback only. Skip if system node works, otherwise
+      // verify the bundled exe can actually launch before exposing it.
+      if (!hasSystemNode) {
+        try {
+          if (fs.existsSync(bundledDir)) {
+            const directExe = path.join(bundledDir, 'node.exe');
+            if (fs.existsSync(directExe) && this._canExecute(directExe)) {
+              extraDirs.unshift(bundledDir);
+            }
+            for (const entry of fs.readdirSync(bundledDir).filter(e => e.startsWith('node-'))) {
+              const nested = path.join(bundledDir, entry);
+              if (fs.existsSync(path.join(nested, 'node.exe')) && this._canExecute(path.join(nested, 'node.exe'))) {
+                extraDirs.unshift(nested);
+              }
+            }
+          }
+        } catch {}
+      }
+    } else {
+      extraDirs.push('/usr/local/bin', '/opt/homebrew/bin');
+      if (!hasSystemNode) {
+        try {
+          const candidates = [
+            path.join(bundledDir, 'bin', 'node'),
+            path.join(bundledDir, 'node'),
+          ];
+          for (const bin of candidates) {
+            if (fs.existsSync(bin) && this._canExecute(bin)) {
+              extraDirs.unshift(path.dirname(bin));
+              break;
+            }
+          }
+        } catch {}
+      }
+    }
+    // Where a user-level installer puts things, on every platform. uv's own
+    // `curl … | sh` (and its Windows script) install into ~/.local/bin and add
+    // it to PATH through a shell profile that a GUI-launched process never
+    // reads — so an install command that IS `uv tool install …` died with
+    // "uv: command not found" on a machine that had uv. install-preflight's
+    // probeUv already searches these two, so leaving them out here meant the
+    // pre-flight passed and the spawn it was guarding then failed.
+    // unshift, not push: the loop below PREPENDS each entry, so the first one
+    // here ends up LAST on PATH. These are a fallback for a binary nothing else
+    // provides — they must never shadow the user's own PATH or the runtime
+    // directories above.
+    extraDirs.unshift(
+      path.join(os.homedir(), '.local', 'bin'),
+      path.join(os.homedir(), '.cargo', 'bin'),
+    );
+
+    // On Windows the spread above yields a "Path" key, not "PATH". Writing
+    // `env.PATH` would create a duplicate key holding only extraDirs and drop
+    // everything else; libuv then resolves spawned binaries against the wrong,
+    // truncated value. Update the existing case-insensitive key in place.
+    const pathKey = Object.keys(env).find(k => k.toLowerCase() === 'path') || 'PATH';
+    for (const d of extraDirs) {
+      if (d && !(env[pathKey] || '').includes(d)) {
+        env[pathKey] = d + sep + (env[pathKey] || '');
+      }
+    }
+    return env;
+  }
+
+  /**
+   * Build an isolated environment for a PowerShell child process.
+   *
+   * PowerShell constructs PSModulePath for the host that is starting. Passing
+   * through a value created by another host (for example pwsh -> powershell)
+   * can make it load binary modules from the wrong runtime. Remove every
+   * casing of the key and let the child rebuild its own defaults.
+   */
+  _powerShellChildEnv(env) {
+    const childEnv = { ...env };
+    for (const key of Object.keys(childEnv)) {
+      if (key.toLowerCase() === 'psmodulepath') delete childEnv[key];
+    }
+    return childEnv;
+  }
+
+  /**
+   * Resolve a PowerShell host without assuming Windows PowerShell 5.1 exists.
+   * Prefer the Windows inbox host for compatibility with existing installer
+   * scripts, then fall back to pwsh from PATH or its standard install folder.
+   *
+   * `platform` and `exists` are seams so the Windows rules run on every CI
+   * platform without touching the real machine.
+   */
+  _resolveWindowsPowerShellHost(
+    env,
+    platform = process.platform,
+    exists = fs.existsSync,
+  ) {
+    if (platform !== 'win32') return null;
+    const value = (name) => {
+      const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+      return key ? env[key] : '';
+    };
+    const systemRoot = value('SystemRoot') || 'C:\\Windows';
+    const windowsPowerShell = path.win32.join(
+      systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
+    );
+    if (exists(windowsPowerShell)) return windowsPowerShell;
+
+    for (const rawDir of (value('Path') || '').split(';')) {
+      const dir = rawDir.trim().replace(/^"|"$/g, '');
+      if (!dir) continue;
+      const candidate = path.win32.join(dir, 'pwsh.exe');
+      if (exists(candidate)) return candidate;
+    }
+
+    const programFiles = value('ProgramFiles') || 'C:\\Program Files';
+    const standardPwsh = path.win32.join(programFiles, 'PowerShell', '7', 'pwsh.exe');
+    return exists(standardPwsh) ? standardPwsh : null;
+  }
+
+  /** Replace only the leading PowerShell executable in an install command. */
+  _retargetPowerShellCommand(command, executable) {
+    const hostPrefix = /^(\s*)(?:"[^"]*\\(?:powershell|pwsh)(?:\.exe)?"|(?:powershell|pwsh)(?:\.exe)?)\s+/i;
+    return command.replace(hostPrefix, `$1"${executable}" `);
+  }
+
+  /** Prepare a Windows PowerShell install without leaking another host's modules. */
+  _prepareWindowsPowerShellInstall(
+    command,
+    env,
+    platform = process.platform,
+    exists = fs.existsSync,
+  ) {
+    const host = this._resolveWindowsPowerShellHost(env, platform, exists);
+    if (!host) {
+      throw new Error('Windows PowerShell or PowerShell 7 is required for this installer.');
+    }
+    return {
+      command: this._retargetPowerShellCommand(this._wrapForWindowsShell(command), host),
+      env: this._powerShellChildEnv(env),
+      host,
+    };
+  }
+
+  /**
+   * Put uv where hermes's installer looks for it, before that installer runs.
+   *
+   * hermes's Install-Uv bootstraps its OWN copy at <HERMES_HOME>\bin\uv.exe
+   * ("no PATH probing, no conda guards" — a uv already on the machine is not
+   * used), and it does that by spawning a child PowerShell for the astral
+   * installer WITHOUT -NoProfile. When that child cannot run — a profile that
+   * throws, a PSModulePath that cannot load built-in modules — uv never lands,
+   * and hermes prints "Installation failed: uv installation failed" and exits
+   * 0 anyway, leaving a half-installed agent.
+   *
+   * Doing the same download ourselves, from an environment we control, takes
+   * that fragile hop out of the install. Its early
+   * `if (Test-Path $managedUv) { return $true }` then short-circuits the whole
+   * step. Best-effort by design: any failure here is logged and the install
+   * proceeds exactly as it does today, so this can only add successes.
+   *
+   * Windows-only. The Unix install.sh runs the uv installer through `sh`,
+   * which reads no profile and has never shown this failure.
+   *
+   * `platform` and `exists` are seams for tests; production passes neither.
+   * They must be threaded into the host lookup below — without them it falls
+   * back to the real filesystem and can never resolve a Windows path on a
+   * Linux or macOS CI runner, which silently turned every assertion about the
+   * spawn into a no-op.
+   */
+  async _bootstrapManagedUv(
+    agentType,
+    env,
+    onData,
+    platform = process.platform,
+    exists = fs.existsSync,
+  ) {
+    if (agentType !== 'hermes' || platform !== 'win32') return;
+    const home = os.homedir();
+    const hermesHome = env.HERMES_HOME
+      || path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'hermes');
+    const binDir = path.join(hermesHome, 'bin');
+    const managedUv = path.join(binDir, 'uv.exe');
+    try { if (exists(managedUv)) return; } catch { return; }
+
+    if (onData) onData(`\nProvisioning uv for Hermes into ${binDir} ...\n`);
+    try {
+      const psExe = this._resolveWindowsPowerShellHost(env, platform, exists);
+      if (!psExe) throw new Error('no Windows PowerShell or PowerShell 7 host found');
+      fs.mkdirSync(binDir, { recursive: true });
+      await new Promise((resolve, reject) => {
+        // `_spawnForTest` is a seam so a test can inspect the environment this
+        // child is given; production never sets it.
+        const spawnFn = this._spawnForTest || require('child_process').spawn;
+        const child = spawnFn(
+          psExe,
+          [
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            // Force UTF-8 out of the child before it prints anything. A
+            // Chinese-locale Windows emits GBK, which reaches the install log
+            // as mojibake — the user saw a wall of "??" where the error was.
+            '-Command',
+            '[Console]::OutputEncoding=[Text.Encoding]::UTF8; irm https://astral.sh/uv/install.ps1 | iex',
+          ],
+          {
+            // UV_INSTALL_DIR is what the astral script honours; it is the same
+            // variable hermes sets for its own attempt.
+            env: this._powerShellChildEnv({ ...env, UV_INSTALL_DIR: binDir }),
+            cwd: home,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+          },
+        );
+        const relay = (d) => { if (onData) onData(String(d)); };
+        if (child.stdout) child.stdout.on('data', relay);
+        if (child.stderr) child.stderr.on('data', relay);
+        child.on('error', reject);
+        child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit code ${code}`))));
+      });
+    } catch (e) {
+      if (onData) onData(`\nCould not provision uv ahead of the installer (${e.message}); letting Hermes try its own.\n`);
+      return;
+    }
+    if (onData) {
+      onData(fs.existsSync(managedUv)
+        ? `uv ready at ${managedUv}\n`
+        : `uv installer finished but ${managedUv} is absent; letting Hermes try its own.\n`);
+    }
+  }
+
+  /**
+   * True if `node` exists outside the bundled launcher directory. Uses raw
+   * process.env.PATH (no enhancement) so we don't accidentally detect the
+   * bundled node and conclude that "system node exists".
+   */
+  _hasSystemNode(bundledDir) {
+    try {
+      // In-process PATH walk: `where` prints in the OEM codepage, so on a
+      // non-ASCII profile its UTF-8-decoded lines never matched bundledDir.
+      const prefix = (bundledDir || '').toLowerCase();
+      for (const line of whereAll('node')) {
+        if (!prefix || !line.toLowerCase().startsWith(prefix)) return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Smoke-test a node binary by running `--version`. Returns false on any
+   * failure (missing exe, blocked by AV, arch mismatch, signature policy).
+   */
+  _canExecute(binaryPath) {
+    try {
+      const { spawnSync } = require('child_process');
+      const r = spawnSync(binaryPath, ['--version'], {
+        timeout: 5000,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return r.status === 0 && !r.error;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if Node.js/npm is available on the system.
+   */
+  hasNodejs() {
+    if (whichBinary('node') && whichBinary('npm')) return true;
+    // Check bundled Node.js in ~/.openagents/nodejs/
+    if (process.platform === 'win32') {
+      try {
+        const bundledDir = path.join(this.configDir, 'nodejs');
+        if (fs.existsSync(bundledDir)) {
+          const entries = fs.readdirSync(bundledDir).filter(e => e.startsWith('node-'));
+          if (entries.length > 0) {
+            const nodeExe = path.join(bundledDir, entries[0], 'node.exe');
+            return fs.existsSync(nodeExe);
+          }
+        }
+      } catch {}
+    }
+    return false;
+  }
+
+  /**
+   * Swap an unpinned package (`pkg`, `pkg@latest`) for the newest release
+   * whose `engines.node` accepts the Node that will run it. openclaw raises
+   * its floor without notice (2026.10.6 wanted Node 24.22.1 while the runtime
+   * was 24.21.0) and its preinstall exits 1 below it, so a workspace's remote
+   * "create agent" — which installs here, not through the launcher's own
+   * holdback — failed on every such machine. Anything uncertain (no Node
+   * version, registry unreachable, unreadable range) leaves the args alone.
+   *
+   * @param {string[]} pkgArgs
+   * @param {string} nodeBin  the node npm runs under
+   * @param {string|null} registry  the `--registry` this install will use
+   * @param {function(string)} [onData]
+   * @returns {Promise<string[]>}
+   */
+  async _holdBackForNode(pkgArgs, nodeBin, registry, onData) {
+    const pkgs = pkgArgs.filter((a) => !a.startsWith('-'));
+    if (pkgs.length !== 1) return pkgArgs;
+    const pkg = unpinnedPackage(pkgs[0]);
+    if (!pkg) return pkgArgs;
+    let nodeVersion;
+    try {
+      nodeVersion = execFileSync(nodeBin, ['-v'], { encoding: 'utf-8', timeout: 5000, windowsHide: true }).trim();
+    } catch { return pkgArgs; }
+    let info;
+    try {
+      info = await fetchPackument(registry || userConfiguredRegistry() || 'https://registry.npmjs.org', pkg);
+    } catch { return pkgArgs; }
+    const latest = info && info['dist-tags'] && info['dist-tags'].latest;
+    const target = resolveInstallableVersion(info, nodeVersion);
+    if (!latest || !target || target === latest) return pkgArgs;
+    const range = info.versions && info.versions[latest] && info.versions[latest].engines
+      && info.versions[latest].engines.node;
+    if (onData) {
+      onData(`${pkg}@${latest} requires Node ${range}, but agents here run on Node ${nodeVersion} — `
+        + `installing ${target}, the newest release that supports it.\n\n`);
+    }
+    return pkgArgs.map((a) => (a === pkgs[0] ? `${pkg}@${target}` : a));
+  }
+
+  /**
+   * The Node.js the portable runtime gets — the same pin as the launcher's
+   * bootstrap/node-version.ts, which owns upgrading an existing runtime; this
+   * copy only ever installs onto a machine with no Node at all. Node 24 needs
+   * macOS 13.5 (Darwin 22.6), so older Macs get the last Node 22 instead.
+   */
+  static portableNodeVersion(platform = process.platform, release = require('os').release()) {
+    if (platform === 'darwin') {
+      const [major, minor] = String(release).split('.').map(Number);
+      if (major < 22 || (major === 22 && minor < 6)) return 'v22.22.3';
+    }
+    return 'v24.22.1';
+  }
+
+  /**
+   * Download and install Node.js LTS. Streams progress via onData callback.
+   * After install, updates PATH so npm is available for subsequent commands.
+   * @param {function(string)} onData
+   * @returns {Promise<void>}
+   */
+  async installNodejs(onData) {
+    const { spawn: spawnProc } = require('child_process');
+    const https = require('https');
+    const os = require('os');
+    const plat = Installer.platform();
+    const nodeVersion = Installer.portableNodeVersion();
+
+    if (onData) onData(`Node.js not found. Installing Node.js ${nodeVersion}...\n\n`);
+
+    if (plat === 'windows') {
+      // Download portable zip — no admin required
+      // No 32-bit Windows build exists past Node 22.
+      const arch = os.arch() === 'arm64' ? 'arm64' : 'x64';
+      const zipPath = path.join(os.tmpdir(), `node-${nodeVersion}.zip`);
+
+      await this._downloadFirst(
+        nodeDistUrls(`${nodeVersion}/node-${nodeVersion}-win-${arch}.zip`),
+        zipPath,
+        onData
+      );
+
+      // Extract to ~/.openagents/nodejs/
+      const nodejsDir = path.join(this.configDir, 'nodejs');
+      fs.mkdirSync(nodejsDir, { recursive: true });
+
+      if (onData) onData(`\nExtracting Node.js to ${nodejsDir}...\n`);
+      await new Promise((resolve, reject) => {
+        const proc = spawnProc('powershell', [
+          '-NoProfile', '-Command',
+          `Expand-Archive -Path '${zipPath}' -DestinationPath '${nodejsDir}' -Force`
+        ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+        if (proc.stdout) proc.stdout.on('data', (d) => { if (onData) onData(d.toString()); });
+        if (proc.stderr) proc.stderr.on('data', (d) => { if (onData) onData(d.toString()); });
+        proc.on('error', reject);
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`Extraction failed with code ${code}`));
+        });
+      });
+
+      // The zip extracts to node-vX.X.X-win-x64/ subfolder — flatten it
+      const extractedDir = path.join(nodejsDir, `node-${nodeVersion}-win-${arch}`);
+      if (fs.existsSync(extractedDir)) {
+        if (onData) onData('Flattening Node.js directory...\n');
+        const entries = fs.readdirSync(extractedDir);
+        for (const entry of entries) {
+          const src = path.join(extractedDir, entry);
+          const dest = path.join(nodejsDir, entry);
+          if (!fs.existsSync(dest)) {
+            fs.renameSync(src, dest);
+          } else if (fs.statSync(src).isDirectory() && fs.statSync(dest).isDirectory()) {
+            // Merge directories (e.g. node_modules)
+            const subEntries = fs.readdirSync(src);
+            for (const sub of subEntries) {
+              const subSrc = path.join(src, sub);
+              const subDest = path.join(dest, sub);
+              if (!fs.existsSync(subDest)) fs.renameSync(subSrc, subDest);
+            }
+          }
+        }
+        // Remove empty nested dir
+        try { fs.rmdirSync(extractedDir, { recursive: true }); } catch {}
+      }
+      const sep = ';';
+
+      // Add nodejs dir to PATH for this session
+      if (!(process.env.PATH || '').includes(nodejsDir)) {
+        process.env.PATH = nodejsDir + sep + (process.env.PATH || '');
+      }
+      // npm global installs go to %APPDATA%\npm
+      const npmGlobal = path.join(process.env.APPDATA || '', 'npm');
+      if (npmGlobal && !(process.env.PATH || '').includes(npmGlobal)) {
+        process.env.PATH = npmGlobal + sep + process.env.PATH;
+      }
+
+    } else {
+      // macOS / Linux: download portable tar.gz/tar.xz, extract to ~/.openagents/nodejs/
+      const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+      const ext = plat === 'macos' ? 'tar.gz' : 'tar.xz';
+      const platName = plat === 'macos' ? 'darwin' : 'linux';
+      const tarPath = path.join(os.tmpdir(), `node-${nodeVersion}.${ext}`);
+
+      await this._downloadFirst(
+        nodeDistUrls(`${nodeVersion}/node-${nodeVersion}-${platName}-${arch}.${ext}`),
+        tarPath,
+        onData
+      );
+
+      const nodeDir = path.join(this.configDir, 'nodejs');
+      fs.mkdirSync(nodeDir, { recursive: true });
+
+      if (onData) onData(`\nExtracting to ${nodeDir}...\n`);
+      const tarFlag = ext === 'tar.gz' ? '-xzf' : '-xJf';
+      await new Promise((resolve, reject) => {
+        const proc = spawnProc('tar', [tarFlag, tarPath, '-C', nodeDir, '--strip-components=1'], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        if (proc.stdout) proc.stdout.on('data', (d) => { if (onData) onData(d.toString()); });
+        if (proc.stderr) proc.stderr.on('data', (d) => { if (onData) onData(d.toString()); });
+        proc.on('error', reject);
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`Extraction failed with code ${code}`));
+        });
+      });
+
+      // Add portable node bin to PATH
+      const nodeBin = path.join(nodeDir, 'bin');
+      if (!(process.env.PATH || '').includes(nodeBin)) {
+        process.env.PATH = nodeBin + ':' + (process.env.PATH || '');
+      }
+    }
+
+    if (onData) onData(`\nNode.js ${nodeVersion} installed successfully.\n\n`);
+  }
+
+  /**
+   * Download a file with progress reporting.
+   */
+  /**
+   * Try each candidate URL in order until one delivers the file. Mirrors carry
+   * identical bytes, so a slow or unreachable origin costs one timeout instead
+   * of failing the whole install.
+   */
+  async _downloadFirst(urls, destPath, onData) {
+    let lastErr = null;
+    for (const url of urls) {
+      try {
+        if (onData) onData(`Downloading ${url}...\n`);
+        await this._downloadFile(url, destPath, onData);
+        return url;
+      } catch (err) {
+        lastErr = err;
+        if (onData) onData(`  failed (${err.message}) — trying next source\n`);
+      }
+    }
+    throw lastErr || new Error('Download failed: no sources available');
+  }
+
+  /**
+   * Download a file with progress reporting.
+   *
+   * Writes to `${destPath}.part` and renames on success: a partial file left at
+   * the final path reads as "already installed" on the next run and produces a
+   * corrupt runtime. A stall timeout and a short-read check are what turn a
+   * silently truncated transfer into a retryable error.
+   */
+  _downloadFile(url, destPath, onData) {
+    const https = require('https');
+    const http = require('http');
+    const STALL_TIMEOUT_MS = 30000;
+    const tmpPath = `${destPath}.part`;
+    try { fs.unlinkSync(tmpPath); } catch {}
+
+    return new Promise((resolve, reject) => {
+      const get = url.startsWith('https') ? https.get : http.get;
+      const fail = (err) => {
+        try { fs.unlinkSync(tmpPath); } catch {}
+        reject(err);
+      };
+      const req = get(url, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          const next = new URL(res.headers.location, url).toString();
+          return this._downloadFile(next, destPath, onData).then(resolve, reject);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return fail(new Error(`Download failed: HTTP ${res.statusCode}`));
+        }
+        const totalBytes = parseInt(res.headers['content-length'] || '0', 10);
+        let downloaded = 0;
+        let lastPercent = -1;
+        const file = fs.createWriteStream(tmpPath);
+        res.on('data', (chunk) => {
+          downloaded += chunk.length;
+          if (totalBytes > 0) {
+            const pct = Math.floor((downloaded / totalBytes) * 100);
+            if (pct !== lastPercent && pct % 10 === 0) {
+              lastPercent = pct;
+              if (onData) onData(`  ${pct}% (${(downloaded / 1024 / 1024).toFixed(1)} MB)\n`);
+            }
+          }
+        });
+        res.on('error', fail);
+        file.on('error', fail);
+        res.pipe(file);
+        file.on('finish', () => {
+          file.close(() => {
+            if (totalBytes > 0 && downloaded !== totalBytes) {
+              return fail(new Error(`Truncated download: ${downloaded} of ${totalBytes} bytes`));
+            }
+            try {
+              fs.renameSync(tmpPath, destPath);
+            } catch (err) {
+              return fail(err);
+            }
+            resolve();
+          });
+        });
+      });
+      // Guard the connection itself: without this a black-holed origin keeps
+      // the promise pending forever and the install just sits there.
+      req.setTimeout(STALL_TIMEOUT_MS, () => {
+        req.destroy(new Error(`Download timed out after ${STALL_TIMEOUT_MS / 1000}s`));
+      });
+      req.on('error', fail);
+    });
+  }
+
+  /**
+   * Locate a `node` binary plus its `npm-cli.js` so npm can be invoked as
+   * `node npm-cli.js …` with argv passed array-style and NO shell. On Windows
+   * that goes through CreateProcessW (UTF-16), so an install prefix under a
+   * non-ASCII home dir (e.g. `C:\Users\用户名\.openagents\runtimes\…`) is
+   * preserved exactly. The legacy `npm.cmd` shell shim instead has cmd.exe
+   * decode the path bytes with the OEM code page (936/GBK on zh-CN), corrupting
+   * it and silently breaking every install. Returns { node, npmCli } or null
+   * when no usable layout is found (caller falls back to the legacy shell
+   * command, which still works for ASCII paths).
+   */
+  _resolveNodeNpmCli() {
+    const exists = (p) => { try { return fs.existsSync(p); } catch { return false; } };
+    const isWin = process.platform === 'win32';
+    const nodeName = isWin ? 'node.exe' : 'node';
+
+    const nodeCandidates = [];
+    // Bundled portable node (~/.openagents/nodejs, plus nested node-* layouts)
+    const bundledDir = path.join(this.configDir, 'nodejs');
+    nodeCandidates.push(path.join(bundledDir, nodeName));
+    nodeCandidates.push(path.join(bundledDir, 'bin', 'node'));
+    try {
+      for (const e of fs.readdirSync(bundledDir)) {
+        if (e.startsWith('node-')) {
+          nodeCandidates.push(path.join(bundledDir, e, nodeName));
+          nodeCandidates.push(path.join(bundledDir, e, 'bin', 'node'));
+        }
+      }
+    } catch {}
+    // System node — its npm-cli.js lives next to (or one level above) it.
+    try {
+      const sys = whichBinary('node');
+      if (sys) nodeCandidates.push(sys);
+    } catch {}
+
+    for (const node of nodeCandidates) {
+      if (!node || !exists(node)) continue;
+      const dir = path.dirname(node);
+      const npmCli = [
+        path.join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+        path.join(dir, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+        path.join(dir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      ].find(exists);
+      if (npmCli && this._canExecute(node)) return { node, npmCli };
+    }
+    return null;
+  }
+
+  /**
+   * Resolve the npm CLI command. Uses system npm if available.
+   */
+  _resolveNpmCommand(args) {
+    const systemNpm = whichBinary('npm');
+    const npmBin = systemNpm ? `"${systemNpm}"` : 'npm';
+
+    // On macOS/Linux, use a user-writable prefix to avoid sudo for global installs
+    if (process.platform !== 'win32' && args.includes('-g')) {
+      const globalDir = path.join(this.configDir, 'npm-global');
+      fs.mkdirSync(globalDir, { recursive: true });
+      // Add the bin dir to PATH so installed binaries are found
+      const binDir = path.join(globalDir, 'bin');
+      if (!(process.env.PATH || '').includes(binDir)) {
+        process.env.PATH = binDir + ':' + (process.env.PATH || '');
+      }
+      return `${npmBin} --prefix "${globalDir}" ${args}`;
+    }
+
+    return `${npmBin} ${args}`;
+  }
+
+  /**
+   * Wrap a command in `powershell.exe -Command "..."` when (a) we're on Windows
+   * and (b) the command uses PowerShell-only tokens like `irm`, `iex`,
+   * `Invoke-RestMethod`, etc. The launcher's install shell is cmd.exe, which
+   * doesn't recognize these aliases — without wrapping, e.g. Cursor's
+   * `irm '…' | iex` exits 255. Skips commands already prefixed with
+   * `powershell`/`pwsh` so we don't double-wrap.
+   */
+  _wrapForWindowsShell(cmd) {
+    if (!cmd || process.platform !== 'win32') return cmd;
+    const trimmed = cmd.trimStart();
+    if (/^("[^"]*\\)?(powershell|pwsh)(\.exe)?["']?\s/i.test(trimmed)) return cmd;
+    const psTokens = /\b(irm|iwr|iex|Invoke-RestMethod|Invoke-WebRequest|Invoke-Expression|Expand-Archive|Get-[A-Z]\w*|Set-[A-Z]\w*)\b/;
+    if (!psTokens.test(cmd)) return cmd;
+    const escaped = cmd.replace(/"/g, '\\"');
+    // PowerShell writes to a pipe in the OEM codepage (936 on zh-CN) and this
+    // output is read as UTF-8, so a non-ASCII path in an installer's log or
+    // error came back garbled. Switch the console encoding first.
+    return `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; ${escaped}"`;
+  }
+
+  _execShell(cmd, timeoutMs = 300000, envOverride = null) {
+    return new Promise((resolve, reject) => {
+      const env = envOverride || this._buildShellEnv();
+
+      let shell = true;
+      if (process.platform === 'win32') {
+        shell = env.ComSpec || 'C:\\Windows\\System32\\cmd.exe';
+      }
+
+      const finalCmd = this._wrapForWindowsShell(cmd);
+      exec(finalCmd, {
+        encoding: 'utf-8',
+        timeout: timeoutMs,
+        shell,
+        env,
+      }, (error, stdout, stderr) => {
+        const output = ((stdout || '') + '\n' + (stderr || '')).trim();
+        if (error) {
+          const err = new Error(output || error.message);
+          err.exitCode = error.code;
+          reject(err);
+        } else {
+          resolve(output);
+        }
+      });
+    });
+  }
+}
+
+/**
+ * Whether a `cmdkey /list` dump lists a credential for `target`.
+ *
+ * Pure, so the matching is testable without a Windows box. Compared
+ * case-insensitively because the stored casing is the CLI's choice, not the
+ * user's, and matched on the `target=` fragment rather than a whole line so the
+ * `LegacyGeneric:` / `Domain:` prefix Windows puts in front of it is irrelevant.
+ * The name must end the line, so `gemini:antigravity` does not match a
+ * `gemini:antigravity-staging` entry.
+ */
+function credentialListHasTarget(output, target) {
+  const name = String(target || '').trim();
+  if (!name) return false;
+  return new RegExp(`target=${escapeRegExp(name)}[ \\t]*\\r?$`, 'im').test(String(output || ''));
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+module.exports = { Installer, compareVersions, clearVersionCache, loginVerdict, credentialListHasTarget, parseJsonLoose, stallLastLine };

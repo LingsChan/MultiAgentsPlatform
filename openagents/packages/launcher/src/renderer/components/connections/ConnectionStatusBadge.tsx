@@ -1,0 +1,43 @@
+import * as React from "react"
+import { useTranslation } from "react-i18next"
+
+import { Badge } from "../ui/badge"
+import { cn } from "../../lib/utils"
+import type { ConnectionStatus } from "../../types"
+
+type Tone = "success" | "warning" | "destructive" | "secondary"
+
+const TONE: Record<ConnectionStatus, Tone> = {
+  connected: "success",
+  expired: "warning",
+  rate_limited: "warning",
+  unauthorized: "destructive",
+  error: "destructive",
+  disconnected: "secondary",
+  offline: "secondary",
+}
+
+const DOT: Record<Tone, string> = {
+  success: "bg-success",
+  warning: "bg-warning",
+  destructive: "bg-destructive",
+  secondary: "bg-muted-foreground",
+}
+
+export function ConnectionStatusBadge({
+  status,
+  className,
+}: {
+  status: ConnectionStatus
+  className?: string
+}): React.JSX.Element {
+  const { t } = useTranslation()
+  const tone = TONE[status]
+
+  return (
+    <Badge variant={tone} className={cn("gap-1.5", className)}>
+      <span className={cn("inline-block size-1.5 rounded-full", DOT[tone])} />
+      {t(`connections.status.${status}`)}
+    </Badge>
+  )
+}

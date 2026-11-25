@@ -1,0 +1,1643 @@
+'use strict';
+
+const https = require('https');
+const http = require('http');
+
+const DEFAULT_ENDPOINT = 'https://workspace-endpoint.openagents.org';
+// Agent progress noise that never belongs in a conversation transcript.
+const RECENT_MESSAGES_EXCLUDED_TYPES = 'status,thinking,todos,loading';
+
+/**
+ * The error a request deadline produces. Every request carries a hard
+ * AbortSignal.timeout deadline (see _get), and when it fires Node rejects with
+ * a bare "AbortError: The operation was aborted" — which reads like somebody
+ * cancelled the call and names no cause. The socket-inactivity timeout said
+ * "Request timed out". Both now say the same thing, with the deadline, and
+ * carry ETIMEDOUT so callers can tell a slow network from a bug.
+ */
+function requestTimeoutError(timeout) {
+  const after = timeout >= 1000 ? `${Math.round(timeout / 1000)}s` : `${timeout}ms`;
+  const err = new Error(`Request timed out after ${after}`);
+  err.code = 'ETIMEDOUT';
+  return err;
+}
+
+/** A request 'error' handler that reports a fired deadline as a timeout. */
+function rejectWithDeadline(reject, timeout) {
+  return (err) => {
+    const aborted = err && (err.name === 'AbortError' || err.code === 'ABORT_ERR');
+    reject(aborted ? requestTimeoutError(timeout) : err);
+  };
+}
+
+/**
+ * Thrown when the workspace rejects a request because our session_id has
+ * been revoked by a newer /v1/join as the same agent. Callers should
+ * stop the adapter rather than retry.
+ */
+class SessionRevokedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SessionRevokedError';
+    this.code = 'session_revoked';
+  }
+}
+
+/**
+ * Reject when a response is cut off after its headers arrived.
+ *
+ * Node reports that on the RESPONSE, and nowhere else: once a response
+ * exists the request emits no 'error' for a connection that closes early,
+ * 'end' only fires for a complete body, and the request's abort signal is a
+ * no-op by then because the socket is already gone. A request helper that
+ * listens for 'end' alone therefore never settles — and each poll loop is a
+ * single await, so one truncated response (a backend restart mid-reply is
+ * enough) silences that loop for the life of the daemon. When it is the
+ * control poller the agent keeps working and answering, and ignores Stop.
+ */
+function rejectOnTruncatedResponse(res, reject) {
+  res.on('error', reject);
+  res.on('close', () => {
+    if (res.complete) return;
+    // Same code Node puts on the 'error' above, so callers count either as
+    // the network blip it is.
+    const err = new Error('Response ended before it was complete');
+    err.code = 'ECONNRESET';
+    reject(err);
+  });
+}
+
+/**
+ * HTTP client for workspace API operations.
+ *
+ * Mirrors the Python SDK's WorkspaceClient — same endpoints, same
+ * auth headers (X-Workspace-Token), same request/response shapes.
+ */
+class WorkspaceClient {
+  /**
+   * @param {string} [endpoint]
+   * @param {{ agentName?: string }} [opts] — when the client acts for ONE
+   *   agent, pass its name: every request then carries `X-Agent-Name` so the
+   *   workspace can apply that agent's permissions (permission model v1.1 §3)
+   *   instead of treating the call as an anonymous machine. Machine-level
+   *   clients (daemon device heartbeat, pairing redeem, workspace removal)
+   *   pass nothing and send no agent identity.
+   */
+  constructor(endpoint, { agentName } = {}) {
+    this.endpoint = (endpoint || DEFAULT_ENDPOINT).replace(/\/$/, '');
+    this.agentName = typeof agentName === 'string' && agentName.trim() ? agentName.trim() : null;
+  }
+
+  /** A client for the same endpoint that acts as `agentName` (or none). */
+  withAgent(agentName) {
+    return new WorkspaceClient(this.endpoint, { agentName });
+  }
+
+  /**
+   * Request headers + the agent identity header. Applied in every transport
+   * helper (_get/_getRaw/_post/_put/_patch/_delete) so no call site can forget
+   * it. Returns a copy — callers' header objects are never mutated.
+   */
+  _withAgent(headers) {
+    const out = { ...(headers || {}) };
+    if (this.agentName && !out['X-Agent-Name']) out['X-Agent-Name'] = this.agentName;
+    return out;
+  }
+
+  /**
+   * Register an agent identity via POST /v1/agentid/register.
+   */
+  async registerAgent(agentName, { apiKey, origin = 'cli' } = {}) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const data = await this._post('/v1/agentid/register', {
+      agent_name: agentName,
+      origin,
+    }, headers);
+
+    return data.data || data;
+  }
+
+  /**
+   * Create a workspace via POST /v1/workspaces.
+   * @returns {{ workspaceId, slug, name, token, url, channelName }}
+   */
+  async createWorkspace({ agentName, name, agentType } = {}) {
+    const payload = {
+      name: name || (agentName ? `${agentName}'s workspace` : 'My Workspace'),
+    };
+    if (agentName) payload.agent_name = agentName;
+    if (agentType) payload.agent_type = agentType;
+
+    const data = await this._post('/v1/workspaces', payload);
+    const result = data.data || data;
+
+    const frontendUrl = this.endpoint
+      .replace('workspace-endpoint', 'workspace')
+      .replace('/v1', '');
+
+    return {
+      workspaceId: result.workspaceId,
+      slug: result.slug || result.workspaceId,
+      name: result.name,
+      token: result.token,
+      url: `${frontendUrl}/${result.slug || result.workspaceId}?token=${result.token}`,
+      channelName: (result.channel || {}).name || '',
+    };
+  }
+
+  /**
+   * Delete a workspace via DELETE /v1/workspaces/{workspaceId}.
+   */
+  async deleteWorkspace(workspaceId, token) {
+    try {
+      await this._delete(`/v1/workspaces/${workspaceId}`, this._wsHeaders(token));
+    } catch (e) {
+      // Best-effort remote deletion.
+      console.warn(`Failed to remotely delete workspace ${workspaceId}: ${e.message}`);
+    }
+  }
+
+  /**
+   * Remove one agent from a workspace via
+   * DELETE /v1/workspaces/{workspaceId}/members/{agentName}.
+   *
+   * Unlike deleteWorkspace above this is NOT best-effort: the caller offered
+   * the user a choice ("also remove it from the workspace"), so a failure has
+   * to be reported rather than swallowed — silently leaving the member behind
+   * is the exact problem this exists to fix.
+   */
+  async removeMember(workspaceId, token, agentName) {
+    await this._delete(
+      `/v1/workspaces/${workspaceId}/members/${encodeURIComponent(agentName)}`,
+      this._wsHeaders(token),
+    );
+  }
+
+  /**
+   * Rename one agent's DISPLAY name in a workspace, via
+   * PATCH /v1/workspaces/{workspaceId}/members/{agentName}.
+   *
+   * The agent's identity (`agent_name`) is untouched — this is the label the
+   * workspace shows and accepts as an @-mention alias, which is why the server
+   * rejects one that clashes with another member. An empty string clears the
+   * label there, falling back to `agent_name`, which is exactly what clearing
+   * the display name on this side means too.
+   */
+  async setMemberDisplayName(workspaceId, token, agentName, displayName) {
+    return this._patch(
+      `/v1/workspaces/${workspaceId}/members/${encodeURIComponent(agentName)}`,
+      { display_name: displayName || '' },
+      this._wsHeaders(token),
+    );
+  }
+
+  /**
+   * Join a workspace via POST /v1/join.
+   */
+  async joinNetwork(agentName, token, { network, agentType, serverHost, workingDir } = {}) {
+    const body = { agent_name: agentName, token };
+    if (network) body.network = network;
+    if (agentType) body.agent_type = agentType;
+    if (serverHost) body.server_host = serverHost;
+    if (workingDir) body.working_dir = workingDir;
+
+    const data = await this._post('/v1/join', body);
+    return data.data || data;
+  }
+
+  /**
+   * Resolve a workspace token to workspace info via POST /v1/token/resolve.
+   * @returns {{ workspace_id, slug, name }}
+   */
+  async resolveToken(token) {
+    const data = await this._post('/v1/token/resolve', { token });
+    return data.data || data;
+  }
+
+  /**
+   * Redeem a node pairing code via POST /v1/nodes/redeem. The code is the
+   * credential (no auth header). Returns { nodeId, workspaceId, workspaceSlug,
+   * workspaceName, token } — the token is the workspace's machine credential.
+   */
+  async redeemPairingCode(code, deviceInfo = {}) {
+    const body = { code, node_key: deviceInfo.nodeKey };
+    if (deviceInfo.name) body.name = deviceInfo.name;
+    if (deviceInfo.hostname) body.hostname = deviceInfo.hostname;
+    if (deviceInfo.deviceType) body.device_type = deviceInfo.deviceType;
+    if (deviceInfo.os) body.os = deviceInfo.os;
+    if (deviceInfo.launcherVersion) body.launcher_version = deviceInfo.launcherVersion;
+    const data = await this._post('/v1/nodes/redeem', body);
+    return data.data || data;
+  }
+
+  /**
+   * Node liveness via POST /v1/nodes/heartbeat (authenticated by the workspace
+   * token). Independent of any agent heartbeat.
+   */
+  async nodeHeartbeat(nodeId, token, deviceInfo = {}) {
+    const body = { node_id: nodeId };
+    if (deviceInfo.hostname) body.hostname = deviceInfo.hostname;
+    if (deviceInfo.deviceType) body.device_type = deviceInfo.deviceType;
+    if (deviceInfo.os) body.os = deviceInfo.os;
+    if (deviceInfo.launcherVersion) body.launcher_version = deviceInfo.launcherVersion;
+    if (Array.isArray(deviceInfo.agents)) body.agents = deviceInfo.agents;
+    if (Array.isArray(deviceInfo.runtimes)) body.runtimes = deviceInfo.runtimes;
+    if (deviceInfo.fs && typeof deviceInfo.fs === 'object') body.fs = deviceInfo.fs;
+    const data = await this._post('/v1/nodes/heartbeat', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Upload a local CLI session the device owner picked for import via
+   * POST /v1/nodes/{nodeId}/imported-sessions (node credential). The first
+   * call (no `channel`) creates the thread and returns {channel, title}; later
+   * calls with `channel` append more of the conversation to it.
+   */
+  async importSession(nodeId, token, body) {
+    const resp = await this._post(`/v1/nodes/${encodeURIComponent(nodeId)}/imported-sessions`, body, this._wsHeaders(token));
+    return resp.data || resp;
+  }
+
+  /**
+   * Report the outcome of a remote node command via
+   * POST /v1/nodes/commands/{id}/result (authenticated by the workspace token).
+   */
+  async nodeCommandResult(commandId, token, { ok, message, data } = {}) {
+    const resp = await this._post(
+      `/v1/nodes/commands/${commandId}/result`,
+      { ok: !!ok, message: message || null, data: data ?? null },
+      this._wsHeaders(token),
+    );
+    return resp.data || resp;
+  }
+
+  /**
+   * Send heartbeat via POST /v1/heartbeat.
+   *
+   * @param {string} [sessionId] - optional session id returned by /v1/join.
+   *   If the server's current session for this agent differs, _post()
+   *   throws SessionRevokedError and the caller should stop its adapter.
+   */
+  async heartbeat(workspaceId, agentName, token, sessionId, presence) {
+    const body = {
+      agent_name: agentName,
+      network: workspaceId,
+    };
+    if (sessionId) body.session_id = sessionId;
+    // v1.1 M3 — busy/queued detail ({ presence_state, busy_channels,
+    // queue_depth }, see BaseAdapter.buildPresenceFields). Optional so older
+    // callers keep sending the legacy body.
+    if (presence && typeof presence === 'object') {
+      if (presence.presence_state !== undefined) body.presence_state = presence.presence_state;
+      if (Array.isArray(presence.busy_channels)) body.busy_channels = presence.busy_channels;
+      if (Number.isFinite(presence.queue_depth)) body.queue_depth = presence.queue_depth;
+    }
+    const data = await this._post('/v1/heartbeat', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  // ── Agent profile / presence (v1.1 M3/M4) ────────────────────────────────
+
+  /** GET /v1/agents/{agent}/availability → { status, presence_state,
+   * busy_channels, queue_depth, runtime_status, runtime_name, reason }. */
+  async getAgentAvailability(workspaceId, token, agentName) {
+    const data = await this._get(
+      `/v1/agents/${encodeURIComponent(agentName)}/availability?network=${encodeURIComponent(workspaceId)}`,
+      this._wsHeaders(token),
+    );
+    return data.data || data;
+  }
+
+  /** GET /v1/agents/{agent}/profile — the specialist card. */
+  async getAgentProfile(workspaceId, token, agentName) {
+    const data = await this._get(
+      `/v1/agents/${encodeURIComponent(agentName)}/profile?network=${encodeURIComponent(workspaceId)}`,
+      this._wsHeaders(token),
+    );
+    return data.data || data;
+  }
+
+  /**
+   * GET /v1/agents/{agent}/shared-context — what THIS agent's run may use when
+   * the request comes from a teammate rather than its owner. Machine-only.
+   * Returns { apply, owner_email, requester_email, shared_instructions,
+   * allowed_knowledge: [{ slug, title, content }], cost_owner }.
+   */
+  async getSharedContext(workspaceId, token, agentName, { requesterEmail, channel, timeout } = {}) {
+    const params = new URLSearchParams({ network: workspaceId });
+    if (requesterEmail) params.set('requester_email', requesterEmail);
+    if (channel) params.set('channel', channel);
+    const data = await this._get(
+      `/v1/agents/${encodeURIComponent(agentName)}/shared-context?${params}`,
+      this._wsHeaders(token),
+      timeout || 5000,
+    );
+    return data.data || data;
+  }
+
+  /**
+   * Raw message events of a channel (newest first by default) — for callers
+   * that need payload/metadata fields _eventToMessage drops (e.g. hand-offs).
+   */
+  async getChannelEvents(workspaceId, channelName, token, { limit = 100, sort = 'desc' } = {}) {
+    const params = new URLSearchParams({
+      network: workspaceId,
+      channel: channelName,
+      type: 'workspace.message',
+      sort,
+      limit: String(Math.min(Math.max(1, limit), 500)),
+    });
+    const data = await this._get(`/v1/events?${params}`, this._wsHeaders(token));
+    const result = data.data || data;
+    return (result && result.events) || [];
+  }
+
+  /**
+   * Disconnect agent via POST /v1/leave. Best-effort (ignores errors).
+   */
+  /**
+   * Open the agent wake-up stream (GET /v1/events/agent-stream, SSE).
+   *
+   * The server sends no event content, only "poll now" signals:
+   * `event: wake` with `{"kinds": ["message"|"control", ...]}`. The caller
+   * reacts by running its normal polls, so all access rules stay server-side
+   * in GET /v1/events.
+   *
+   * Returns `{ done, close }`. `done` resolves (never rejects) with
+   * `{ reason }`:
+   *   - 'disabled': the backend does not offer the stream for this workspace
+   *     (404, including backends that predate it) → keep polling.
+   *   - 'ended': the server closed the stream normally → reconnect.
+   *   - 'error': network/HTTP error, or silence past `idleMs` → back off.
+   *
+   * @param {object} opts
+   * @param {() => void} [opts.onOpen]  called once the stream is established
+   * @param {(kinds: string[]) => void} [opts.onWake]
+   * @param {number} [opts.idleMs=45000]  no bytes for this long = dead stream
+   *   (the server sends a keepalive every 15 s)
+   * @param {number} [opts.connectMs=15000]
+   */
+  openAgentStream(workspaceId, agentName, token, { onOpen, onWake, idleMs = 45000, connectMs = 15000 } = {}) {
+    const params = new URLSearchParams({ network: workspaceId, agent: agentName });
+    const fullUrl = `${this.endpoint}/v1/events/agent-stream?${params}`;
+    const headers = this._withAgent({ ...this._wsHeaders(token), Accept: 'text/event-stream' });
+    delete headers['Content-Type'];
+    let req = null;
+    let settled = false;
+    let idleTimer = null;
+    let finish;
+    const done = new Promise((resolve) => { finish = resolve; });
+    const settle = (reason, error) => {
+      if (settled) return;
+      settled = true;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
+      try { if (req) req.destroy(); } catch {}
+      finish({ reason, error });
+    };
+    const armIdle = (ms) => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => settle('error', new Error(`agent stream silent for ${Math.round(ms / 1000)}s`)), ms);
+    };
+    try {
+      const parsedUrl = new URL(fullUrl);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+      armIdle(connectMs);
+      req = transport.request(fullUrl, { method: 'GET', headers }, (res) => {
+        if (res.statusCode === 404) { res.resume(); settle('disabled'); return; }
+        const type = String(res.headers['content-type'] || '');
+        if (res.statusCode !== 200 || !type.startsWith('text/event-stream')) {
+          res.resume();
+          const err = new Error(`agent stream HTTP ${res.statusCode}`);
+          err.status = res.statusCode;
+          settle('error', err);
+          return;
+        }
+        res.setEncoding('utf8');
+        armIdle(idleMs);
+        try { if (onOpen) onOpen(); } catch {}
+        let buffer = '';
+        res.on('data', (chunk) => {
+          if (settled) return;
+          armIdle(idleMs);
+          buffer += chunk.replace(/\r\n/g, '\n');
+          let sep;
+          while ((sep = buffer.indexOf('\n\n')) !== -1) {
+            const block = buffer.slice(0, sep);
+            buffer = buffer.slice(sep + 2);
+            let eventName = 'message';
+            const data = [];
+            for (const line of block.split('\n')) {
+              if (line.startsWith('event:')) eventName = line.slice(6).trim();
+              else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+            }
+            if (eventName === 'reconnect') { settle('ended'); return; }
+            if (eventName !== 'wake') continue;
+            let kinds = ['message', 'control'];
+            try {
+              const parsed = JSON.parse(data.join('\n'));
+              if (parsed && Array.isArray(parsed.kinds)) kinds = parsed.kinds;
+            } catch {}
+            try { if (onWake) onWake(kinds); } catch {}
+          }
+          if (buffer.length > 65536) settle('error', new Error('agent stream: oversized event'));
+        });
+        res.on('end', () => settle('ended'));
+        res.on('error', (e) => settle('error', e));
+        res.on('close', () => settle('ended'));
+      });
+      req.on('error', (e) => settle('error', e));
+      req.end();
+    } catch (e) {
+      settle('error', e);
+    }
+    return { done, close: () => settle('closed') };
+  }
+
+  async disconnect(workspaceId, agentName, token) {
+    try {
+      await this._post('/v1/leave', {
+        agent_name: agentName,
+        network: workspaceId,
+      }, this._wsHeaders(token));
+    } catch {}
+  }
+
+  /**
+   * Post a raw event via POST /v1/events.
+   *
+   * @param {string} [sessionId] - if given, embedded in event.metadata so
+   *   the server can reject stale sessions with SessionRevokedError.
+   */
+  async sendEvent(workspaceId, event, token, sessionId) {
+    event.network = workspaceId;
+    if (sessionId) {
+      event.metadata = { ...(event.metadata || {}), session_id: sessionId };
+    }
+    const data = await this._post('/v1/events', event, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Detect safe retry support before using a durable message outbox.
+   */
+  async supportsMessageDelivery() {
+    if (this._messageDeliverySupported !== undefined && Date.now() < this._messageDeliveryCheckUntil) return this._messageDeliverySupported;
+    try {
+      const result = await this._get('/v1/events/delivery-capabilities');
+      this._messageDeliverySupported = (result.data || result).idempotent_messages === true;
+    } catch (e) {
+      if (e.status !== 404) throw e;
+      this._messageDeliverySupported = false;
+    }
+    this._messageDeliveryCheckUntil = Date.now() + 60000;
+    return this._messageDeliverySupported;
+  }
+
+  /** Send a chat message, optionally with a stable delivery key. */
+  async sendMessage(workspaceId, channelName, token, content, {
+    senderType = 'agent', senderName, messageType = 'chat', metadata, attachments, sessionId, idempotencyKey,
+  } = {}) {
+    const sourcePrefix = senderType === 'agent' ? 'openagents' : 'human';
+    const source = senderName ? `${sourcePrefix}:${senderName}` : `${sourcePrefix}:unknown`;
+
+    const payload = { content, message_type: messageType };
+    if (attachments && attachments.length) payload.attachments = attachments;
+
+    // DM sessions (`dm:<counterpart address>`, created by _eventToMessage for
+    // incoming direct messages) reply as direct events to the counterpart —
+    // not into a `channel/dm:…` channel, which no client would ever read.
+    if (channelName && channelName.startsWith('dm:')) {
+      const counterpart = channelName.slice(3);
+      const meta = { ...(metadata || {}) };
+      if (!meta.target_agents) {
+        meta.target_agents = counterpart.startsWith('openagents:')
+          ? [counterpart.replace(/^openagents:/, '')]
+          : ['__no_response__'];
+      }
+      return this.sendEvent(workspaceId, {
+        type: 'workspace.message.posted',
+      ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+        source,
+        target: counterpart,
+        payload,
+        metadata: meta,
+        visibility: 'direct',
+      }, token, sessionId);
+    }
+
+    return this.sendEvent(workspaceId, {
+      type: 'workspace.message.posted',
+      ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+      source,
+      target: `channel/${channelName}`,
+      payload,
+      metadata: metadata || {},
+    }, token, sessionId);
+  }
+
+  /**
+   * Poll messages in a channel via GET /v1/events.
+   * @returns {Array} message-compatible objects
+   */
+  async pollMessages(workspaceId, channelName, token, { after, limit = 50 } = {}) {
+    const params = new URLSearchParams({
+      network: workspaceId,
+      channel: channelName,
+      type: 'workspace.message',
+      limit: String(limit),
+    });
+    if (after) params.set('after', after);
+
+    const data = await this._get(`/v1/events?${params}`, this._wsHeaders(token));
+    const result = data.data || data;
+    const events = (result && result.events) || [];
+    return events.map((e) => this._eventToMessage(e));
+  }
+
+  /**
+   * Fetch N messages in a channel, returned oldest-to-newest. `sort` picks
+   * which end of the channel the window comes from: 'desc' (default) takes
+   * the most recent N, 'asc' takes the channel's opening N. Used by adapters
+   * to rebuild context for a fresh Claude Code session when --resume of the
+   * previous session fails (the channel's chat history is the only thing
+   * that survives a session-storage rotation).
+   *
+   * Agent status/thinking/todos/loading events are dropped server-side by
+   * default: one tool-heavy agent turn posts dozens of them into the same
+   * channel, and filtering only after the fetch left a "100 event" window
+   * holding a handful of real chat messages (OA-026). Pass
+   * `excludeMessageTypes: ''` to get every event.
+   */
+  async getRecentMessages(workspaceId, channelName, token, limit = 30, {
+    sort = 'desc', before, timeout, throwOnError = false, excludeMessageTypes = RECENT_MESSAGES_EXCLUDED_TYPES,
+  } = {}) {
+    try {
+      const params = new URLSearchParams({
+        network: workspaceId,
+        channel: channelName,
+        type: 'workspace.message',
+        sort,
+        limit: String(limit),
+      });
+      if (before) params.set('before', before);
+      if (excludeMessageTypes) params.set('exclude_message_types', excludeMessageTypes);
+      const data = await this._get(`/v1/events?${params}`, this._wsHeaders(token), timeout);
+      const result = data.data || data;
+      const events = (result && result.events) || [];
+      // A desc window arrives newest-first; reverse so the caller always gets
+      // chronological order. An asc window is already chronological.
+      const ordered = sort === 'asc' ? events.slice() : events.slice().reverse();
+      return ordered.map((e) => this._eventToMessage(e));
+    } catch (error) {
+      if (throwOnError) throw error;
+      return [];
+    }
+  }
+
+  /**
+   * Fetch the latest workspace.message.posted event id (head cursor).
+   * Used by adapters to skip past existing events on join in O(1) instead
+   * of paginating from the start. Returns null if the workspace is empty
+   * or the request fails.
+   */
+  async getHeadEventId(workspaceId, token) {
+    try {
+      const params = new URLSearchParams({
+        network: workspaceId,
+        type: 'workspace.message.posted',
+        sort: 'desc',
+        limit: '1',
+      });
+      const data = await this._get(`/v1/events?${params}`, this._wsHeaders(token));
+      const result = data.data || data;
+      const events = (result && result.events) || [];
+      return events.length > 0 ? (events[0].id || null) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Poll for pending messages targeted at an agent via GET /v1/events.
+   * Returns { messages, cursor } where cursor is the last event ID.
+   */
+  async pollPending(workspaceId, agentName, token, { after, limit = 500 } = {}) {
+    const params = new URLSearchParams({
+      network: workspaceId,
+      type: 'workspace.message.posted',
+      // Server-side pre-filter: only return events routed to this agent (plus
+      // untargeted ones) instead of the whole network's traffic. Backward
+      // compatible — older backends ignore the unknown param and return
+      // everything, so the client-side filter below stays as the safety net.
+      target_agents: agentName,
+      limit: String(limit),
+    });
+    if (after) params.set('after', after);
+
+    const data = await this._get(`/v1/events?${params}`, this._wsHeaders(token));
+    const result = data.data || data;
+    const events = (result && result.events) || [];
+
+    // Prefer the server's next_cursor: with server-side target filtering the
+    // last returned event lags the stream tip, so advancing by it alone would
+    // re-scan the same range every poll. next_cursor jumps past other agents'
+    // events once ours are drained. Older backends don't send it — fall back
+    // to the last returned event id (they return the full stream, so that IS
+    // the tip).
+    let cursor = null;
+    if (result && result.next_cursor) {
+      cursor = result.next_cursor;
+    } else if (events.length > 0) {
+      cursor = events[events.length - 1].id || null;
+    }
+
+    // Filter for messages targeted at this agent. With a targeting-aware
+    // backend this is mostly a no-op (server already narrowed the set); it
+    // remains authoritative for older backends and for the untargeted events
+    // the server includes as a safe superset.
+    //
+    // target_agents semantics:
+    //   • absent            → legacy server with no routing decision
+    //                         (broadcast for human messages, ignore for agents)
+    //   • [...agentNames]   → only listed agents should respond
+    //   • ["__no_response__"]
+    //                       → routing happened and decided nobody
+    //                         should respond. Sentinel is used instead
+    //                         of [] because pre-0.2.106 clients treat
+    //                         empty array as "broadcast" and every
+    //                         agent would reply. The sentinel is
+    //                         non-empty and matches no real agent.
+    const messages = [];
+    for (const e of events) {
+      const source = e.source || '';
+      const meta = e.metadata || {};
+      const targetAgents = meta.target_agents;
+      const hasTargetList = Array.isArray(targetAgents);
+
+      // Skip own messages
+      if (source === `openagents:${agentName}`) continue;
+
+      if (source.startsWith('human:')) {
+        if (hasTargetList) {
+          if (targetAgents.includes(agentName)) {
+            messages.push(this._eventToMessage(e));
+          }
+        } else {
+          // Legacy server (no target_agents): broadcast for compat
+          messages.push(this._eventToMessage(e));
+        }
+      } else if (source.startsWith('system:')) {
+        // System messages (timers, notifications): pick up if targeted
+        if (hasTargetList && targetAgents.includes(agentName)) {
+          messages.push(this._eventToMessage(e));
+        }
+      } else if (source.startsWith('openagents:')) {
+        // Agent messages: only pick up if explicitly listed
+        if (hasTargetList && targetAgents.includes(agentName)) {
+          messages.push(this._eventToMessage(e));
+        }
+      }
+    }
+
+    const composing = !!(result && result.composing);
+    return { messages, cursor, composing };
+  }
+
+  /**
+   * Get the workspace's top-level metadata via GET /v1/workspaces/{id}.
+   *
+   * Returns the full data block from the backend — adapters care about
+   * `browserEnabled` today, but more keys may be surfaced over time. On
+   * error, returns null so callers can fall back to defaults rather than
+   * crashing.
+   */
+  async getWorkspaceMetadata(workspaceId, token) {
+    try {
+      const data = await this._get(
+        `/v1/workspaces/${workspaceId}`,
+        this._wsHeaders(token),
+      );
+      return data.data || data || {};
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Report skill-install progress/result back to the workspace.
+   *
+   * POST /v1/workspaces/{id}/members/{agentName}/skills/status
+   * Body: { skill_id, state: "installing"|"installed"|"failed"|"uninstalled",
+   *         path?, error? }
+   *
+   * The backend updates WorkspaceMember.enabled_skills.skill_status so the
+   * Skill Hub UI can render installing / installed / failed states. Best
+   * effort — returns the updated payload or throws (caller decides).
+   */
+  async reportSkillStatus(workspaceId, agentName, token, { skillId, state, path: installPath, error, partial, versionId } = {}) {
+    const body = { skill_id: skillId, state };
+    if (installPath) body.path = installPath;
+    if (error) body.error = String(error).slice(0, 2000);
+    if (partial) body.partial = true;
+    if (versionId) body.version_id = versionId;
+    const data = await this._post(
+      `/v1/workspaces/${workspaceId}/members/${encodeURIComponent(agentName)}/skills/status`,
+      body,
+      this._wsHeaders(token),
+    );
+    return data.data || data;
+  }
+
+  /**
+   * Get session/channel info via GET /v1/workspaces/{id}/channels/{name}.
+   */
+  async getSession(workspaceId, channelName, token) {
+    try {
+      const data = await this._get(
+        `/v1/workspaces/${workspaceId}/channels/${channelName}`,
+        this._wsHeaders(token),
+      );
+      const result = data.data || data;
+      return {
+        sessionId: result.name || channelName,
+        title: result.title || channelName,
+        titleManuallySet: result.titleManuallySet || false,
+        resumeFrom: result.resumeFrom || null,
+        status: result.status || 'active',
+      };
+    } catch {
+      return { sessionId: channelName, title: channelName, status: 'active' };
+    }
+  }
+
+  /**
+   * Update session/channel info via PATCH /v1/workspaces/{id}/channels/{name}.
+   */
+  async updateSession(workspaceId, channelName, token, { title, status, autoTitle } = {}) {
+    const body = {};
+    if (title !== undefined) body.title = title;
+    if (status !== undefined) body.status = status;
+    if (autoTitle !== undefined) body.auto_title = autoTitle;
+    try {
+      await this._patch(
+        `/v1/workspaces/${workspaceId}/channels/${channelName}`,
+        body,
+        this._wsHeaders(token),
+      );
+    } catch {}
+  }
+
+  /**
+   * Poll for control events targeted at an agent via GET /v1/events.
+   */
+  async pollControl(workspaceId, agentName, token, { after } = {}) {
+    try {
+      const params = new URLSearchParams({
+        network: workspaceId,
+        type: 'workspace.agent.control',
+        target: `openagents:${agentName}`,
+        limit: '10',
+        sort: 'desc',
+      });
+      if (after) params.set('after', after);
+      const data = await this._get(`/v1/events?${params}`, this._wsHeaders(token));
+      const result = data.data || data;
+      const events = (result && result.events) || [];
+      // Re-sort ascending by timestamp so callers process oldest-first.
+      events.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      return events;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Get workspace agents via GET /v1/discover.
+   * @returns {Array<{ agentName, role, status }>}
+   */
+  async getAgents(workspaceId, token) {
+    const params = new URLSearchParams({ network: workspaceId });
+    const data = await this._get(`/v1/discover?${params}`, this._wsHeaders(token));
+    const result = data.data || data;
+    const agents = (result && result.agents) || [];
+    return agents.map((a) => ({
+      agentName: (a.address || '').replace('openagents:', ''),
+      // The workspace's label for this agent, or null when it has none and
+      // falls back to agentName. Carried so a rename made in the workspace can
+      // be reflected back on the device.
+      displayName: a.display_name || null,
+      role: a.role || 'member',
+      status: a.status || 'offline',
+      enabledSkills: a.enabled_skills || null,
+      model: a.model || null,
+    }));
+  }
+
+  // ── File methods ──
+
+  /**
+   * Upload a file via POST /v1/files/base64.
+   */
+  async publishWebProject(workspaceId, token, project, projectId) {
+    const body = { ...project, network: workspaceId };
+    const route = '/v1/web-projects' + (projectId ? '/' + encodeURIComponent(projectId) : '');
+    const data = projectId
+      ? await this._put(route, body, this._wsHeaders(token), 60000)
+      : await this._post(route, body, this._wsHeaders(token), 60000);
+    return data.data || data;
+  }
+
+  async uploadFile(workspaceId, token, filename, contentBase64, {
+    contentType = 'application/octet-stream', source = 'human:user', channelName, visibility,
+  } = {}) {
+    const body = {
+      filename,
+      content_base64: contentBase64,
+      content_type: contentType,
+      network: workspaceId,
+      source,
+    };
+    if (channelName) body.channel_name = channelName;
+    if (visibility) body.visibility = visibility;
+
+    const data = await this._post('/v1/files/base64', body, this._wsHeaders(token), 60000);
+    return data.data || data;
+  }
+
+  /**
+   * Search the web for images via POST /v1/search/images.
+   */
+  async searchImages(workspaceId, token, query, { count = 10 } = {}) {
+    const body = { query, network: workspaceId, count };
+    const data = await this._post('/v1/search/images', body, this._wsHeaders(token), 30000);
+    return data.data || data;
+  }
+
+  /**
+   * Download a URL into workspace storage via POST /v1/files/from_url.
+   * With postToChannel, the file is also posted into the chat as an
+   * inline attachment.
+   */
+  async uploadFileFromUrl(workspaceId, token, url, {
+    filename, channelName, source = 'human:user', postToChannel = false, caption,
+  } = {}) {
+    const body = { url, network: workspaceId, source, post_to_channel: postToChannel };
+    if (filename) body.filename = filename;
+    if (channelName) body.channel_name = channelName;
+    if (caption) body.caption = caption;
+    const data = await this._post('/v1/files/from_url', body, this._wsHeaders(token), 90000);
+    return data.data || data;
+  }
+
+  /**
+   * List files via GET /v1/files.
+   */
+  async listFiles(workspaceId, token, { limit = 50, offset = 0 } = {}) {
+    const params = new URLSearchParams({
+      network: workspaceId,
+      limit: String(limit),
+      offset: String(offset),
+    });
+    const data = await this._get(`/v1/files?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Get file metadata via GET /v1/files/{fileId}/info.
+   */
+  async getFileInfo(token, fileId) {
+    try {
+      const data = await this._get(`/v1/files/${fileId}/info`, this._wsHeaders(token));
+      return data.data || data;
+    } catch {
+      return { id: fileId, filename: fileId, content_type: 'application/octet-stream' };
+    }
+  }
+
+  /**
+   * Download a file via GET /v1/files/{fileId}.
+   * @returns {Buffer}
+   */
+  async readFile(workspaceId, token, fileId) {
+    const params = new URLSearchParams({ network: workspaceId });
+    return this._getRaw(`/v1/files/${fileId}?${params}`, this._wsHeaders(token), 60000);
+  }
+
+  /** Download an immutable public registry version. */
+  async readRegistryVersion(versionId, token) {
+    if (!versionId) throw new Error('registry version id is required');
+    return this._getRaw(
+      `/v1/registry/versions/${encodeURIComponent(versionId)}/download`,
+      this._wsHeaders(token),
+      60000,
+    );
+  }
+
+  /**
+   * Delete a file via DELETE /v1/files/{fileId}.
+   */
+  async deleteFile(workspaceId, token, fileId) {
+    const data = await this._delete(`/v1/files/${fileId}`, this._wsHeaders(token), workspaceId);
+    return data.data || data;
+  }
+
+  // ── Browser methods ──
+
+  /**
+   * Open a new browser tab via POST /v1/browser/tabs.
+   */
+  async browserOpenTab(workspaceId, token, { url = 'about:blank', source = 'human:user', context_id, channel } = {}) {
+    const body = { url, network: workspaceId, source, channel };
+    if (context_id) body.context_id = context_id;
+    const data = await this._post('/v1/browser/tabs', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * List browser tabs via GET /v1/browser/tabs.
+   */
+  async browserListTabs(workspaceId, token) {
+    const params = new URLSearchParams({ network: workspaceId });
+    const data = await this._get(`/v1/browser/tabs?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Navigate a browser tab via POST /v1/browser/tabs/{tabId}/navigate.
+   */
+  async browserNavigate(workspaceId, token, tabId, url, { source, channel } = {}) {
+    const data = await this._post(`/v1/browser/tabs/${tabId}/navigate`, { url, source, channel }, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Click an element via POST /v1/browser/tabs/{tabId}/click.
+   */
+  async browserClick(workspaceId, token, tabId, selector, { source, channel } = {}) {
+    const data = await this._post(`/v1/browser/tabs/${tabId}/click`, { selector, source, channel }, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Type text via POST /v1/browser/tabs/{tabId}/type.
+   */
+  async browserType(workspaceId, token, tabId, selector, text, { source, channel } = {}) {
+    const data = await this._post(`/v1/browser/tabs/${tabId}/type`, { selector, text, source, channel }, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Get screenshot via GET /v1/browser/tabs/{tabId}/screenshot.
+   * @returns {Buffer}
+   */
+  /**
+   * Attach files to a file input via POST /v1/browser/tabs/{tabId}/upload.
+   * @param {Array<{file_id?: string, name?: string, mime_type?: string, data_base64?: string}>} files
+   */
+  async browserUpload(workspaceId, token, tabId, files, { selector = 'input[type=file]', frame_selector, source, channel } = {}) {
+    const body = { selector, files, source, channel };
+    if (frame_selector) body.frame_selector = frame_selector;
+    const data = await this._post(`/v1/browser/tabs/${tabId}/upload`, body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async browserScreenshot(workspaceId, token, tabId, { source, channel } = {}) {
+    const query = new URLSearchParams();
+    if (source) query.set('source', source);
+    if (channel) query.set('channel', channel);
+    return this._getRaw(`/v1/browser/tabs/${tabId}/screenshot?${query}`, this._wsHeaders(token), 30000);
+  }
+
+  /**
+   * Get accessibility snapshot via GET /v1/browser/tabs/{tabId}/snapshot.
+   * @returns {string}
+   */
+  async browserSnapshot(workspaceId, token, tabId, { source, channel } = {}) {
+    const query = new URLSearchParams();
+    if (source) query.set('source', source);
+    if (channel) query.set('channel', channel);
+    const buf = await this._getRaw(`/v1/browser/tabs/${tabId}/snapshot?${query}`, this._wsHeaders(token));
+    return buf.toString('utf-8');
+  }
+
+  /**
+   * Close a browser tab via DELETE /v1/browser/tabs/{tabId}.
+   */
+  async browserCloseTab(workspaceId, token, tabId) {
+    const data = await this._delete(`/v1/browser/tabs/${tabId}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Server-side fetch chain via POST /v1/fetch — reads a page WITHOUT
+   * holding a shared browser tab. Static HTTP first; JS-heavy pages are
+   * rendered in an ephemeral browser session that is closed immediately.
+   */
+  async fetchUrl(workspaceId, token, url, { mode = 'auto', maxChars, source } = {}) {
+    const body = { url, network: workspaceId, mode };
+    if (maxChars) body.max_chars = maxChars;
+    if (source) body.source = source;
+    const data = await this._post('/v1/fetch', body, this._wsHeaders(token), 90000);
+    return data.data || data;
+  }
+
+  /**
+   * List persistent browser contexts via GET /v1/browser/contexts.
+   */
+  async browserListContexts(workspaceId, token) {
+    const params = new URLSearchParams({ network: workspaceId });
+    const data = await this._get(`/v1/browser/contexts?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  // ── Todos & Timers ──
+
+  async putTodos(workspaceId, channelName, token, todos, { source } = {}) {
+    const body = {
+      todos,
+      network: workspaceId,
+      channel: channelName,
+      source: source || 'openagents:unknown',
+    };
+    const data = await this._put('/v1/todos', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async getTodos(workspaceId, channelName, token, { agent, all, source } = {}) {
+    const params = new URLSearchParams({ network: workspaceId });
+    if (channelName) params.set('channel', channelName);
+    if (agent) params.set('agent', agent);
+    if (source) params.set('source', source);
+    if (all) params.set('all', 'true');
+    const data = await this._get(`/v1/todos?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async createTimer(workspaceId, channelName, token, delay, message, { source } = {}) {
+    const body = {
+      delay,
+      message,
+      network: workspaceId,
+      channel: channelName,
+      source: source || 'openagents:unknown',
+    };
+    const data = await this._post('/v1/timers', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async listTimers(workspaceId, channelName, token) {
+    const params = new URLSearchParams({ network: workspaceId });
+    if (channelName) params.set('channel', channelName);
+    const data = await this._get(`/v1/timers?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async cancelTimer(workspaceId, token, timerId, network) {
+    const params = network ? `?network=${network}` : '';
+    const data = await this._delete(`/v1/timers/${timerId}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  // ── Routines ──
+
+  async createRoutine(workspaceId, channelName, token, { name, message, context, hour, minute, days, interval_minutes, source } = {}) {
+    const body = {
+      name,
+      message,
+      context: context || '',
+      network: workspaceId,
+      channel: channelName,
+      source_channel: channelName && !/^routines?:/.test(channelName) ? channelName : undefined,
+      source: source || 'openagents:unknown',
+    };
+    if (interval_minutes != null) {
+      body.interval_minutes = interval_minutes;
+    } else {
+      body.hour = hour;
+      body.minute = minute;
+      if (days) body.days = days;
+    }
+    const data = await this._post('/v1/routines', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async listRoutines(workspaceId, channelName, token) {
+    const params = new URLSearchParams({ network: workspaceId });
+    if (channelName) params.set('channel', channelName);
+    const data = await this._get(`/v1/routines?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /**
+   * Edit a routine in place. Only the fields passed are changed; the schedule
+   * keeps the same either/or rule as creation (`interval_minutes`, or
+   * `hour`/`minute`/`days`). `status` is 'active' | 'paused' — cancelling
+   * still goes through `cancelRoutine`.
+   */
+  async updateRoutine(workspaceId, token, routineId, { name, message, context, hour, minute, days, interval_minutes, source, status } = {}) {
+    const body = { network: workspaceId };
+    if (name != null) body.name = name;
+    if (message != null) body.message = message;
+    if (context != null) body.context = context;
+    if (source != null) body.source = source;
+    if (status != null) body.status = status;
+    if (interval_minutes != null) {
+      body.interval_minutes = interval_minutes;
+    } else {
+      if (hour != null) body.hour = hour;
+      if (minute != null) body.minute = minute;
+      if (days != null) body.days = days;
+    }
+    const data = await this._patch(`/v1/routines/${routineId}`, body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async cancelRoutine(workspaceId, token, routineId) {
+    const data = await this._delete(`/v1/routines/${routineId}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  // ── Notifications ──
+
+  async createNotification(workspaceId, token, { title, message, priority, channel, source } = {}) {
+    const body = {
+      title,
+      message,
+      priority: priority || 'normal',
+      network: workspaceId,
+      source: source || 'openagents:unknown',
+    };
+    if (channel) body.channel = channel;
+    const data = await this._post('/v1/notifications', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async listNotifications(workspaceId, token, { limit = 50 } = {}) {
+    const params = new URLSearchParams({
+      network: workspaceId,
+      limit: String(limit),
+    });
+    const data = await this._get(`/v1/notifications?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  // ── Knowledge Base ──
+
+  async listKnowledge(workspaceId, token, { limit = 100, timeout } = {}) {
+    const params = new URLSearchParams({
+      network: workspaceId,
+      limit: String(limit),
+    });
+    const data = await this._get(`/v1/knowledge?${params}`, this._wsHeaders(token), timeout);
+    return data.data || data;
+  }
+
+  async getKnowledge(workspaceId, token, entryId, { timeout } = {}) {
+    const params = new URLSearchParams({ network: workspaceId });
+    const data = await this._get(`/v1/knowledge/${entryId}?${params}`, this._wsHeaders(token), timeout);
+    return data.data || data;
+  }
+
+  async getKnowledgeBySlug(workspaceId, token, slug) {
+    const params = new URLSearchParams({ network: workspaceId });
+    const data = await this._get(`/v1/knowledge/by-slug/${slug}?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async createKnowledge(workspaceId, token, { title, content, description, source } = {}) {
+    const body = { title, content, network: workspaceId, source: source || 'openagents:unknown' };
+    if (description) body.description = description;
+    const data = await this._post('/v1/knowledge', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async updateKnowledge(workspaceId, token, entryId, { title, content, description, source } = {}) {
+    const body = { network: workspaceId, source: source || 'openagents:unknown' };
+    if (title !== undefined) body.title = title;
+    if (content !== undefined) body.content = content;
+    if (description !== undefined) body.description = description;
+    const data = await this._put(`/v1/knowledge/${entryId}`, body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async deleteKnowledge(workspaceId, token, entryId) {
+    const data = await this._delete(`/v1/knowledge/${entryId}`, this._wsHeaders(token), workspaceId);
+    return data.data || data;
+  }
+
+  // ── Internal helpers ──
+
+  /**
+   * Convert an ONM event to a message-compatible object.
+   */
+  _eventToMessage(event) {
+    const source = event.source || '';
+    const isHuman = source.startsWith('human:');
+    const senderName = source.replace('openagents:', '').replace('human:', '');
+    const payload = event.payload || {};
+    const target = event.target || '';
+    const ts = event.timestamp;
+
+    // Session id: channels map to their name. A direct message (visibility
+    // 'direct', target = this agent's own address) maps to a per-counterpart
+    // DM session `dm:<source address>` — so the adapter keeps one CLI session
+    // per DM peer, and sendMessage() below routes replies back as direct
+    // events to that peer instead of into a channel.
+    let sessionId;
+    if (target.startsWith('channel/')) {
+      sessionId = target.replace('channel/', '');
+    } else if (event.visibility === 'direct' && source) {
+      sessionId = `dm:${source}`;
+    } else {
+      sessionId = target;
+    }
+
+    const msg = {
+      messageId: event.id || '',
+      sessionId,
+      senderType: isHuman ? 'human' : 'agent',
+      senderName,
+      senderDisplayName: payload.sender_display_name || (event.metadata || {}).sender_display_name || null,
+      content: (payload.content || event.content || ''),
+      mentions: payload.mentions || [],
+      messageType: payload.message_type || 'chat',
+      metadata: event.metadata || {},
+    };
+    // The person behind a human message (v1.1): mobile puts it in the
+    // payload, the Launcher in metadata, the web app uses its email as the
+    // sender id. Used to fetch the owner-reviewed shared context for a
+    // teammate's request and to tell the owner who asked.
+    if (isHuman) {
+      const meta = event.metadata || {};
+      const email = [payload.sender_email, meta.sender_email, payload.sender_id]
+        .find((v) => typeof v === 'string' && /^[^\s@]+@[^\s@]+$/.test(v.trim()));
+      if (email) msg.senderEmail = email.trim().toLowerCase();
+    }
+    if (payload.handoff && typeof payload.handoff === 'object') {
+      msg.handoff = payload.handoff;
+    }
+    if (ts) {
+      msg.createdAt = new Date(ts).toISOString();
+    }
+    if (payload.attachments) {
+      msg.attachments = payload.attachments;
+    }
+    return msg;
+  }
+
+  // ── Approvals ─────────────────────────────────────────────────────────────
+
+  /** File an approval request (POST /v1/approvals). Returns the record; its
+   * `status` may already be approved/rejected when policy auto-decided. */
+  async createApproval(workspaceId, token, {
+    channel, kind, action, details, risk, source, assignee_email, requester_email,
+  } = {}) {
+    const body = {
+      network: workspaceId,
+      channel,
+      kind: kind || 'other',
+      action,
+      source: source || 'openagents:unknown',
+    };
+    if (details) body.details = String(details).slice(0, 4000);
+    if (risk) body.risk = risk;
+    if (assignee_email) body.assignee_email = assignee_email;
+    if (requester_email) body.requester_email = requester_email;
+    const data = await this._post('/v1/approvals', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  /** Ask for a public "anyone with the link" link to an artifact (POST
+   * /v1/public-shares/requests). Nothing is published: the workspace files
+   * an approval in the thread, and a person who can manage the artifact
+   * decides. Returns the approval record (status "pending"). */
+  async requestPublicShare(workspaceId, token, {
+    channel, kind, id, expires_at, reason, source, requester_email,
+  } = {}) {
+    const body = {
+      network: workspaceId,
+      channel,
+      kind: kind || 'file',
+      id,
+      source: source || 'openagents:unknown',
+    };
+    if (expires_at) body.expires_at = expires_at;
+    if (reason) body.reason = String(reason).slice(0, 500);
+    if (requester_email) body.requester_email = requester_email;
+    const data = await this._post('/v1/public-shares/requests', body, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  async getApproval(workspaceId, token, approvalId) {
+    const params = new URLSearchParams({ network: workspaceId });
+    const data = await this._get(`/v1/approvals/${encodeURIComponent(approvalId)}?${params}`, this._wsHeaders(token));
+    return data.data || data;
+  }
+
+  // ── Work brief (v1.1 M5) ──────────────────────────────────────────────────
+
+  /** Read a thread's shared work brief (GET /v1/channels/{channel}/brief).
+   * Empty fields come back null / [] when nothing has been written yet. */
+  async getBrief(workspaceId, token, channelName) {
+    const params = new URLSearchParams({ network: workspaceId });
+    const data = await this._get(
+      `/v1/channels/${encodeURIComponent(channelName)}/brief?${params}`,
+      this._wsHeaders(token),
+    );
+    return data.data || data;
+  }
+
+  /** Partial upsert of a thread's brief (PUT /v1/channels/{channel}/brief).
+   * Only the keys present in `fields` change; `source` is recorded as the
+   * writer ("openagents:<agent>"). */
+  async putBrief(workspaceId, token, channelName, fields = {}, { source } = {}) {
+    const body = { network: workspaceId, source: source || 'openagents:unknown', ...fields };
+    const data = await this._put(
+      `/v1/channels/${encodeURIComponent(channelName)}/brief`,
+      body,
+      this._wsHeaders(token),
+    );
+    return data.data || data;
+  }
+
+  _wsHeaders(token) {
+    return {
+      'Content-Type': 'application/json',
+      'X-Workspace-Token': token,
+    };
+  }
+
+  _get(urlPath, headers = {}, timeout = 15000) {
+    headers = this._withAgent(headers);
+    const fullUrl = this.endpoint + urlPath;
+
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(fullUrl);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+
+      const req = transport.request(fullUrl, {
+        method: 'GET',
+        headers,
+        timeout,
+        // Hard end-to-end deadline. The `timeout` option above is only a SOCKET
+        // inactivity timeout — it is NOT armed until a socket exists, so it does
+        // not bound DNS resolution or TCP connect. During a network partition a
+        // request stuck in getaddrinfo/connect never fires 'timeout', so the
+        // await never settles and the caller's single poll loop wedges forever
+        // (the agent stays "online" via its separate heartbeat but stops
+        // consuming messages). AbortSignal.timeout fires in ANY phase.
+        signal: AbortSignal.timeout(timeout),
+      }, (res) => {
+        let data = '';
+        rejectOnTruncatedResponse(res, reject);
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (res.statusCode >= 400) {
+              const err = new Error(parsed.message || `HTTP ${res.statusCode}`);
+              // Lets the poll loop tell a rejected credential (401/403) and an
+              // overloaded server (5xx) apart from a bug.
+              err.status = res.statusCode;
+              reject(err);
+            } else {
+              resolve(parsed);
+            }
+          } catch {
+            // A proxy's HTML error page (502/504) lands here.
+            const err = new Error(`Invalid response: ${data.slice(0, 200)}`);
+            if (res.statusCode >= 400) err.status = res.statusCode;
+            reject(err);
+          }
+        });
+      });
+
+      req.on('error', rejectWithDeadline(reject, timeout));
+      req.on('timeout', () => { req.destroy(); reject(requestTimeoutError(timeout)); });
+      req.end();
+    });
+  }
+
+  _getRaw(urlPath, headers = {}, timeout = 15000) {
+    headers = this._withAgent(headers);
+    const fullUrl = this.endpoint + urlPath;
+
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(fullUrl);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+
+      const req = transport.request(fullUrl, {
+        method: 'GET',
+        headers,
+        timeout,
+        signal: AbortSignal.timeout(timeout), // hard deadline (covers DNS/connect); see _get
+      }, (res) => {
+        const chunks = [];
+        rejectOnTruncatedResponse(res, reject);
+        res.on('data', (chunk) => { chunks.push(chunk); });
+        res.on('end', () => {
+          const buf = Buffer.concat(chunks);
+          if (res.statusCode >= 400) {
+            reject(new Error(`HTTP ${res.statusCode}: ${buf.toString('utf-8').slice(0, 200)}`));
+          } else {
+            resolve(buf);
+          }
+        });
+      });
+
+      req.on('error', rejectWithDeadline(reject, timeout));
+      req.on('timeout', () => { req.destroy(); reject(requestTimeoutError(timeout)); });
+      req.end();
+    });
+  }
+
+  _post(urlPath, body, headers = {}, timeout = 30000) {
+    headers = this._withAgent(headers);
+    if (!headers['Content-Type']) headers['Content-Type'] = 'application/json';
+    const jsonBody = JSON.stringify(body);
+    const fullUrl = this.endpoint + urlPath;
+
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(fullUrl);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+
+      const req = transport.request(fullUrl, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Length': Buffer.byteLength(jsonBody) },
+        timeout,
+        signal: AbortSignal.timeout(timeout), // hard deadline (covers DNS/connect); see _get
+      }, (res) => {
+        let data = '';
+        rejectOnTruncatedResponse(res, reject);
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (res.statusCode >= 400) {
+              const msg = parsed.message || `HTTP ${res.statusCode}`;
+              if (typeof msg === 'string' && msg.toLowerCase().includes('session_revoked')) {
+                reject(new SessionRevokedError(msg));
+              } else {
+                const err = new Error(msg);
+                // Preserve structured error details (error_code, hint,
+                // quota occupancy, ...) so tool handlers can surface them.
+                if (parsed.data && typeof parsed.data === 'object') err.data = parsed.data;
+                // The HTTP status lets callers tell a definitive rejection
+                // (e.g. 404 "not found") from a transient one (5xx/timeout);
+                // the node heartbeat uses it to clear a removed pairing.
+                err.status = res.statusCode;
+                reject(err);
+              }
+            } else {
+              resolve(parsed);
+            }
+          } catch {
+            const err = new Error(`Invalid response (HTTP ${res.statusCode})`);
+            err.status = res.statusCode;
+            reject(err);
+          }
+        });
+      });
+
+      req.on('error', rejectWithDeadline(reject, timeout));
+      req.on('timeout', () => { req.destroy(); reject(requestTimeoutError(timeout)); });
+      req.write(jsonBody);
+      req.end();
+    });
+  }
+
+  _put(urlPath, body, headers = {}, timeout = 30000) {
+    headers = this._withAgent(headers);
+    if (!headers['Content-Type']) headers['Content-Type'] = 'application/json';
+    const jsonBody = JSON.stringify(body);
+    const fullUrl = this.endpoint + urlPath;
+
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(fullUrl);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+
+      const req = transport.request(fullUrl, {
+        method: 'PUT',
+        headers: { ...headers, 'Content-Length': Buffer.byteLength(jsonBody) },
+        timeout,
+        signal: AbortSignal.timeout(timeout), // hard deadline (covers DNS/connect); see _get
+      }, (res) => {
+        let data = '';
+        rejectOnTruncatedResponse(res, reject);
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (res.statusCode >= 400) {
+              const msg = parsed.message || `HTTP ${res.statusCode}`;
+              if (typeof msg === 'string' && msg.toLowerCase().includes('session_revoked')) {
+                reject(new SessionRevokedError(msg));
+              } else {
+                reject(new Error(msg));
+              }
+            } else {
+              resolve(parsed);
+            }
+          } catch {
+            reject(new Error(`Invalid response: ${data.slice(0, 200)}`));
+          }
+        });
+      });
+
+      req.on('error', rejectWithDeadline(reject, timeout));
+      req.on('timeout', () => { req.destroy(); reject(requestTimeoutError(timeout)); });
+      req.write(jsonBody);
+      req.end();
+    });
+  }
+
+  _patch(urlPath, body, headers = {}, timeout = 15000) {
+    headers = this._withAgent(headers);
+    if (!headers['Content-Type']) headers['Content-Type'] = 'application/json';
+    const jsonBody = JSON.stringify(body);
+    const fullUrl = this.endpoint + urlPath;
+
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(fullUrl);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+
+      const req = transport.request(fullUrl, {
+        method: 'PATCH',
+        headers: { ...headers, 'Content-Length': Buffer.byteLength(jsonBody) },
+        timeout,
+        signal: AbortSignal.timeout(timeout), // hard deadline (covers DNS/connect); see _get
+      }, (res) => {
+        let data = '';
+        rejectOnTruncatedResponse(res, reject);
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (res.statusCode >= 400) {
+              reject(new Error(parsed.message || `HTTP ${res.statusCode}`));
+            } else {
+              resolve(parsed);
+            }
+          } catch {
+            reject(new Error(`Invalid response: ${data.slice(0, 200)}`));
+          }
+        });
+      });
+
+      req.on('error', rejectWithDeadline(reject, timeout));
+      req.on('timeout', () => { req.destroy(); reject(requestTimeoutError(timeout)); });
+      req.write(jsonBody);
+      req.end();
+    });
+  }
+
+  _delete(urlPath, headers = {}, network) {
+    headers = this._withAgent(headers);
+    const fullUrl = this.endpoint + urlPath + (network ? `?network=${network}` : '');
+
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(fullUrl);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+
+      const req = transport.request(fullUrl, {
+        method: 'DELETE',
+        headers,
+        timeout: 15000,
+        signal: AbortSignal.timeout(15000), // hard deadline (covers DNS/connect); see _get
+      }, (res) => {
+        let data = '';
+        rejectOnTruncatedResponse(res, reject);
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (res.statusCode >= 400) {
+              const err = new Error(parsed.message || `HTTP ${res.statusCode}`);
+              // Callers act on it: removeAgentFromWorkspace takes a 404 as
+              // "already gone". Without it that check never matched, and an
+              // agent whose membership was already removed could not be
+              // deleted at all ("Member not found").
+              err.status = res.statusCode;
+              reject(err);
+            } else {
+              resolve(parsed);
+            }
+          } catch {
+            const err = new Error(`Invalid response: ${data.slice(0, 200)}`);
+            if (res.statusCode >= 400) err.status = res.statusCode;
+            reject(err);
+          }
+        });
+      });
+
+      req.on('error', rejectWithDeadline(reject, 15000));
+      req.on('timeout', () => { req.destroy(); reject(requestTimeoutError(15000)); });
+      req.end();
+    });
+  }
+}
+
+module.exports = { WorkspaceClient, SessionRevokedError };

@@ -1,0 +1,354 @@
+/**
+ * Shared utilities for adapter implementations.
+ *
+ * Direct port of Python: sdk/src/openagents/adapters/utils.py
+ */
+
+'use strict';
+
+const SESSION_DEFAULT_RE = /^(Session \d+|session-[0-9a-f]+|channel-[0-9a-f]+)$/;
+
+/**
+ * Generate a short session title from the first user message.
+ */
+function generateSessionTitle(message, maxWords = 6) {
+  // Collapse whitespace, strip code blocks
+  let text = message.replace(/\s+/g, ' ').trim();
+  text = text.replace(/```[\s\S]*?```/g, '').trim();
+  text = text.replace(/`[^`]+`/g, '').trim();
+
+  if (!text) return '';
+
+  // Try to get first sentence
+  const sentenceMatch = text.match(/^(.+?[.!?])\s/);
+  if (sentenceMatch) {
+    text = sentenceMatch[1].replace(/[.!?]+$/, '').trim();
+  }
+
+  // Take first maxWords words
+  const words = text.split(/\s+/);
+  if (words.length > maxWords) {
+    text = words.slice(0, maxWords).join(' ');
+  }
+
+  // Strip common filler prefixes
+  text = text.replace(
+    /^(hey|hi|hello|please|can you|could you|i need you to|i want you to)\s+/i,
+    ''
+  ).trim();
+
+  // Capitalize first letter
+  if (text) {
+    text = text[0].toUpperCase() + text.slice(1);
+  }
+
+  // Hard cap at 50 characters
+  if (text.length > 50) {
+    text = text.slice(0, 47) + '...';
+  }
+
+  return text;
+}
+
+/**
+ * Format attachment metadata into text to append to an agent prompt.
+ *
+ * `tokenExpr` is the SHELL EXPRESSION the agent should use for the workspace
+ * token, not the token itself. It defaults to `$TOKEN` for the adapters that
+ * already export the token under that name. An adapter whose prompt must never
+ * contain the literal token (deepseek writes its prompt to a file and exports
+ * OPENAGENTS_WORKSPACE_TOKEN into the child environment) passes its own
+ * expression instead — otherwise `$TOKEN` expands to the empty string in the
+ * child and every attachment download silently 401s.
+ *
+ * @param {Array} attachments
+ * @param {'mcp'|'skills'} [toolMode='mcp']
+ * @param {boolean} [isWindows]
+ * @param {object} [opts]
+ * @param {string} [opts.tokenExpr='$TOKEN'] shell expression yielding the token
+ * @param {string} [opts.endpoint] base URL used when an attachment carries no
+ *   absolute `url`. Without it the fallback emits a literal `{WORKSPACE_API}`
+ *   placeholder that nothing substitutes.
+ */
+function formatAttachmentsForPrompt(
+  attachments,
+  toolMode = 'mcp',
+  isWindows = process.platform === 'win32',
+  { tokenExpr = '$TOKEN', endpoint = null } = {},
+) {
+  if (!attachments || attachments.length === 0) return null;
+
+  const lines = ['\n[Attached files]'];
+  for (const att of attachments) {
+    const filename = att.filename || 'unknown';
+    const fileId = att.fileId || '';
+    const contentType = att.contentType || '';
+    if (toolMode === 'skills') {
+      const base = endpoint ? String(endpoint).replace(/\/+$/, '') : '{WORKSPACE_API}';
+      const url = att.url || `${base}/v1/files/${fileId}`;
+      const curl = isWindows ? 'curl.exe' : 'curl';
+      const tmpDir = isWindows ? '$env:TEMP' : '/tmp';
+      // A web upload's filename is its workspace path (uploaded_files/<stamp>_<name>)
+      // and curl -o does not create folders, so that download failed with exit 23.
+      const localName = filename.split(/[\\/]/).pop() || fileId || 'attachment';
+      if (contentType.startsWith('image/')) {
+        lines.push(
+          `- Image: ${filename} (file_id: ${fileId}) — ` +
+          `download with curl, then use your Read tool on the local file to view it:\n` +
+          `  Step 1: ${curl} -s -H "X-Workspace-Token: ${tokenExpr}" "${url}" -o ${tmpDir}/${localName}\n` +
+          `  Step 2: Use the Read tool on ${tmpDir}/${localName} to see the image`
+        );
+      } else {
+        lines.push(
+          `- File: ${filename} (file_id: ${fileId}, type: ${contentType}) — ` +
+          `download with curl, then use your Read tool on the local file:\n` +
+          `  Step 1: ${curl} -s -H "X-Workspace-Token: ${tokenExpr}" "${url}" -o ${tmpDir}/${localName}\n` +
+          `  Step 2: Use the Read tool on ${tmpDir}/${localName} to read the file`
+        );
+      }
+    } else {
+      if (contentType.startsWith('image/')) {
+        lines.push(
+          `- Image: ${filename} (file_id: ${fileId}) — ` +
+          'use workspace_read_file to view this image'
+        );
+      } else {
+        lines.push(
+          `- File: ${filename} (file_id: ${fileId}, type: ${contentType}) — ` +
+          'use workspace_read_file to read this file'
+        );
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Environment variable names whose value is a credential. Deliberately broad:
+ * masking a value that turns out to be harmless costs one word of an error
+ * notice, while missing a key posts it to every member of the workspace.
+ */
+const SECRET_NAME_RE = /KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH/i;
+/** Shorter than this and a value is as likely a flag ("1", "true") as a secret. */
+const MIN_SECRET_LENGTH = 8;
+
+/**
+ * The exact values an agent must never quote back: everything in its
+ * environment whose name says it is a credential, plus whatever the caller
+ * already knows to be one (the workspace token). Longest first, so a secret
+ * that contains another is masked whole rather than leaving its tail behind.
+ *
+ * @param {object} env     the environment the agent's CLI runs with
+ * @param {string[]} extra further values to mask
+ * @returns {string[]}
+ */
+function secretValues(env, extra = []) {
+  const out = new Set();
+  const add = (value) => {
+    const v = typeof value === 'string' ? value.trim() : '';
+    if (v.length >= MIN_SECRET_LENGTH) out.add(v);
+  };
+  for (const [name, value] of Object.entries(env || {})) {
+    if (SECRET_NAME_RE.test(name)) add(value);
+  }
+  for (const value of extra || []) add(value);
+  return [...out].sort((x, y) => y.length - x.length);
+}
+
+/**
+ * Mask known secret values in `text` and touch nothing else. For text that is
+ * mostly prose or code — a model's partial answer — where the shape rules of
+ * redactSecrets would rewrite ordinary words ("token limit", `password: string`).
+ */
+function maskSecretValues(text, secrets) {
+  let out = String(text == null ? '' : text);
+  for (const secret of secrets || []) {
+    if (typeof secret === 'string' && secret.length >= MIN_SECRET_LENGTH) {
+      out = out.split(secret).join('[REDACTED]');
+    }
+  }
+  return out;
+}
+
+/**
+ * Strip secrets out of anything on its way to a log line or a channel message.
+ *
+ * Adapter diagnostics quote raw CLI output, and a CLI that fails on auth tends
+ * to echo the credential it was handed. Two passes:
+ *
+ *   1. `secrets` — the values we already know are secret (see secretValues),
+ *      masked wherever they appear. No pattern can know every provider's key
+ *      format; this needs no format at all. It runs first because a pattern
+ *      that recognises half of a key would otherwise leave the other half.
+ *   2. The shapes that actually turn up in CLI output, for a credential that
+ *      is not ours to know (another tool's token, a key in a config file). The
+ *      closing catch-all takes any long opaque token the named patterns missed.
+ *
+ * Lived as a private static on two adapters before claude needed it as well —
+ * a third identical copy is one copy too many for a security-relevant rule.
+ *
+ * @param {string} s
+ * @param {string[]} [secrets] exact values to mask, e.g. from secretValues()
+ */
+function redactSecrets(s, secrets) {
+  let out = maskSecretValues(s, secrets);
+  out = out
+    // scheme://user:password@host, and scheme://token@host.
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s@?#]+@/gi, '$1[REDACTED]@')
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, 'sk-[REDACTED]')
+    .replace(/\b(?:github_pat|gh[pousr])_[A-Za-z0-9_]{10,}/g, '[REDACTED_TOKEN]')
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}/g, '[REDACTED_TOKEN]')
+    .replace(/\bAKIA[0-9A-Z]{12,}/g, '[REDACTED_KEY]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/g, '[REDACTED_JWT]')
+    // Google API keys are 39 chars, one short of the catch-all below.
+    .replace(/\bAIza[0-9A-Za-z_-]{30,}/g, '[REDACTED_KEY]')
+    .replace(/\bya29\.[0-9A-Za-z_-]{20,}/g, '[REDACTED_TOKEN]')
+    // key: value. An Authorization value is "<scheme> <credential>", so the
+    // scheme word is skipped — taking it for the value masked "Bearer" and
+    // left the token standing right behind it.
+    .replace(/(authorization|api[_-]?key|x-api-key|token|bearer|secret|password|passwd)(["'\s:=]+)(?:(?:bearer|basic|token)[ \t]+)?([^\s"',}]+)/gi,
+      (m, k, sep) => `${k}${sep}[REDACTED]`)
+    // A Basic credential quoted without its header name. Base64 has no shape
+    // of its own, so this wants padding or some length before it believes it.
+    .replace(/\b(basic)[ \t]+(?:[A-Za-z0-9+/]{16,}={0,2}|[A-Za-z0-9+/]{4,}={1,2})/gi, '$1 [REDACTED]')
+    .replace(/([?&](?:api[_-]?key|key|token|access_token)=)[^&\s"']+/gi, '$1[REDACTED]')
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, '[REDACTED]')
+    // Keys too short for the catch-all with no prefix to know them by: bare
+    // hex (32+), and the "<32 hex>.<secret>" form Zhipu issues.
+    .replace(/\b[0-9a-f]{32,}(?:\.[A-Za-z0-9]{8,})?\b/gi, '[REDACTED]');
+  return out;
+}
+
+/**
+ * Decode CLI output. The CLIs write UTF-8, but text that came from Windows
+ * itself (cmd.exe, a system error) is in the console code page, which on a
+ * Chinese system is GBK and showed up as rows of "�". Fall back to GB18030
+ * only when UTF-8 fails and GB18030 reads the bytes cleanly.
+ */
+function decodeConsoleOutput(buf, isWindows = process.platform === 'win32') {
+  const utf8 = buf.toString('utf-8');
+  if (!isWindows || !utf8.includes('�')) return utf8;
+  try {
+    return new TextDecoder('gb18030', { fatal: true }).decode(buf);
+  } catch {
+    return utf8;
+  }
+}
+
+/**
+ * Lines a CLI prints on a perfectly healthy run. Reported as "the" error,
+ * they hid the real one. Claude Code warns about its claude.ai connectors
+ * whenever a key is set, and about a model it does not know (any relay model:
+ * glm, kimi, …) — "…so it assumes a context window of 200000 tokens … Until
+ * then auto-compact keeps this session within 200k tokens". Codex does the
+ * same for a model missing from its catalog: "warning: Model metadata for
+ * `gpt-5.5` not found. Defaulting to fallback metadata…", and logs every
+ * run's housekeeping as timestamped WARN/INFO records plus "Reading prompt
+ * from stdin...", which filled the smoke test's timeout message. Node's own
+ * process warnings ("(node:1234) Warning: …", "(Use `node --trace-warnings
+ * ...`") come ahead of the real error from npm-shipped CLIs like CodeBuddy.
+ * Newer Claude Code reports an unknown model as a one-line signal instead,
+ * "[claude-code:unrecognized_model] {"model":…}", on every run against a relay
+ * model; read as the failure, it turned a timed-out smoke test into "wrong
+ * model" and skipped the direct API check that would have said why.
+ * CodeBuddy on a Windows machine without Git opens every run with a
+ * five-line "Note: Git Bash not detected … will use PowerShell" notice on
+ * stderr and carries on; a failed connection test quoted that notice as its
+ * reason, so the real one never showed (daily errors dashboard, 2026-11-23).
+ */
+const BENIGN_CLI_OUTPUT = /claude\.ai connectors are disabled|doesn't recognize the model|\[claude-code:unrecognized_model\]|assumes a context window|auto-compact keeps this session|CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT|Model metadata for .* not found|Defaulting to fallback metadata|^\s*Reading (prompt|additional input) from stdin|^\s*\d{4}-\d{2}-\d{2}T[\d:.]+Z?\s+(TRACE|DEBUG|INFO|WARN)\s|^\s*\(node:\d+\) (\[\w+\] )?\w*Warning:|^\s*\(Use `node --trace-(warnings|deprecation) \.\.\.`|^\s*Note: Git Bash not detected\b|^\s*Git Bash-only features \(|^\s*To enable Git Bash features, install Git for Windows|^\s*or set: CODEBUDDY_CODE_GIT_BASH_PATH=|^\s*Suppress this notice with: CODEBUDDY_SKIP_GIT_BASH_CHECK/i;
+
+/**
+ * An account with nothing left to spend, in words that say only that.
+ * Relays built on new-api / one-api refuse at 403 with "Insufficient user
+ * quota, remaining quota: ＄-0.000054" or "预扣费额度失败, 用户剩余额度: ¥0.22", and
+ * others say "Forbidden: Insufficient account balance" or "403 organization
+ * balance exhausted". Checked after the
+ * status code, each of those read as a rejected key: the connection test,
+ * OpenCode and Pi all told the user to replace a key that works, and Pi
+ * marked the agent as signed out (daily errors dashboard, 2026-11-23).
+ *
+ * Adapters test this ahead of their 401/403 and rate-limit rules, so it is
+ * kept to phrases that never describe a throttle or a bad key: no bare
+ * "quota exceeded" (Gemini's per-minute limit), "billing", 额度 or 402, which
+ * also turn up in rate-limit text, paths and ids. CodeRouter's "Your free
+ * trial's $5.00 usage credit can't cover this request" reached OpenCode's
+ * "failed for an undetermined reason" (daily errors dashboard, 2026-11-25).
+ * Match lower-cased text.
+ */
+const CREDIT_EXHAUSTED = /insufficient[_ ]?(?:[a-z]+[_ ])?(?:balance|quota|credits?|funds)\b|not enough (?:quota|credits?|balance)|credits? (?:can.?t|cannot|doesn.?t|does not) cover (?:this|the) request|no credits? (?:left|remaining)|pre-?consume quota|credit balance is too low|payment required|out of (?:credits?|balance)\b|\bbalance (?:is |has been )?exhausted\b|余额不足|额度不足|预扣费额度失败|欠费|arrearage/;
+
+/**
+ * A provider turning away the device's network or region, not its
+ * credentials. Anthropic answers 403 ("Request blocked before it reached
+ * Anthropic's API (HTTP 403) · the network this request came from isn't
+ * allowed: usually an unsupported region"), and read by its status alone
+ * that sent users to replace a key nobody had looked at (daily errors
+ * dashboard, 2026-11-24). Kept to wording about where the request came from:
+ * "unsupported region us-west-9" in a cloud config is a setting, not a block.
+ * Match lower-cased text.
+ */
+const REGION_BLOCKED = /request blocked before it reached|network this request came from isn.t allowed|unsupported_country|(?:country|region),? (?:or territory )?(?:is )?not supported|not available in your (?:country|region)/;
+
+/**
+ * What a failed socket says went wrong. Node 20+ tries every address a host
+ * resolves to (happy eyeballs); when all of them fail it raises an
+ * AggregateError whose own message is EMPTY, with the reasons on `errors` and
+ * the code on `code`. Read as `e.message` alone that was "": the smoke test
+ * took it for success and crashed on the missing body ("Cannot read
+ * properties of undefined (reading 'slice')"), and a chat run failed with no
+ * reason at all.
+ */
+function networkErrorText(err) {
+  if (!err) return 'unknown network error';
+  if (err.message) return err.message;
+  const inner = Array.isArray(err.errors)
+    ? [...new Set(err.errors.map((e) => e && e.message).filter(Boolean))].join('; ')
+    : '';
+  return inner || err.code || String(err) || 'unknown network error';
+}
+
+// Terminal escape sequences (colour, cursor). A CLI that colours its errors
+// writes them to a pipe too, and quoted into a channel they show as
+// "\x1b[91m\x1b[1mError: \x1b[0m…".
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
+/** `text` with terminal escape sequences removed. */
+function stripAnsi(text) {
+  return String(text || '').replace(ANSI_RE, '');
+}
+
+/** CLI output with the known-harmless lines taken out. */
+function stripCliNoise(text) {
+  return String(text || '').split(/\r?\n/).filter((l) => !BENIGN_CLI_OUTPUT.test(l)).join('\n');
+}
+
+/**
+ * Whether a prompt can go to a CLI as one argv element (`-p <prompt>`).
+ * Windows caps a whole command line at 32,767 characters and Node fails the
+ * spawn itself with ENAMETOOLONG — the system prompt plus a large pinned
+ * glossary got there with a one-word message. Linux caps a single argument at
+ * 128 KiB. Both limits leave headroom for quoting and the rest of the argv.
+ * Past it, an adapter sends the prompt over stdin.
+ */
+function promptFitsArgv(prompt, platform = process.platform) {
+  const limit = platform === 'win32' ? 24000 : 100000;
+  return String(prompt || '').length <= limit;
+}
+
+module.exports = {
+  promptFitsArgv,
+  SESSION_DEFAULT_RE,
+  networkErrorText,
+  BENIGN_CLI_OUTPUT,
+  CREDIT_EXHAUSTED,
+  REGION_BLOCKED,
+  stripCliNoise,
+  stripAnsi,
+  decodeConsoleOutput,
+  generateSessionTitle,
+  formatAttachmentsForPrompt,
+  redactSecrets,
+  maskSecretValues,
+  secretValues,
+};

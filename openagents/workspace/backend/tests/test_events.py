@@ -1,0 +1,753 @@
+# -*- coding: utf-8 -*-
+"""
+Tests for the event-native API (POST/GET /v1/events).
+"""
+
+import pytest
+
+
+class TestSendEvent:
+    """POST /v1/events — send events through the pipeline."""
+
+    def test_send_message_event(self, client, workspace):
+        """Send a workspace.message.posted event through the pipeline."""
+        channel_name = workspace["channel"]["name"]
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "human:user1",
+            "target": f"channel/{channel_name}",
+            "payload": {"content": "Hello, world!"},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["type"] == "workspace.message.posted"
+        assert data["source"] == "human:user1"
+        assert data["target"] == f"channel/{channel_name}"
+        assert "id" in data
+        assert "timestamp" in data
+
+    def test_send_event_missing_network(self, client, workspace):
+        """Events without network field are rejected."""
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "human:user1",
+            "target": "channel/test",
+        })
+        assert resp.status_code == 400
+
+    def test_send_event_invalid_network(self, client, workspace):
+        """Events with nonexistent network are rejected."""
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "human:user1",
+            "target": "channel/test",
+            "network": "nonexistent",
+        })
+        assert resp.status_code == 404
+
+    def test_send_event_wrong_token(self, client, workspace):
+        """Events with wrong token are rejected by auth mod."""
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "human:user1",
+            "target": "channel/test",
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": "wrong-token"})
+        assert resp.status_code == 401
+
+    def test_send_event_stamps_network_id(self, client, workspace):
+        """Auth mod stamps network ID on the event."""
+        channel_name = workspace["channel"]["name"]
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-alpha",
+            "target": f"channel/{channel_name}",
+            "payload": {"content": "test"},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        assert resp.status_code == 200
+
+        # Verify event was persisted
+        poll = client.get("/v1/events", params={"network": workspace["id"]},
+                          headers={"X-Workspace-Token": workspace["token"]})
+        assert poll.status_code == 200
+        events = poll.json()["data"]["events"]
+        assert len(events) >= 1
+        found = [e for e in events if e["type"] == "workspace.message.posted"]
+        assert len(found) >= 1
+
+    def test_send_event_with_metadata(self, client, workspace):
+        """Custom metadata is preserved through the pipeline."""
+        channel_name = workspace["channel"]["name"]
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-alpha",
+            "target": f"channel/{channel_name}",
+            "payload": {"content": "test"},
+            "metadata": {"custom_key": "custom_value"},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["metadata"]["custom_key"] == "custom_value"
+
+    def test_human_message_routes_to_master(self, client, workspace):
+        """Human messages are routed to the channel master agent."""
+        channel_name = workspace["channel"]["name"]
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "human:user1",
+            "target": f"channel/{channel_name}",
+            "payload": {"content": "Hello agent!"},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        # workspace_mod should add target_agents with the channel master
+        assert "target_agents" in data["metadata"]
+        assert "agent-alpha" in data["metadata"]["target_agents"]
+
+
+    def test_agent_message_master_no_targeting_in_single_agent_channel(self, client, workspace):
+        """Master agent messages in single-agent channels have empty target_agents.
+
+        With the LLM router, multi-agent routing uses the router.
+        In single-agent channels (or when router is disabled), the fallback
+        applies: master's own messages get no targeting.
+
+        As of the routing fix: target_agents is ALWAYS set (to an empty
+        list if nobody should respond) so clients don't fall through to
+        broadcast-to-all on missing field.
+        """
+        channel_name = workspace["channel"]["name"]
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-alpha",
+            "target": f"channel/{channel_name}",
+            "payload": {
+                "content": "@agent-beta please review the code",
+                "message_type": "chat",
+            },
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        # Master's message in a single-agent channel — no real targets
+        # (sentinel list, not missing, so legacy clients don't broadcast)
+        assert data["metadata"].get("target_agents") == ["__no_response__"]
+
+    def test_master_message_without_mentions_no_target_agents(self, client, workspace):
+        """Master agent messages without mentions produce empty target_agents (no self-trigger)."""
+        channel_name = workspace["channel"]["name"]
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-alpha",  # agent-alpha is the channel master
+            "target": f"channel/{channel_name}",
+            "payload": {"content": "Just a status update"},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        # Master's own messages should NOT trigger itself — sentinel
+        # list (not missing field, not empty) so legacy clients skip.
+        assert data["metadata"].get("target_agents") == ["__no_response__"]
+
+    def test_member_message_without_mentions_routes_to_master(self, client, workspace):
+        """Member agent messages without mentions route back to channel master."""
+        # Add a member agent
+        client.post("/v1/join", json={
+            "agent_name": "agent-beta",
+            "token": workspace["token"],
+            "network": workspace["id"],
+        })
+
+        channel_name = workspace["channel"]["name"]
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-beta",  # member, not master
+            "target": f"channel/{channel_name}",
+            "payload": {"content": "I finished the task."},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        # Member's response should be routed back to the master
+        assert data["metadata"]["target_agents"] == ["agent-alpha"]
+
+    def test_member_message_with_mention_routes_to_mentioned_agent(self, client, workspace):
+        """Agent messages with explicit @mentions route to the mentioned agent."""
+        # Add member agents to workspace (not to channel — so channel stays single-participant)
+        for name in ["agent-beta", "agent-gamma"]:
+            client.post("/v1/join", json={
+                "agent_name": name,
+                "token": workspace["token"],
+                "network": workspace["id"],
+            })
+
+        channel_name = workspace["channel"]["name"]
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-beta",
+            "target": f"channel/{channel_name}",
+            "payload": {"content": "@agent-gamma can you review this?"},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        # Explicit @mention routes directly to the mentioned agent
+        assert data["metadata"]["target_agents"] == ["agent-gamma"]
+
+
+class TestPollEvents:
+    """GET /v1/events — poll events from a network."""
+
+    def test_poll_empty_network(self, client, workspace):
+        """Polling a new network returns empty list."""
+        resp = client.get("/v1/events", params={"network": workspace["id"]},
+                          headers={"X-Workspace-Token": workspace["token"]})
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["events"] == []
+        assert data["has_more"] is False
+
+    def test_poll_after_send(self, client, workspace):
+        """Events appear after being sent."""
+        channel_name = workspace["channel"]["name"]
+        # Send an event
+        client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-alpha",
+            "target": f"channel/{channel_name}",
+            "payload": {"content": "msg1"},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        # Poll
+        resp = client.get("/v1/events", params={"network": workspace["id"]},
+                          headers={"X-Workspace-Token": workspace["token"]})
+        assert resp.status_code == 200
+        events = resp.json()["data"]["events"]
+        assert len(events) == 1
+        assert events[0]["payload"]["content"] == "msg1"
+
+    def test_poll_filter_by_type(self, client, workspace):
+        """Filter events by type prefix."""
+        channel_name = workspace["channel"]["name"]
+        # Send two different event types
+        for etype in ("workspace.message.posted", "workspace.session.created"):
+            client.post("/v1/events", json={
+                "type": etype,
+                "source": "openagents:agent-alpha",
+                "target": f"channel/{channel_name}",
+                "payload": {},
+                "network": workspace["id"],
+            }, headers={"X-Workspace-Token": workspace["token"]})
+
+        # Filter by workspace.session
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "type": "workspace.session",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        events = resp.json()["data"]["events"]
+        assert len(events) == 1
+        assert events[0]["type"] == "workspace.session.created"
+
+    def test_poll_filter_by_target(self, client, workspace):
+        """Filter events by target address."""
+        channel_name = workspace["channel"]["name"]
+        client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-alpha",
+            "target": f"channel/{channel_name}",
+            "payload": {},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+
+        # Filter by exact target
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "target": f"channel/{channel_name}",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        events = resp.json()["data"]["events"]
+        assert len(events) == 1
+
+        # Different target returns empty
+        resp2 = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "target": "channel/nonexistent",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        assert resp2.json()["data"]["events"] == []
+
+    def test_poll_cursor_pagination(self, client, workspace):
+        """Cursor-based pagination with after parameter."""
+        channel_name = workspace["channel"]["name"]
+        # Send 3 events
+        event_ids = []
+        for i in range(3):
+            resp = client.post("/v1/events", json={
+                "type": "workspace.message.posted",
+                "source": "openagents:agent-alpha",
+                "target": f"channel/{channel_name}",
+                "payload": {"content": f"msg{i}"},
+                "network": workspace["id"],
+            }, headers={"X-Workspace-Token": workspace["token"]})
+            event_ids.append(resp.json()["data"]["id"])
+
+        # Get first page (limit 2)
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "limit": 2,
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        data = resp.json()["data"]
+        assert len(data["events"]) == 2
+        assert data["has_more"] is True
+
+        # Get second page using cursor
+        resp2 = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "after": data["events"][1]["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        data2 = resp2.json()["data"]
+        assert len(data2["events"]) == 1
+        assert data2["has_more"] is False
+
+    def test_poll_invalid_network(self, client):
+        """Polling nonexistent network returns 404."""
+        resp = client.get("/v1/events", params={"network": "nonexistent"})
+        assert resp.status_code == 404
+
+
+class TestPollExcludeMessageTypes:
+    """GET /v1/events?exclude_message_types= — filter out intermediate agent
+    output (thinking/status/todos) so the limit window only counts real
+    messages."""
+
+    def _post_message(self, client, workspace, content, message_type=None):
+        channel_name = workspace["channel"]["name"]
+        payload = {"content": content}
+        if message_type is not None:
+            payload["message_type"] = message_type
+        resp = client.post("/v1/events", json={
+            "type": "workspace.message.posted",
+            "source": "openagents:agent-alpha",
+            "target": f"channel/{channel_name}",
+            "payload": payload,
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        assert resp.status_code == 200
+        return resp.json()["data"]["id"]
+
+    def test_excludes_listed_message_types(self, client, workspace):
+        """thinking/status/todos are filtered out; chat and untyped kept."""
+        self._post_message(client, workspace, "real question", "chat")
+        self._post_message(client, workspace, "step 1", "thinking")
+        self._post_message(client, workspace, "running tool", "status")
+        self._post_message(client, workspace, "todo list", "todos")
+        self._post_message(client, workspace, "no explicit type")  # message_type absent
+
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "type": "workspace.message",
+            "exclude_message_types": "thinking,status,todos",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        assert resp.status_code == 200
+        events = resp.json()["data"]["events"]
+        contents = [e["payload"].get("content") for e in events]
+        assert "real question" in contents
+        assert "no explicit type" in contents
+        assert "step 1" not in contents
+        assert "running tool" not in contents
+        assert "todo list" not in contents
+
+    def test_limit_window_counts_only_kept_messages(self, client, workspace):
+        """A burst of status events must not push the user's message out of
+        the first history page (the reported refresh-loses-question bug)."""
+        self._post_message(client, workspace, "user question", "chat")
+        for i in range(10):
+            self._post_message(client, workspace, f"status {i}", "status")
+
+        # Without exclusion, limit=5 newest-first returns only status events.
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "type": "workspace.message",
+            "sort": "desc",
+            "limit": 5,
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        contents = [e["payload"].get("content") for e in resp.json()["data"]["events"]]
+        assert "user question" not in contents
+
+        # With exclusion, the user's message is inside the window.
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "type": "workspace.message",
+            "sort": "desc",
+            "limit": 5,
+            "exclude_message_types": "thinking,status,todos",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        contents = [e["payload"].get("content") for e in resp.json()["data"]["events"]]
+        assert "user question" in contents
+
+    def test_blank_exclude_param_is_noop(self, client, workspace):
+        """Empty/whitespace-only exclude list applies no filter."""
+        self._post_message(client, workspace, "hello", "status")
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "type": "workspace.message",
+            "exclude_message_types": " , ",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        assert resp.status_code == 200
+        contents = [e["payload"].get("content") for e in resp.json()["data"]["events"]]
+        assert "hello" in contents
+
+
+class TestPollCacheKeyConsistency:
+    """The head/at-head keys poll_events constructs must stay invalidatable
+    by _poll_cache_keys_for — regression tests for the exclude_message_types
+    param silently changing every filter hash."""
+
+    def test_adapter_poll_hash_is_in_invalidation_set(self):
+        """Filters without exclude_message_types must hash exactly like the
+        enumerated invalidation patterns, or agents keep getting stale
+        cached-empty responses after new events are posted."""
+        from app.routers.events import _poll_cache_keys_for, _poll_filter_hash
+
+        ws = "ws-cache-test"
+        invalidated = {k for pair in _poll_cache_keys_for(ws, "workspace.message.posted") for k in pair}
+
+        # The main adapter poll pattern (workspace-client.js pollPending).
+        fh = _poll_filter_hash(ws, "", "", "workspace.message.posted", "", "asc", 500)
+        assert "v1events:head:" + fh in invalidated
+        assert "v1events:athead:" + fh in invalidated
+
+        # getHeadEventId pattern.
+        fh = _poll_filter_hash(ws, "", "", "workspace.message.posted", "", "desc", 1)
+        assert "v1events:head:" + fh in invalidated
+
+        # Untyped all-events pattern.
+        fh = _poll_filter_hash(ws, "", "", "", "", "asc", 50)
+        assert "v1events:head:" + fh in invalidated
+
+    def test_exclude_param_changes_hash(self):
+        """Polls that do use exclude_message_types must get their own key —
+        sharing the plain filter's key would poison its cached results."""
+        from app.routers.events import _poll_filter_hash
+
+        ws = "ws-cache-test"
+        plain = _poll_filter_hash(ws, "", "general", "workspace.message", "", "desc", 50)
+        excluded = _poll_filter_hash(
+            ws, "", "general", "workspace.message", "", "desc", 50,
+            exclude_message_types="thinking,status,todos",
+        )
+        assert plain != excluded
+
+
+class TestPollTargetAgents:
+    """GET /v1/events?target_agents= — server-side per-agent filtering.
+
+    The adapter's `pollPending` sends this so agents stop pulling the whole
+    network's traffic. The filter matches exactly what the adapter keeps:
+    events targeting the agent + untargeted *human* messages. Events for other
+    agents, the `__no_response__` sentinel, and untargeted *agent* messages
+    (agent-to-agent chatter the adapter discards) are excluded.
+    """
+
+    def _seed(self, db, workspace):
+        """Insert message events with assorted target_agents + sources."""
+        from app.models import EventRecord
+
+        net = workspace["id"]
+        ch = f"channel/{workspace['channel']['name']}"
+        rows = [
+            # (id, target_agents, source)
+            ("ev-a", ["alpha"], "human:user1"),           # for alpha
+            ("ev-b", ["beta"], "human:user1"),            # for beta only
+            ("ev-ab", ["alpha", "beta"], "human:user1"),  # for both
+            ("ev-human-none", None, "human:user1"),       # untargeted human → broadcast
+            ("ev-agent-none", None, "openagents:beta"),   # untargeted agent → discarded
+            ("ev-noresp", ["__no_response__"], "human:user1"),  # routed-to-nobody
+        ]
+        for i, (eid, targets, source) in enumerate(rows):
+            meta = {} if targets is None else {"target_agents": targets}
+            db.add(EventRecord(
+                id=eid,
+                network_id=net,
+                type="workspace.message.posted",
+                source=source,
+                target=ch,
+                payload={"content": eid, "message_type": "chat"},
+                metadata_=meta,
+                timestamp=1_000 + i,
+            ))
+        db.commit()
+
+    def test_filters_to_targeted_plus_untargeted_human(self, client, workspace, db):
+        self._seed(db, workspace)
+
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "type": "workspace.message.posted",
+            "target_agents": "alpha",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        assert resp.status_code == 200
+        ids = {e["id"] for e in resp.json()["data"]["events"]}
+
+        # alpha's events + untargeted *human* broadcast
+        assert "ev-a" in ids
+        assert "ev-ab" in ids
+        assert "ev-human-none" in ids
+        # never beta-only, the sentinel, or untargeted *agent* chatter
+        assert "ev-b" not in ids
+        assert "ev-noresp" not in ids
+        assert "ev-agent-none" not in ids
+
+    def test_next_cursor_skips_ahead_to_stream_tip(self, client, workspace, db):
+        """When an agent has drained its own events, next_cursor jumps to the
+        stream tip so it doesn't re-scan other agents' traffic each poll."""
+        self._seed(db, workspace)
+
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "type": "workspace.message.posted",
+            "target_agents": "alpha",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        data = resp.json()["data"]
+
+        # ev-noresp is the newest event in the stream even though it wasn't
+        # returned; next_cursor must point there so the next poll starts past it.
+        assert data["has_more"] is False
+        assert data["next_cursor"] == "ev-noresp"
+
+    def test_absent_param_is_unchanged_broadcast(self, client, workspace, db):
+        """No target_agents param → legacy behavior: every event returned,
+        no next_cursor field (backward compatible)."""
+        self._seed(db, workspace)
+
+        resp = client.get("/v1/events", params={
+            "network": workspace["id"],
+            "type": "workspace.message.posted",
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        data = resp.json()["data"]
+        ids = {e["id"] for e in data["events"]}
+        assert {"ev-a", "ev-b", "ev-ab", "ev-human-none", "ev-agent-none", "ev-noresp"} <= ids
+        assert "next_cursor" not in data
+
+
+class TestPollResolveCache:
+    """The workspace resolve+auth is served from Redis so at-head polls don't
+    hit Postgres. The cache must never bypass auth.
+    """
+
+    def _use_memory_cache(self, monkeypatch):
+        """Swap the Redis helpers for an in-memory dict so the cache-hit path
+        (normally a no-op in tests, where Redis is disabled) is exercised."""
+        from app import cache as _cache
+        store = {}
+        monkeypatch.setattr(_cache, "get_bytes", lambda k: store.get(k))
+        monkeypatch.setattr(_cache, "set_bytes", lambda k, v, ttl_seconds=0.0: store.__setitem__(k, v))
+        monkeypatch.setattr(_cache, "delete_key", lambda k: store.pop(k, None))
+        return store
+
+    def test_cache_hit_still_enforces_token(self, client, workspace, monkeypatch):
+        store = self._use_memory_cache(monkeypatch)
+        params = {"network": workspace["id"], "type": "workspace.message.posted"}
+        good = {"X-Workspace-Token": workspace["token"]}
+
+        # 1) first poll resolves via DB and populates the resolve cache
+        r1 = client.get("/v1/events", params=params, headers=good)
+        assert r1.status_code == 200
+        assert any(k.startswith("v1ws:resolve:") for k in store), "resolve cache should be populated"
+
+        # 2) second poll is served with the cache warm — still authorized
+        r2 = client.get("/v1/events", params=params, headers=good)
+        assert r2.status_code == 200
+
+        # 3) a wrong token with the cache warm is STILL rejected — the cached
+        # token-hash must not let a bad token through (it falls through to DB auth)
+        r3 = client.get("/v1/events", params=params, headers={"X-Workspace-Token": "wrong-token"})
+        assert r3.status_code == 401
+
+    def test_warm_legacy_machine_poll_never_checks_out_database(self, client, workspace, monkeypatch):
+        self._use_memory_cache(monkeypatch)
+        params = {'network': workspace['id'], 'type': 'workspace.message.posted'}
+        headers = {'X-Workspace-Token': workspace['token']}
+        assert client.get('/v1/events', params=params, headers=headers).status_code == 200
+        from sqlalchemy.orm import Session
+        def unexpected_query(*args, **kwargs):
+            raise AssertionError('A cached legacy machine poll must not query the database')
+        with monkeypatch.context() as patch:
+            patch.setattr(Session, 'execute', unexpected_query)
+            assert client.get('/v1/events', params=params, headers=headers).status_code == 200
+
+    @pytest.mark.parametrize('extra_headers', [
+        {'Authorization':'Bearer expired-person-token'}, {'X-Agent-Name':'identified-agent'},
+    ])
+    def test_warm_poll_never_skips_identity_resolution(self, client, workspace, monkeypatch, extra_headers):
+        self._use_memory_cache(monkeypatch)
+        params = {'network': workspace['id'], 'type': 'workspace.message.posted'}
+        headers = {'X-Workspace-Token':workspace['token']}
+        assert client.get('/v1/events', params=params, headers=headers).status_code == 200
+        from app.services import visibility
+        original = visibility.resolve_viewer
+        calls = []
+        def resolve(*args, **kwargs):
+            calls.append(True)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(visibility, 'resolve_viewer', resolve)
+        client.get('/v1/events', params=params, headers={**headers, **extra_headers})
+        assert calls
+
+    def test_identified_poll_reuses_freshly_loaded_workspace(self, client, workspace, db, monkeypatch):
+        from sqlalchemy import event
+        self._use_memory_cache(monkeypatch)
+        queries = []
+        def capture(conn, cursor, statement, *args):
+            if 'FROM workspaces' in statement:
+                queries.append(statement)
+        event.listen(db.bind, 'before_cursor_execute', capture)
+        try:
+            r = client.get('/v1/events', params={'network':workspace['id']}, headers={
+                'X-Workspace-Token':workspace['token'], 'X-Agent-Name':'identified-agent'})
+        finally:
+            event.remove(db.bind, 'before_cursor_execute', capture)
+        assert r.status_code == 200
+        assert len(queries) == 1
+
+    def test_warm_device_poll_checks_credential_with_one_query(self, client, workspace, db, monkeypatch):
+        from sqlalchemy import event
+        from app.models import Node
+        self._use_memory_cache(monkeypatch)
+        node = Node(workspace_id=workspace['id'], node_key='poll-device', token='device-poll-secret')
+        db.add(node)
+        db.commit()
+        params = {'network': workspace['id'], 'type': 'workspace.message.posted'}
+        headers = {'X-Workspace-Token': 'device-poll-secret'}
+        assert client.get('/v1/events', params=params, headers=headers).status_code == 200
+        queries = []
+        def capture(conn, cursor, statement, *args):
+            queries.append(statement)
+        event.listen(db.bind, 'before_cursor_execute', capture)
+        try:
+            assert client.get('/v1/events', params=params, headers=headers).status_code == 200
+        finally:
+            event.remove(db.bind, 'before_cursor_execute', capture)
+        assert len(queries) == 1
+        assert 'nodes' in queries[0] and 'workspaces' in queries[0]
+        # Cached event data must not preserve access after credential rotation.
+        node.token = 'rotated-device-secret'
+        db.commit()
+        assert client.get('/v1/events', params=params, headers=headers).status_code == 401
+
+    def test_device_poll_cannot_open_deleted_or_other_workspace(self, client, workspace, db, monkeypatch):
+        from app.models import Node, Workspace
+        self._use_memory_cache(monkeypatch)
+        other = Workspace(name='Another workspace', slug='other-device-workspace', password_hash='other-secret')
+        db.add(other)
+        db.flush()
+        db.add(Node(workspace_id=other.id, node_key='other-device', token='other-device-token'))
+        db.commit()
+        headers = {'X-Workspace-Token': 'other-device-token'}
+        assert client.get('/v1/events', params={'network':workspace['id']}, headers=headers).status_code == 401
+        # Warm the event cache before deleting the workspace.
+        assert client.get('/v1/events', params={'network':other.id}, headers=headers).status_code == 200
+        other.status = 'deleted'
+        db.commit()
+        assert client.get('/v1/events', params={'network':other.id}, headers=headers).status_code == 401
+
+
+class TestPollCacheFreshness:
+    """A new event must never be hidden by a cached poll answer for a scoped
+    filter. Per-thread clients poll with `channel=` and re-poll on each SSE
+    signal; a stale cached empty page would hide the reply until the next
+    event arrives."""
+
+    def _use_memory_cache(self, monkeypatch):
+        from app import cache as _cache
+        store = {}
+        monkeypatch.setattr(_cache, "get_bytes", lambda k: store.get(k))
+        monkeypatch.setattr(_cache, "set_bytes", lambda k, v, ttl_seconds=0.0: store.__setitem__(k, v))
+        monkeypatch.setattr(_cache, "delete_key", lambda k: store.pop(k, None))
+        return store
+
+    def _post(self, client, workspace, content, type="workspace.message.posted"):
+        resp = client.post("/v1/events", json={
+            "type": type,
+            "source": "openagents:agent-alpha",
+            "target": f"channel/{workspace['channel']['name']}",
+            "payload": {"content": content},
+            "network": workspace["id"],
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        assert resp.status_code == 200
+
+    @pytest.mark.parametrize("scope", ["channel", "target"])
+    def test_scoped_poll_sees_event_posted_within_ttl(self, client, workspace, monkeypatch, scope):
+        store = self._use_memory_cache(monkeypatch)
+        channel_name = workspace["channel"]["name"]
+        headers = {"X-Workspace-Token": workspace["token"]}
+        params = {"network": workspace["id"], "type": "workspace.message", "sort": "asc", "limit": 50}
+        params.update({"channel": channel_name} if scope == "channel" else {"target": f"channel/{channel_name}"})
+
+        self._post(client, workspace, "hello")
+        first = client.get("/v1/events", params=params, headers=headers).json()["data"]
+        cursor = first["newest_id"]
+        assert cursor
+
+        # Caught up: the empty answer is cached (exact key and at-head marker).
+        caught_up = client.get("/v1/events", params={**params, "after": cursor}, headers=headers).json()["data"]
+        assert caught_up["events"] == []
+        assert any(k.startswith("v1events:athead:") for k in store)
+
+        # The reply lands inside the cache TTL; the same poll must return it.
+        self._post(client, workspace, "reply")
+        after = client.get("/v1/events", params={**params, "after": cursor}, headers=headers).json()["data"]
+        assert [e["payload"]["content"] for e in after["events"]] == ["reply"]
+
+
+class TestLateSavedEvents:
+    """An event can be saved seconds after its timestamp (routing); polls must not skip it."""
+
+    def test_late_saved_message_still_reaches_its_agent(self, client, workspace, db):
+        import time
+        from app.models import EventRecord
+        net, ch = workspace["id"], f"channel/{workspace['channel']['name']}"
+        now = int(time.time() * 1000)
+
+        def add(eid, targets, ts):
+            db.add(EventRecord(id=eid, network_id=net, type="workspace.message.posted", source="human:user1",
+                               target=ch, payload={"content": eid, "message_type": "chat"},
+                               metadata_={"target_agents": targets}, timestamp=ts))
+            db.commit()
+
+        def poll(after=None):
+            params = {"network": net, "type": "workspace.message.posted", "target_agents": "alpha"}
+            if after:
+                params["after"] = after
+            return client.get("/v1/events", params=params, headers={"X-Workspace-Token": workspace["token"]}).json()["data"]
+
+        add("ev-old", ["alpha"], now - 60_000)
+        first = poll()
+        add("ev-other", ["beta"], now - 1_000)        # someone else's message, visible at once
+        second = poll(first["next_cursor"])            # alpha polls while its own message is still routing
+        add("ev-late", ["alpha"], now - 2_000)         # saved late, stamped before ev-other
+        third = poll(second["next_cursor"])
+        assert "ev-late" in [e["id"] for e in third["events"]]
+
+    def test_posted_message_is_stamped_when_saved(self, client, workspace, db):
+        import time
+        from app.models import EventRecord
+        before = int(time.time() * 1000)
+        resp = client.post("/v1/events", json={"type": "workspace.message.posted", "source": "openagents:agent-alpha",
+                                               "target": f"channel/{workspace['channel']['name']}", "network": workspace["id"],
+                                               "payload": {"content": "hello"}, "timestamp": before - 3_600_000},
+                           headers={"X-Workspace-Token": workspace["token"]})
+        assert resp.status_code == 200, resp.text
+        row = db.get(EventRecord, resp.json()["data"]["id"])
+        assert row.timestamp >= before

@@ -1,0 +1,2927 @@
+# -*- coding: utf-8 -*-
+"""
+Workspace management endpoints — CRUD for the workspace itself.
+
+These are NOT part of the ONM spec — they manage the product layer
+(creating networks, listing user's workspaces, updating settings).
+
+POST   /v1/workspaces              Create a new workspace
+GET    /v1/workspaces              List workspaces
+GET    /v1/workspaces/{id}         Get workspace details
+PATCH  /v1/workspaces/{id}         Update workspace settings
+DELETE /v1/workspaces/{id}         Delete workspace
+PATCH  /v1/workspaces/{id}/members/{name}  Update agent description/role
+"""
+
+import json as _json
+import logging
+import os
+import secrets
+import time
+import uuid
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Header, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session, selectinload
+
+from app import naming
+from app.config import config
+from app.database import get_db
+from app.models import (
+    Channel,
+    ChannelMember,
+    Node,
+    User,
+    Workspace,
+    WorkspaceCollaborator,
+    WorkspaceInvite,
+    WorkspaceMember,
+    WorkspaceMembership,
+)
+from app.access import (
+    get_or_create_user_by_email,
+    resolve_current_user,
+    resolve_user_role,
+    verify_workspace_access,
+)
+from app.response import ResponseCode, json_response, success_response
+from app.routers.network import _workspace_filter
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/v1/workspaces", tags=["Workspaces"])
+
+AGENT_TIMEOUT = timedelta(seconds=config.AGENT_TIMEOUT_SECONDS)
+
+PUBLIC_WORKSPACE_SETTINGS = frozenset({
+    "theme", "monitorMode", "services_enabled", "browser_enabled", "slack_browser_previews",
+    # Beta: one live SSE stream per web-app tab and wake-ups for agent
+    # connectors instead of timed polling (see app/services/agent_stream.py).
+    "realtime_stream",
+})
+
+
+def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
+    """Extract bearer token from Authorization header."""
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return None
+
+
+def _verify_workspace_access(workspace, token: Optional[str], authorization: Optional[str]) -> bool:
+    """Check if the caller has access to a workspace.
+
+    Thin wrapper over the single source of truth in app.access — kept here so
+    the many callers importing this name don't have to change. (This path now
+    also accepts Sign in with Apple bearers, matching the network router; the
+    old copy verified Google/Firebase tokens only.)
+    """
+    from app.access import verify_workspace_access
+    return verify_workspace_access(workspace, token, authorization)
+
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str
+    agent_name: Optional[str] = None   # Optional — if provided, becomes master member
+    agent_type: Optional[str] = None   # "claude", "openclaw", etc.
+    creator_email: Optional[str] = None
+
+class ChannelUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    starred: Optional[bool] = None
+    pinned: Optional[bool] = None
+    is_channel: Optional[bool] = None
+    # v1.1: "private" (owner + participants + grants) | "public" (every
+    # collaborator). "workspace" is accepted as an alias for "public".
+    visibility: Optional[str] = None
+    # v1.1: who directs the work in a shared thread ("" clears).
+    director_email: Optional[str] = None
+    master_agent: Optional[str] = None  # Reassign channel master
+    response_mode: Optional[str] = None
+    orchestration_mode: Optional[str] = None  # "dynamic" | "workflow"
+    orchestration_instruction: Optional[str] = None  # legacy free-text plan
+    workflow_id: Optional[str] = None  # structured workflow to drive this thread ("" clears)
+    auto_title: bool = False  # When True, title update is from auto-titling (don't mark as manually set)
+
+class WorkspaceUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    settings: Optional[dict] = None
+    status: Optional[str] = None
+    # Enforced-login toggle (v1.0). Only owner/admin (or a workspace-token
+    # holder) may change it — see update_workspace.
+    require_login: Optional[bool] = None
+    # Convenience top-level toggle for the Browser Fabric viewer in clients.
+    # Stored inside `settings.browser_enabled` so we don't need a schema
+    # migration — but exposed as a typed field so clients don't have to
+    # round-trip the whole settings dict to flip one bool.
+    browser_enabled: Optional[bool] = None
+    browserfabric_api_key: Optional[str] = None
+
+class CollaboratorAddRequest(BaseModel):
+    email: str
+    role: str = Field(default="editor", pattern=r"^(editor|viewer)$")
+
+
+class PresencePingRequest(BaseModel):
+    senderEmail: str
+    senderDisplayName: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _mask_bf_key(key: str | None) -> str | None:
+    if not key:
+        return None
+    if len(key) > 12:
+        return key[:8] + "..." + key[-4:]
+    return key[:4] + "..."
+
+
+def _format_workspace(ws: Workspace, members: list, now: datetime, token=None, authorization=None) -> dict:
+    from sqlalchemy.orm import object_session
+    from app.services.access_model import resolve_principal, hidden_agent_names
+    db = object_session(ws)
+    viewer = resolve_principal(db, ws, token, authorization)
+    hidden = hidden_agent_names(db, str(ws.id), viewer, members)
+    members = [m for m in members if m.agent_name not in hidden]
+    agents = []
+    for m in members:
+        status = m.status
+        is_cloud = (m.agent_type or "").startswith("cloud:")
+        if not is_cloud and m.last_heartbeat:
+            # Ensure timezone-aware comparison (SQLite stores naive datetimes)
+            heartbeat = m.last_heartbeat
+            if heartbeat.tzinfo is None:
+                heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+            if (now - heartbeat) > AGENT_TIMEOUT:
+                status = "offline"
+        agents.append({
+            "agentName": m.agent_name,
+            "displayName": m.display_name,
+            "role": m.role,
+            "agentType": m.agent_type,
+            "status": status,
+            "description": m.description,
+            "workingDir": m.working_dir if viewer.machine or viewer.email == m.owner_email else None,
+            "model": m.model,
+            "builtin": (m.agent_type or "") == "cloud:openagents",
+            "lastHeartbeatAt": m.last_heartbeat.isoformat() if m.last_heartbeat else None,
+            "joinedAt": m.joined_at.isoformat() if m.joined_at else None,
+        })
+
+    settings = ws.settings or {}
+    # Only documented display/behavior settings cross the API boundary.
+    # Credentials and server-only settings must never ride along in this map.
+    public_settings = {key: value for key, value in settings.items() if key in PUBLIC_WORKSPACE_SETTINGS}
+    return {
+        "workspaceId": str(ws.id),
+        "slug": ws.slug,
+        "name": ws.name,
+        "creatorEmail": ws.creator_email,
+        "requireLogin": bool(ws.require_login),
+        "settings": public_settings,
+        # Surface browser_enabled at the top level for clients that don't
+        # want to dig into the settings dict. Mirrors what's inside settings.
+        "browserEnabled": bool(settings.get("browser_enabled", False)),
+        "browserfabricApiKey": _mask_bf_key(settings.get("browserfabric_api_key")),
+        "status": ws.status,
+        "createdAt": ws.created_at.isoformat() if ws.created_at else None,
+        "lastActivityAt": ws.last_activity_at.isoformat() if ws.last_activity_at else None,
+        "agents": agents,
+    }
+
+
+def _format_channel(ch: Channel, db=None) -> dict:
+    from app.services.personal_assistant import is_yumi, is_personal_channel
+    personal = db is not None and is_personal_channel(db, ch)
+    builtin = db is not None and is_yumi(db, ch.workspace_id, "yumi")
+    return {
+        "channelId": str(ch.id),
+        "workspaceId": str(ch.workspace_id),
+        "name": ch.name,
+        "title": ch.title,
+        "titleManuallySet": bool(ch.title_manually_set),
+        "createdBy": ch.created_by,
+        "masterAgent": None if builtin and not personal and ch.master_agent == "yumi" else ch.master_agent,
+        "orchestrationMode": "workflow" if ch.orchestration_mode == "workflow" else "dynamic",
+        "responseMode": ch.response_mode or "proactive",
+        "orchestrationInstruction": ch.orchestration_instruction,
+        "workflowId": ch.workflow_id,
+        "resumeFrom": ch.resume_from,
+        "forkedFrom": ch.forked_from,
+        "status": ch.status,
+        "starred": bool(ch.starred),
+        "isChannel": bool(ch.is_channel),
+        "participants": [p.agent_name for p in (ch.participants or []) if not (builtin and not personal and p.agent_name == "yumi")],
+        "visibility": "private" if personal or (ch.visibility or "") == "private" else "public",
+        "ownerEmail": ch.owner_email,
+        "participantsCanInvite": bool(ch.participants_can_invite),
+        "membersCanAddAgents": bool(ch.members_can_add_agents),
+        "directorEmail": ch.director_email,
+        "createdAt": ch.created_at.isoformat() if ch.created_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/workspaces — Create workspace
+# ---------------------------------------------------------------------------
+
+@router.post("")
+def create_workspace(
+    body: WorkspaceCreateRequest,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    """Create a new workspace (= ONM network).
+
+    When called with a verified identity bearer (the logged-in web flow), the
+    caller becomes the owner: their verified email is recorded as creator_email
+    and an owner WorkspaceMembership is created. Anonymous creation (no bearer)
+    still works for backward compatibility — creator_email falls back to the
+    request body, and ownership is reconciled the first time that user logs in.
+    """
+    # The creating agent's name enters router prompts verbatim — same
+    # character policy as the join handler.
+    if body.agent_name:
+        name_problem = naming.agent_name_problem(body.agent_name)
+        if name_problem:
+            return json_response(
+                ResponseCode.BAD_REQUEST, f"Invalid agent name: {name_problem}",
+            )
+
+    # Generate slug and token
+    slug = secrets.token_hex(4)
+    token = secrets.token_urlsafe(32)
+
+    now = datetime.now(timezone.utc)
+
+    from app.access import resolve_current_user
+    owner = resolve_current_user(db, authorization)
+    creator_email = owner.email if owner else body.creator_email
+
+    workspace = Workspace(
+        slug=slug,
+        name=body.name,
+        creator_email=creator_email,
+        password_hash=token,
+        # Every new workspace enforces login by default (secure-by-default).
+        # Machine access via the workspace token is unaffected — agents, the
+        # agn CLI and ?token= links all pass the token rule — so anonymous
+        # (CLI) creation still works end-to-end. An owner/admin can opt out
+        # via PATCH require_login=false (Security settings).
+        require_login=True,
+        settings={},
+        status="active",
+    )
+    db.add(workspace)
+    db.flush()
+
+    if owner:
+        db.add(WorkspaceMembership(
+            workspace_id=workspace.id,
+            user_id=owner.id,
+            role="owner",
+        ))
+
+    # Optionally add the creating agent as master member
+    if body.agent_name:
+        member = WorkspaceMember(
+            workspace_id=workspace.id,
+            agent_name=body.agent_name,
+            owner_email=creator_email,
+            role="master",
+            agent_type=body.agent_type,
+            status="online",
+            last_heartbeat=now,
+        )
+        db.add(member)
+
+    # Seed a default "Session 1" channel ONLY when we know which agent to put in
+    # it. An empty channel (no participants) would surface as a thread with no
+    # agent — instead, an agent-less workspace starts with zero threads and the
+    # user creates their first session via the New Thread dialog (which selects
+    # agents). When agent_name is provided (e.g. tests, TUI), the starter
+    # channel is created with that agent as master + participant.
+    channel = None
+    if body.agent_name:
+        channel = Channel(
+            workspace_id=workspace.id,
+            name=f"session-{secrets.token_hex(4)}",
+            title="Session 1",
+            created_by=body.agent_name,
+            master_agent=body.agent_name,
+            status="active",
+        )
+        db.add(channel)
+        db.flush()
+        db.add(ChannelMember(
+            channel_id=channel.id,
+            agent_name=body.agent_name,
+        ))
+
+    # Auto-provision the built-in Yumi onboarding assistant (no-op when disabled
+    # or no server key is configured). Never let this block workspace creation.
+    try:
+        from app.services.yumi import provision_yumi, seed_welcome_thread
+        if provision_yumi(db, workspace) and not body.agent_name:
+            # Web-created workspace (no agent yet): seed a Yumi-led welcome
+            # thread so the first screen is a conversation, not an empty room.
+            seed_welcome_thread(db, workspace)
+    except Exception:
+        logger.warning("create_workspace: failed to provision Yumi", exc_info=True)
+
+    db.commit()
+    db.refresh(workspace)
+
+    return success_response({
+        "workspaceId": str(workspace.id),
+        "slug": workspace.slug,
+        "name": workspace.name,
+        "token": token,
+        "channel": _format_channel(channel, db) if channel else None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/workspaces — List workspaces
+# ---------------------------------------------------------------------------
+
+@router.get("")
+def list_workspaces(
+    creator_email: Optional[str] = Query(None),
+    agent_name: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    """List only workspaces accessible to the verified human identity.
+
+    Filters narrow that set; an email or agent name is never authorization.
+    Legacy creator/collaborator access matches resolve_user_role without a
+    migration or a membership backfill during this read.
+    """
+    user = resolve_current_user(db, authorization)
+    if user is None:
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid identity token")
+    email = user.email.strip().lower()
+    memberships = select(WorkspaceMembership.workspace_id).where(WorkspaceMembership.user_id == user.id)
+    collaborations = select(WorkspaceCollaborator.workspace_id).where(func.lower(WorkspaceCollaborator.email) == email)
+    query = select(Workspace).where(
+        Workspace.status != "deleted",
+        or_(Workspace.id.in_(memberships), func.lower(Workspace.creator_email) == email,
+            Workspace.id.in_(collaborations)),
+    )
+
+    if creator_email:
+        query = query.where(Workspace.creator_email == creator_email)
+
+    if agent_name:
+        query = query.join(WorkspaceMember).where(
+            WorkspaceMember.agent_name == agent_name
+        )
+
+    query = query.options(selectinload(Workspace.members))
+    workspaces = db.execute(query.order_by(Workspace.last_activity_at.desc())).scalars().all()
+    now = datetime.now(timezone.utc)
+
+    results = [_format_workspace(ws, ws.members, now, authorization=authorization) for ws in workspaces]
+
+    return success_response(results)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/workspaces/skill-catalog  (static — no auth required)
+# Must be defined before /{workspace_id} to avoid path capture.
+# ---------------------------------------------------------------------------
+
+@router.get("/skill-catalog")
+async def skill_catalog():
+    """Return the full skill catalog (public, static data)."""
+    from app.skill_catalog import get_catalog
+    return success_response(get_catalog())
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/workspaces/{workspace_id} — Get workspace
+# ---------------------------------------------------------------------------
+
+@router.get("/{workspace_id}")
+def get_workspace(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Get workspace details by ID or slug."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid workspace credentials")
+
+    members = db.execute(
+        select(WorkspaceMember).where(WorkspaceMember.workspace_id == workspace.id)
+    ).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    data = _format_workspace(workspace, members, now, x_workspace_token, authorization)
+    # Only expose setup state, not other members' private device connections.
+    # Offline devices and agents still count as an existing setup; Yumi does not.
+    has_agent = any((m.agent_type or "") != "cloud:openagents" for m in members)
+    has_device = db.execute(
+        select(Node.id).where(Node.workspace_id == workspace.id).limit(1)
+    ).first() is not None
+    data["needsFirstDevice"] = not has_agent and not has_device
+    return success_response(data)
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v1/workspaces/{workspace_id} — Update workspace
+# ---------------------------------------------------------------------------
+
+@router.patch("/{workspace_id}")
+def update_workspace(
+    workspace_id: str,
+    body: WorkspaceUpdateRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Update workspace name, settings, or status."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid workspace credentials")
+
+    from app.access import verify_workspace_access
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role="admin"):
+        return json_response(ResponseCode.FORBIDDEN, "Admin role required to change workspace settings")
+
+    if body.name is not None:
+        workspace.name = body.name
+    if body.settings is not None:
+        unknown = set(body.settings) - PUBLIC_WORKSPACE_SETTINGS
+        if unknown:
+            return json_response(ResponseCode.BAD_REQUEST, "Unsupported workspace settings; use the dedicated configuration fields")
+        if "services_enabled" in body.settings and type(body.settings["services_enabled"]) is not bool:
+            return json_response(ResponseCode.BAD_REQUEST, "services_enabled must be a boolean")
+        if "realtime_stream" in body.settings and type(body.settings["realtime_stream"]) is not bool:
+            return json_response(ResponseCode.BAD_REQUEST, "realtime_stream must be a boolean")
+        # Clients only receive public settings. Replacing the entire stored map
+        # with that round-trip would silently erase keys and server metadata.
+        workspace.settings = {**(workspace.settings or {}), **body.settings}
+    if body.browser_enabled is not None:
+        current = dict(workspace.settings or {})
+        current["browser_enabled"] = body.browser_enabled
+        workspace.settings = current
+    if body.browserfabric_api_key is not None:
+        current = dict(workspace.settings or {})
+        if body.browserfabric_api_key == "":
+            current.pop("browserfabric_api_key", None)
+        else:
+            current["browserfabric_api_key"] = body.browserfabric_api_key
+        workspace.settings = current
+    if body.status is not None:
+        workspace.status = body.status
+
+    if body.require_login is not None:
+        # Enforced-login is an owner/admin control (a workspace-token holder is
+        # trusted and also permitted). Other members can't flip it.
+        from app.access import verify_workspace_access
+        if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role="admin"):
+            return json_response(ResponseCode.FORBIDDEN, "Only an owner or admin can change login enforcement")
+        workspace.require_login = body.require_login
+
+    db.commit()
+    db.refresh(workspace)
+    if body.settings and "realtime_stream" in body.settings:
+        from app.services.agent_stream import forget_workspace_settings
+        forget_workspace_settings(workspace.id)
+
+    members = db.execute(
+        select(WorkspaceMember).where(WorkspaceMember.workspace_id == workspace.id)
+    ).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    return success_response(_format_workspace(workspace, members, now, x_workspace_token, authorization))
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/workspaces/{workspace_id}/claim — Claim workspace ownership
+# ---------------------------------------------------------------------------
+
+@router.post("/{workspace_id}/claim")
+def claim_workspace(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+    x_workspace_token: Optional[str] = Header(None),
+):
+    """
+    Claim ownership of a workspace.
+
+    An unclaimed workspace requires both a verified person and its shared
+    workspace credential. Device credentials do not prove workspace ownership.
+    """
+    user = resolve_current_user(db, authorization)
+    if user is None:
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid or expired token")
+    email = user.email
+
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id)).with_for_update()
+    ).scalar_one_or_none()
+
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    from app.services.legacy_ownership import workspace_owner_email, inherit_unowned_resources
+    owner = workspace_owner_email(db, workspace)
+    if owner and owner != email:
+        return json_response(ResponseCode.FORBIDDEN, "Workspace already claimed by another user")
+
+    if not owner and not (workspace.password_hash and x_workspace_token and
+            secrets.compare_digest(workspace.password_hash, x_workspace_token)):
+        return json_response(ResponseCode.FORBIDDEN, "The existing workspace token is required to claim ownership")
+
+    workspace.creator_email = email
+    membership = db.get(WorkspaceMembership, (workspace.id, user.id))
+    if membership is None:
+        db.add(WorkspaceMembership(workspace_id=workspace.id, user_id=user.id, role="owner"))
+    else:
+        membership.role = "owner"
+    inherit_unowned_resources(db, workspace, email)
+    workspace.legacy_machine_access = False
+    db.commit()
+    db.refresh(workspace)
+
+    members = db.execute(
+        select(WorkspaceMember).where(WorkspaceMember.workspace_id == workspace.id)
+    ).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    return success_response(_format_workspace(workspace, members, now, None, authorization))
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/workspaces/{workspace_id}/rotate-token
+# ---------------------------------------------------------------------------
+
+@router.post("/{workspace_id}/rotate-token")
+def rotate_token(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Rotate the workspace token. Old token immediately stops working.
+
+    Requires either the current workspace token or Firebase bearer auth
+    from the workspace owner.
+    """
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    from app.access import verify_workspace_access
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role="admin"):
+        return json_response(ResponseCode.FORBIDDEN, "Admin role required to rotate the workspace token")
+
+    new_token = secrets.token_urlsafe(32)
+    workspace.password_hash = new_token
+    db.commit()
+
+    return success_response({
+        "workspace_id": str(workspace.id),
+        "token": new_token,
+    })
+
+
+
+def _connection_management_error(db, workspace, member, token, authorization):
+    if member.node_id:
+        from app.models import Node
+        from app.routers.nodes import _can_access_connection
+        node = db.get(Node, member.node_id)
+        if not node or not _can_access_connection(db, workspace, node, token, authorization):
+            return json_response(ResponseCode.FORBIDDEN, "Only the connection owner can manage this agent")
+    elif authorization and member.owner_email:
+        # Unpairing a device does not make its agents available for takeover.
+        from app.services.visibility import resolve_viewer
+        viewer = resolve_viewer(db, workspace, token, authorization)
+        if viewer.email != member.owner_email.strip().lower():
+            return json_response(ResponseCode.FORBIDDEN, "Only the agent owner can manage this agent")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/workspaces/{workspace_id}/members/{agent_name}
+# ---------------------------------------------------------------------------
+
+@router.delete("/{workspace_id}/members/{agent_name}")
+def remove_member(
+    workspace_id: str,
+    agent_name: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Remove an agent from a workspace."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    member = db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.agent_name == agent_name,
+        )
+    ).scalar_one_or_none()
+
+    if not member:
+        return json_response(ResponseCode.NOT_FOUND, "Member not found")
+    if member.agent_type == "cloud:openagents":
+        return json_response(ResponseCode.FORBIDDEN, "Yumi is your built-in assistant and cannot be removed")
+    denied = _connection_management_error(db, workspace, member, x_workspace_token, authorization)
+    if denied is not None:
+        return denied
+
+    from app.services import hosted_agents
+    hosted = hosted_agents.release(db, workspace.id, agent_name)
+    db.delete(member)
+    db.commit()
+    if hosted is not None:
+        hosted_agents.schedule_termination(hosted.id)
+
+    return success_response({"agent_name": agent_name, "removed": True})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v1/workspaces/{workspace_id}/members/{agent_name}
+# ---------------------------------------------------------------------------
+
+class MemberUpdateRequest(BaseModel):
+    description: Optional[str] = None
+    role: Optional[str] = None
+    # ── v1.1 ownership + specialist profile (owner/admin/machine only) ──
+    owner_email: Optional[str] = None          # "" clears
+    # DEPRECATED (permission model v1.1): accepted and ignored. What an agent
+    # can be used for is exactly its grants — see /v1/grants.
+    visibility: Optional[str] = None
+    purpose: Optional[str] = None
+    example_requests: Optional[List[str]] = None
+    required_inputs: Optional[str] = None
+    shared_instructions: Optional[str] = None
+    allowed_knowledge: Optional[List[str]] = None
+    request_approver_email: Optional[str] = None  # empty string disables request approval
+    cost_owner: Optional[str] = None           # "owner" | "workspace" | "requester" | ""
+
+    enabled_skills: Optional[Dict[str, bool]] = None
+    # Display label, any script. Empty string clears it (falls back to agent_name).
+    display_name: Optional[str] = None
+    # Model id the agent should use (from /v1/agent-catalog/{type} models, but
+    # any id is accepted — catalogs are curated suggestions). Empty string
+    # clears the override back to the agent's own default.
+    model: Optional[str] = None
+
+
+@router.patch("/{workspace_id}/members/{agent_name}")
+def update_member(
+    workspace_id: str,
+    agent_name: str,
+    body: MemberUpdateRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Update an agent's metadata (description, role)."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    member = db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.agent_name == agent_name,
+        )
+    ).scalar_one_or_none()
+
+    if not member:
+        return json_response(ResponseCode.NOT_FOUND, "Member not found")
+
+    denied = _connection_management_error(db, workspace, member, x_workspace_token, authorization)
+    if denied is not None:
+        return denied
+
+    if member.node_id:
+        from app.models import Node
+        from app.routers.nodes import _can_access_connection
+        connection = db.get(Node, member.node_id)
+        if not connection or not _can_access_connection(db, workspace, connection, x_workspace_token, authorization):
+            return json_response(ResponseCode.FORBIDDEN, "Only the connection owner can manage this agent")
+        if body.owner_email is not None and body.owner_email.strip().lower() != connection.owner_email:
+            return json_response(ResponseCode.BAD_REQUEST, "Agent ownership is inherited from its device connection")
+
+    if body.request_approver_email is not None:
+        from app.access import resolve_user_role, role_at_least
+        from app.services.visibility import resolve_viewer
+        viewer = resolve_viewer(db, workspace, x_workspace_token, authorization)
+        role = resolve_user_role(db, workspace, authorization) if viewer.is_human else None
+        is_owner = bool(viewer.email) and (member.owner_email or "").lower() == viewer.email
+        if not viewer.is_human or not (is_owner or role_at_least(role, "admin")):
+            return json_response(ResponseCode.FORBIDDEN, "Only the agent's owner or an admin may set request approval")
+        reviewer = body.request_approver_email.strip().lower()
+        if reviewer:
+            eligible = db.execute(select(User.email).join(WorkspaceMembership, WorkspaceMembership.user_id == User.id).where(
+                WorkspaceMembership.workspace_id == workspace.id, func.lower(User.email) == reviewer,
+                WorkspaceMembership.role.in_(["member", "admin", "owner"]))).scalar_one_or_none()
+            if not eligible:
+                return json_response(ResponseCode.BAD_REQUEST, "Choose a current workspace member, admin or owner")
+        member.request_approver_email = reviewer or None
+
+    # v1.1: ownership and the shared profile may only be edited by a machine,
+    # an admin/owner, or the agent's own owner. A member may *claim* an
+    # unowned agent by setting owner_email to themselves.
+    owner_fields = ("owner_email", "purpose", "example_requests",
+                    "required_inputs", "shared_instructions", "allowed_knowledge", "cost_owner")
+    if any(getattr(body, f) is not None for f in owner_fields):
+        from app.access import resolve_user_role, role_at_least
+        from app.services.visibility import resolve_viewer
+        _viewer = resolve_viewer(db, workspace, x_workspace_token, authorization)
+        _role = resolve_user_role(db, workspace, authorization) if _viewer.is_human else "owner"
+        _is_owner = bool(_viewer.email) and (member.owner_email or "").lower() == _viewer.email
+        _claim = (
+            body.owner_email is not None and not member.owner_email and _viewer.email
+            and body.owner_email.strip().lower() == _viewer.email
+        )
+        if not (_viewer.machine or role_at_least(_role, "admin") or _is_owner or _claim):
+            return json_response(ResponseCode.FORBIDDEN, "Only the agent's owner or an admin may change this")
+        if body.owner_email is not None:
+            member.owner_email = body.owner_email.strip().lower() or None
+        if body.purpose is not None:
+            member.purpose = body.purpose.strip() or None
+        if body.example_requests is not None:
+            member.example_requests = [x.strip() for x in body.example_requests if x and x.strip()][:12] or None
+        if body.required_inputs is not None:
+            member.required_inputs = body.required_inputs.strip() or None
+        if body.shared_instructions is not None:
+            member.shared_instructions = body.shared_instructions.strip() or None
+        if body.allowed_knowledge is not None:
+            member.allowed_knowledge = [x.strip() for x in body.allowed_knowledge if x and x.strip()] or None
+        if body.cost_owner is not None:
+            co = body.cost_owner.strip().lower()
+            if co and co not in ("owner", "workspace", "requester"):
+                return json_response(ResponseCode.BAD_REQUEST, "cost_owner must be owner | workspace | requester")
+            member.cost_owner = co or None
+
+    if body.display_name is not None:
+        display_name = body.display_name.strip()
+        if not display_name:
+            member.display_name = None
+        else:
+            if len(display_name) > naming.MAX_DISPLAY_NAME_LENGTH:
+                return json_response(
+                    ResponseCode.BAD_REQUEST,
+                    f"Display name must be at most {naming.MAX_DISPLAY_NAME_LENGTH} characters",
+                )
+            # Control chars, Unicode line separators and bidi overrides could
+            # forge extra lines in the router prompt — reject them.
+            if naming.has_unsafe_chars(display_name):
+                return json_response(
+                    ResponseCode.BAD_REQUEST,
+                    "Display name must not contain control or line-separator characters",
+                )
+            # Display names are routable aliases, sharing one namespace with
+            # agent names. Lock the workspace row so a concurrent rename/join
+            # can't pass this check simultaneously and commit a duplicate.
+            naming.lock_member_namespace(db, workspace.id)
+            clash = naming.find_alias_clash(
+                db, workspace.id, display_name, exclude_agent=agent_name,
+            )
+            if clash:
+                return json_response(
+                    ResponseCode.BAD_REQUEST,
+                    f"Display name conflicts with another member ('{clash}')",
+                )
+            member.display_name = display_name
+    if body.description is not None:
+        member.description = body.description
+    if body.role is not None:
+        member.role = body.role
+    if body.enabled_skills is not None:
+        from app.skill_catalog import get_skill_defaults
+        defaults = get_skill_defaults()
+        valid = {k: v for k, v in body.enabled_skills.items() if k in defaults}
+        member.enabled_skills = valid or None
+    if body.model is not None:
+        model = body.model.strip()
+        if len(model) > 200:
+            return json_response(ResponseCode.BAD_REQUEST, "Model id too long")
+        if model and naming.has_unsafe_chars(model):
+            return json_response(
+                ResponseCode.BAD_REQUEST,
+                "Model id must not contain control characters",
+            )
+        member.model = model or None
+        if (member.agent_type or "").startswith("cloud:"):
+            # Cloud agents execute server-side; their runtime reads
+            # cloud_agent_configs.model, so keep it in lockstep.
+            if member.model:
+                cloud_cfg = db.execute(
+                    select(CloudAgentConfig).where(
+                        CloudAgentConfig.workspace_id == workspace.id,
+                        CloudAgentConfig.agent_name == agent_name,
+                    )
+                ).scalar_one_or_none()
+                if cloud_cfg:
+                    cloud_cfg.model = member.model
+        else:
+            # Tell a live adapter about the change; it respawns its CLI with
+            # the new model on the next message (launchers without model
+            # support ignore unknown control actions).
+            _emit_agent_control_event(
+                db, workspace, agent_name, "model.set", {"model": member.model},
+            )
+
+    db.commit()
+
+    return success_response({
+        "agentName": member.agent_name,
+        "displayName": member.display_name,
+        "description": member.description,
+        "role": member.role,
+        "enabledSkills": member.enabled_skills,
+        "model": member.model,
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/workspaces/{workspace_id}/members/{agent_name}/generate-description
+# ---------------------------------------------------------------------------
+
+_DESCRIPTION_PROMPT = """\
+Write a ONE-LINE role description for an AI agent in a multi-agent workspace, \
+so a router can decide when to delegate tasks to it.
+
+Agent name: {name}
+Type: {agent_type}
+Working directory: {working_dir}
+Installed skills: {skills}
+
+Recent messages this agent has posted (newest last):
+{history}
+
+Write ONE concise sentence (max ~16 words), third person, describing this \
+agent's specialty/role and the kinds of tasks it handles. No name prefix, no \
+quotes, no trailing period needed. If signal is thin, infer from the name, \
+type, working directory, and skills. Output ONLY the sentence."""
+
+
+@router.post("/{workspace_id}/members/{agent_name}/generate-description")
+def generate_member_description(
+    workspace_id: str,
+    agent_name: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Draft a one-line role description for an agent using the router LLM.
+
+    Uses the agent's recent activity + metadata (type, working dir, skills) to
+    infer a specialty. Returns the suggestion WITHOUT saving — the client shows
+    it for review and persists via PATCH /members/{name} if the user accepts.
+    """
+    from app.models import EventRecord
+    from app.mods.workspace_mod import (
+        _anthropic_text, _get_llm_client, _get_router_model, _get_router_api_key,
+    )
+
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    member = db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.agent_name == agent_name,
+        )
+    ).scalar_one_or_none()
+    if not member:
+        return json_response(ResponseCode.NOT_FOUND, "Member not found")
+    denied = _connection_management_error(db, workspace, member, x_workspace_token, authorization)
+    if denied is not None:
+        return denied
+
+    if not _get_router_api_key():
+        return json_response(
+            ResponseCode.BAD_REQUEST,
+            "Description generation is unavailable (no router LLM key configured)",
+        )
+
+    # Gather up to 15 of the agent's own recent chat messages for signal.
+    recent = db.execute(
+        select(EventRecord)
+        .where(
+            EventRecord.network_id == workspace.id,
+            EventRecord.source == f"openagents:{agent_name}",
+            EventRecord.type == "workspace.message.posted",
+        )
+        .order_by(EventRecord.timestamp.desc())
+        .limit(15)
+    ).scalars().all()
+    recent.reverse()
+    snippets = []
+    for evt in recent:
+        payload = evt.payload or {}
+        if payload.get("message_type", "chat") != "chat":
+            continue
+        text = (payload.get("content") or "").strip().replace("\n", " ")
+        if text:
+            snippets.append(f"- {text[:200]}")
+    history = "\n".join(snippets[-15:]) if snippets else "(no recent messages)"
+
+    installed = []
+    if isinstance(member.enabled_skills, dict):
+        installed = member.enabled_skills.get("installed") or []
+    skills = ", ".join(installed) if installed else "(none listed)"
+
+    prompt = _DESCRIPTION_PROMPT.format(
+        name=agent_name,
+        agent_type=member.agent_type or "unknown",
+        working_dir=member.working_dir or "(unknown)",
+        skills=skills,
+        history=history,
+    )
+
+    try:
+        client, provider = _get_llm_client()
+        model = _get_router_model()
+        if provider == "openai":
+            resp = client.chat.completions.create(
+                # Reasoning models share this budget with the visible answer;
+                # 60 tokens can be exhausted before any description is emitted.
+                model=model, max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = (resp.choices[0].message.content or "").strip()
+        else:
+            resp = client.messages.create(
+                model=model, max_tokens=60,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = _anthropic_text(resp).strip()
+    except Exception as e:
+        logger.error("generate-description failed for %s: %s", agent_name, e)
+        return json_response(ResponseCode.INTERNAL_ERROR, "Failed to generate description")
+
+    # Strip stray wrapping quotes / trailing period the model sometimes adds.
+    text = text.strip().strip('"').strip("'").rstrip(".").strip()
+    if not text:
+        logger.warning("generate-description returned an empty answer")
+        return json_response(ResponseCode.INTERNAL_ERROR, "Model returned an empty description; please retry")
+    return success_response({"agentName": agent_name, "description": text})
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/workspaces/{workspace_id}/members/{agent_name}/skills/install
+# DELETE /v1/workspaces/{workspace_id}/members/{agent_name}/skills/uninstall
+# ---------------------------------------------------------------------------
+
+class SkillInstallRequest(BaseModel):
+    skill_id: str
+    version_id: Optional[str] = None
+
+
+class SkillStatusRequest(BaseModel):
+    skill_id: str
+    state: str  # "installing" | "installed" | "failed" | "uninstalled"
+    path: Optional[str] = None
+    error: Optional[str] = None
+    partial: Optional[bool] = None  # SKILL.md fetched but bundled files missing
+    version_id: Optional[str] = None
+
+
+_VALID_SKILL_STATES = {"installing", "installed", "failed", "uninstalled"}
+
+
+class CustomSkillRegisterRequest(BaseModel):
+    """Register a previously-uploaded workspace file as a custom skill.
+
+    The file must already exist as a ``FileRecord`` in *this* workspace (upload
+    via ``POST /v1/files`` first, then register with the returned ``file_id``).
+    """
+    file_id: str
+    id: Optional[str] = None            # auto-derived from filename when omitted
+    name: Optional[str] = None
+    description: Optional[str] = None
+    filename: Optional[str] = None      # original name, for display metadata only
+
+
+class CustomSkillVersionRequest(BaseModel):
+    file_id: str = Field(max_length=128)
+    changelog: str = Field(default="", max_length=4000)
+
+
+def _custom_skills_map(workspace) -> dict:
+    """Return a shallow copy of ``settings["custom_skills"]`` (id → metadata)."""
+    return dict((workspace.settings or {}).get("custom_skills") or {})
+
+
+def _emit_agent_control_event(db, workspace, agent_name: str, action: str, payload: dict) -> None:
+    """Persist a ``workspace.agent.control`` event targeted at one agent and
+    publish it to the workspace's Redis pub/sub channel.
+
+    The launcher's per-agent control poller
+    (``GET /v1/events?type=workspace.agent.control&target=openagents:<name>``)
+    picks this up and dispatches the action to the adapter. We write the
+    EventRecord directly — mirroring mod/persistence — rather than running the
+    full event pipeline, because the caller has already verified workspace
+    access and there is no human/agent source to authenticate.
+    """
+    from app import cache
+    from app.models import EventRecord
+
+    event_id = str(uuid.uuid4())
+    timestamp = int(time.time() * 1000)
+    full_payload = {"action": action, **(payload or {})}
+    record = EventRecord(
+        id=event_id,
+        network_id=workspace.id,
+        type="workspace.agent.control",
+        source="human:system",
+        target=f"openagents:{agent_name}",
+        payload=full_payload,
+        metadata_={},
+        timestamp=timestamp,
+        visibility="direct",
+    )
+    db.add(record)
+    db.flush()
+
+    try:
+        snapshot = {
+            "id": event_id,
+            "type": "workspace.agent.control",
+            "source": "human:system",
+            "target": f"openagents:{agent_name}",
+            "payload": full_payload,
+            "metadata": {},
+            "timestamp": timestamp,
+        }
+        cache.publish_event(
+            f"ws:{workspace.id}:events",
+            _json.dumps(snapshot, default=str, separators=(",", ":")).encode(),
+        )
+    except Exception:
+        # Pub/sub is a fast-path optimization; the poller still finds the
+        # persisted event. Never fail the request on a cache hiccup.
+        logger.warning("install_skill: failed to publish control event to cache", exc_info=True)
+
+
+def _set_skill_status(skills_data: dict, skill_id: str, state: str,
+                      path: Optional[str] = None, error: Optional[str] = None,
+                      partial: Optional[bool] = None) -> dict:
+    """Update the per-skill status map inside an ``enabled_skills`` dict.
+
+    Keeps the legacy ``installed`` list in sync (only successfully-installed
+    skills appear there, so existing readers keep working) and stores richer
+    state under ``skill_status`` for the UI.
+    """
+    status_map = dict(skills_data.get("skill_status", {}))
+    entry = {"state": state, "updated_at": int(time.time() * 1000)}
+    if path:
+        entry["path"] = path
+    if error:
+        entry["error"] = error[:2000]
+    if partial:
+        entry["partial"] = True
+    status_map[skill_id] = entry
+    skills_data["skill_status"] = status_map
+
+    installed = [s for s in skills_data.get("installed", []) if s != skill_id]
+    if state == "installed":
+        installed.append(skill_id)
+    skills_data["installed"] = installed
+    return skills_data
+
+
+def _resolve_registry_skill(db: Session, skill_id: str) -> tuple[Optional[object], Optional[object]]:
+    """Resolve a Registry skill from either its UUID or an upstream catalog slug.
+
+    Mirrored UGC is always addressed by UUID. Built-in skills report install
+    state under their historical catalog slug, so fall back to a slug lookup
+    restricted to upstream pointers — an unrelated user skill that happens to
+    share a slug must never match.
+    """
+    from app.models import RegistrySkill, RegistrySkillVersion
+
+    registry_skill = db.get(RegistrySkill, skill_id)
+    if registry_skill is not None:
+        version = db.get(RegistrySkillVersion, registry_skill.latest_published_version_id)
+        return registry_skill, version
+    row = db.execute(
+        select(RegistrySkill, RegistrySkillVersion)
+        .join(
+            RegistrySkillVersion,
+            RegistrySkillVersion.id == RegistrySkill.latest_published_version_id,
+        )
+        .where(
+            RegistrySkill.slug == skill_id,
+            RegistrySkillVersion.source_mode == "upstream_pointer",
+        )
+    ).first()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def _registry_status_aliases(db: Session, skill_id: str) -> tuple[set[str], Optional[object]]:
+    """Return compatible status keys for an upstream Registry pointer.
+
+    Built-in skills historically used their catalog slug in ``enabled_skills``.
+    One Registry build briefly used the Registry UUID instead. Treat both as
+    aliases for upstream pointers so uninstall can clean either representation;
+    mirrored UGC remains UUID-only to avoid collisions with unrelated slugs.
+    """
+    registry_skill, version = _resolve_registry_skill(db, skill_id)
+    aliases = {skill_id}
+    if registry_skill is not None and version is not None and version.source_mode == "upstream_pointer":
+        aliases.update({registry_skill.id, registry_skill.slug})
+    return aliases, registry_skill
+
+
+@router.post("/{workspace_id}/members/{agent_name}/skills/install")
+def install_skill(
+    workspace_id: str,
+    agent_name: str,
+    body: SkillInstallRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Request installation of a third-party skill for an agent.
+
+    Marks the skill ``installing`` and emits a ``skill.install`` control event
+    so the launcher actually installs it into the agent's skills directory.
+    The agent reports back via ``/skills/status`` to flip the state to
+    ``installed`` or ``failed`` — the skill is NOT marked installed here.
+    """
+    from app.skill_catalog import find_skill
+
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    member = db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.agent_name == agent_name,
+        )
+    ).scalar_one_or_none()
+    if not member:
+        return json_response(ResponseCode.NOT_FOUND, "Member not found")
+    denied = _connection_management_error(db, workspace, member, x_workspace_token, authorization)
+    if denied is not None:
+        return denied
+
+    # Built-in catalog first; then workspace-private skills, then a public
+    # registry UUID. New clients pin an immutable registry version.
+    skill = find_skill(body.skill_id)
+    custom = None
+    registry_skill = None
+    registry_version = None
+    if not skill:
+        from app.models import RegistrySkill, RegistrySkillVersion, WorkspaceSkill, WorkspaceSkillVersion
+        from app.skill_registry import materialize_legacy_workspace_skills
+        materialize_legacy_workspace_skills(db, workspace)
+        # Normalized versions are authoritative. Legacy JSON remains only as a
+        # fallback for rows that could not yet be materialized (for example a
+        # missing historical file), so v2/v3 installs can never silently use
+        # the first uploaded file.
+        local_skill = db.execute(select(WorkspaceSkill).where(
+            WorkspaceSkill.workspace_id == workspace.id,
+            WorkspaceSkill.slug == body.skill_id,
+            WorkspaceSkill.status == "active",
+        )).scalar_one_or_none()
+        if local_skill:
+            local_version = db.get(WorkspaceSkillVersion, local_skill.latest_version_id)
+            if local_version:
+                custom = {
+                    "id": local_skill.slug,
+                    "name": local_skill.name,
+                    "description": local_skill.summary,
+                    "source_type": "workspace_file",
+                    "file_id": local_version.file_id,
+                    "filename": f"{local_skill.slug}.{local_version.package_type}",
+                    "package_type": local_version.package_type,
+                    "version_id": local_version.id,
+                }
+        if not custom:
+            custom = _custom_skills_map(workspace).get(body.skill_id)
+        if not custom:
+            registry_skill = db.execute(select(RegistrySkill).where(
+                RegistrySkill.id == body.skill_id,
+                RegistrySkill.visibility == "public",
+                RegistrySkill.status == "active",
+            )).scalar_one_or_none()
+            if registry_skill:
+                target_version_id = body.version_id or registry_skill.latest_published_version_id
+                registry_version = db.execute(select(RegistrySkillVersion).where(
+                    RegistrySkillVersion.id == target_version_id,
+                    RegistrySkillVersion.skill_id == registry_skill.id,
+                    RegistrySkillVersion.status == "published",
+                )).scalar_one_or_none()
+    if not skill and not custom and not registry_version:
+        return json_response(ResponseCode.NOT_FOUND, f"Unknown skill: {body.skill_id}")
+
+    # For a custom skill, confirm its backing upload still exists and belongs to
+    # this workspace BEFORE marking installing / emitting the control event.
+    # Otherwise a file deleted from Workspace Files would only surface as a
+    # late agent-side readFile failure; fail fast here with a clear, actionable
+    # message so the UI can tell the user to re-upload.
+    if custom:
+        from app.models import FileRecord
+        file_id = custom.get("file_id")
+        file_rec = db.execute(
+            select(FileRecord).where(FileRecord.id == file_id)
+        ).scalar_one_or_none() if file_id else None
+        if (not file_rec or file_rec.status != "active"
+                or str(file_rec.workspace_id) != str(workspace.id)):
+            return json_response(
+                ResponseCode.CONFLICT,
+                "This skill's uploaded file was deleted. Please re-upload the skill.",
+            )
+
+    if registry_version and registry_version.source_mode == "mirrored" and (member.agent_type or "").lower() not in {"claude", "cursor", "codex"}:
+        return json_response(
+            ResponseCode.BAD_REQUEST,
+            f"Registry MVP does not yet support agent type '{member.agent_type or 'unknown'}'",
+        )
+
+    status_skill_id = registry_skill.id if registry_skill else body.skill_id
+    skills_data = dict(member.enabled_skills or {})
+    skills_data = _set_skill_status(skills_data, status_skill_id, "installing")
+    member.enabled_skills = skills_data
+
+    if custom:
+        # Custom skill: the agent downloads the uploaded file from workspace
+        # storage via WorkspaceClient.readFile. Send only metadata + file_id —
+        # NEVER the file contents / base64 in the control event payload.
+        _emit_agent_control_event(db, workspace, agent_name, "skill.install", {
+            "skill": {
+                "id": custom["id"],
+                "name": custom.get("name", custom["id"]),
+                "description": custom.get("description", ""),
+                "source_type": custom.get("source_type", "workspace_file"),
+                "file_id": custom.get("file_id"),
+                "filename": custom.get("filename"),
+                "content_type": custom.get("content_type"),
+                "package_type": custom.get("package_type"),
+                "version_id": custom.get("version_id"),
+            },
+        })
+    elif registry_version:
+        event_skill = {
+            "id": registry_skill.slug,
+            "registry_skill_id": registry_skill.id,
+            "version_id": registry_version.id,
+            "name": registry_skill.name,
+            "description": registry_skill.summary,
+            "package_type": registry_version.package_type,
+            "content_sha256": registry_version.content_sha256,
+        }
+        if registry_version.source_mode == "mirrored":
+            event_skill["source_type"] = "registry"
+        else:
+            event_skill.update({
+                "source_type": "registry_upstream",
+                "source_repo": registry_version.source_repo,
+                "source_path": registry_version.source_path,
+            })
+        _emit_agent_control_event(db, workspace, agent_name, "skill.install", {"skill": event_skill})
+    else:
+        # Carry the catalog metadata the launcher needs to fetch the skill.
+        _emit_agent_control_event(db, workspace, agent_name, "skill.install", {
+            "skill": {
+                "id": skill["id"],
+                "name": skill.get("name", skill["id"]),
+                "description": skill.get("description", ""),
+                "source_repo": skill.get("source_repo", ""),
+                "source_path": skill.get("source_path", ""),
+            },
+        })
+    from app.models import AgentSkillInstallation
+    selected_version_id = (
+        registry_version.id if registry_version
+        else custom.get("version_id") if custom
+        else None
+    )
+    installation = db.get(AgentSkillInstallation, (workspace.id, agent_name, status_skill_id))
+    if installation is None:
+        installation = AgentSkillInstallation(
+            workspace_id=workspace.id,
+            agent_name=agent_name,
+            skill_id=status_skill_id,
+            version_id=selected_version_id,
+            state="installing",
+        )
+        db.add(installation)
+    else:
+        installation.version_id = selected_version_id or installation.version_id
+        installation.state = "installing"
+        installation.error = None
+        installation.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    logger.info(
+        "install_skill: queued install of '%s' for agent '%s' in workspace %s",
+        status_skill_id, agent_name, workspace.id,
+    )
+    return success_response({
+        "agentName": agent_name,
+        "skillId": status_skill_id,
+        "versionId": selected_version_id,
+        "action": "installing",
+        "state": "installing",
+        "installedSkills": list(skills_data.get("installed", [])),
+        "skillStatus": skills_data.get("skill_status", {}),
+    })
+
+
+@router.post("/{workspace_id}/members/{agent_name}/skills/status")
+def report_skill_status(
+    workspace_id: str,
+    agent_name: str,
+    body: SkillStatusRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Launcher → workspace callback reporting skill install progress/result.
+
+    Updates ``enabled_skills.skill_status`` so the Skill Hub UI can render
+    installing → installed / failed, and keeps the legacy ``installed`` list
+    in sync. Also re-publishes to the SSE channel for instant UI updates.
+    """
+    if body.state not in _VALID_SKILL_STATES:
+        return json_response(ResponseCode.BAD_REQUEST, f"Invalid state: {body.state}")
+
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    member = db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.agent_name == agent_name,
+        )
+    ).scalar_one_or_none()
+    if not member:
+        return json_response(ResponseCode.NOT_FOUND, "Member not found")
+
+    skills_data = dict(member.enabled_skills or {})
+    if body.state == "uninstalled":
+        # Drop the status entry entirely on uninstall.
+        status_map = dict(skills_data.get("skill_status", {}))
+        status_map.pop(body.skill_id, None)
+        skills_data["skill_status"] = status_map
+        skills_data["installed"] = [
+            s for s in skills_data.get("installed", []) if s != body.skill_id
+        ]
+    else:
+        skills_data = _set_skill_status(
+            skills_data, body.skill_id, body.state, body.path, body.error, body.partial
+        )
+    member.enabled_skills = skills_data
+
+    from app.models import AgentSkillInstallation
+    installation = db.get(AgentSkillInstallation, (workspace.id, agent_name, body.skill_id))
+    previous_state = installation.state if installation else None
+    if body.state == "uninstalled":
+        if installation:
+            db.delete(installation)
+    else:
+        if installation is None:
+            installation = AgentSkillInstallation(
+                workspace_id=workspace.id,
+                agent_name=agent_name,
+                skill_id=body.skill_id,
+                version_id=body.version_id,
+                state=body.state,
+            )
+            db.add(installation)
+        installation.version_id = body.version_id or installation.version_id
+        installation.state = body.state
+        installation.install_path = body.path
+        installation.error = body.error
+        installation.updated_at = datetime.now(timezone.utc)
+        if body.state == "installed":
+            installation.installed_at = datetime.now(timezone.utc)
+            if previous_state != "installed":
+                # Built-ins report under their catalog slug, mirrored UGC under
+                # the Registry UUID — resolve both so popularity is comparable
+                # across the two source modes.
+                registry_skill, _ = _resolve_registry_skill(db, body.skill_id)
+                if registry_skill:
+                    from app.skill_registry import record_skill_activity
+                    event = record_skill_activity(
+                        db, registry_skill, "install",
+                        workspace_id=workspace.id,
+                        agent_name=agent_name,
+                        version_id=body.version_id,
+                    )
+                    # Search orders by install_count, so it needs the same abuse
+                    # rules as the leaderboard: a reinstall loop or an author
+                    # installing their own skill must not move it up the list.
+                    if event is not None and not event.self_authored:
+                        registry_skill.install_count = (registry_skill.install_count or 0) + 1
+    db.commit()
+
+    if body.state == "failed":
+        logger.error(
+            "skill install FAILED: skill='%s' agent='%s' workspace=%s error=%s",
+            body.skill_id, agent_name, workspace.id, body.error,
+        )
+    elif body.state == "installed" and body.partial:
+        logger.warning(
+            "skill installed PARTIALLY (SKILL.md only, bundled files missing): "
+            "skill='%s' agent='%s'", body.skill_id, agent_name,
+        )
+    else:
+        logger.info(
+            "skill status: skill='%s' agent='%s' state='%s'",
+            body.skill_id, agent_name, body.state,
+        )
+
+    # Push a lightweight status event so SSE-connected UIs update instantly.
+    try:
+        from app import cache
+        snapshot = {
+            "id": str(uuid.uuid4()),
+            "type": "workspace.skill.status",
+            "source": f"openagents:{agent_name}",
+            "target": f"openagents:{agent_name}",
+            "payload": {
+                "skill_id": body.skill_id,
+                "state": body.state,
+                "error": body.error,
+            },
+            "metadata": {},
+            "timestamp": int(time.time() * 1000),
+        }
+        cache.publish_event(
+            f"ws:{workspace.id}:events",
+            _json.dumps(snapshot, default=str, separators=(",", ":")).encode(),
+        )
+    except Exception:
+        pass
+
+    return success_response({
+        "agentName": agent_name,
+        "skillId": body.skill_id,
+        "state": body.state,
+        "installedSkills": list(skills_data.get("installed", [])),
+        "skillStatus": skills_data.get("skill_status", {}),
+    })
+
+
+@router.post("/{workspace_id}/members/{agent_name}/skills/uninstall")
+def uninstall_skill(
+    workspace_id: str,
+    agent_name: str,
+    body: SkillInstallRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Uninstall a third-party skill from an agent.
+
+    Removes it from the DB immediately (optimistic) and emits a
+    ``skill.uninstall`` control event so the launcher deletes the on-disk
+    skill directory.
+    """
+    from app.skill_catalog import find_skill
+
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    member = db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.agent_name == agent_name,
+        )
+    ).scalar_one_or_none()
+    if not member:
+        return json_response(ResponseCode.NOT_FOUND, "Member not found")
+    denied = _connection_management_error(db, workspace, member, x_workspace_token, authorization)
+    if denied is not None:
+        return denied
+
+    aliases, alias_registry_skill = _registry_status_aliases(db, body.skill_id)
+    skills_data = dict(member.enabled_skills or {})
+    installed = [s for s in skills_data.get("installed", []) if s not in aliases]
+    skills_data["installed"] = installed
+    status_map = dict(skills_data.get("skill_status", {}))
+    for alias in aliases:
+        status_map.pop(alias, None)
+    skills_data["skill_status"] = status_map
+    member.enabled_skills = skills_data
+
+    from app.models import AgentSkillInstallation
+    # `_registry_status_aliases` already resolved by UUID first, then by
+    # upstream slug — no second lookup needed here.
+    registry_skill = alias_registry_skill
+    skill = find_skill(body.skill_id) or {
+        "id": registry_skill.slug if registry_skill else body.skill_id,
+        "name": registry_skill.name if registry_skill else body.skill_id,
+    }
+    _emit_agent_control_event(db, workspace, agent_name, "skill.uninstall", {
+        "skill": {
+            "id": skill["id"],
+            "registry_skill_id": registry_skill.id if registry_skill else None,
+            "name": skill.get("name", skill["id"]),
+            "source_repo": skill.get("source_repo", ""),
+            "source_path": skill.get("source_path", ""),
+        },
+    })
+    for alias in aliases:
+        installation = db.get(AgentSkillInstallation, (workspace.id, agent_name, alias))
+        if installation:
+            db.delete(installation)
+    db.commit()
+
+    return success_response({
+        "agentName": agent_name,
+        "skillId": body.skill_id,
+        "action": "uninstalled",
+        "installedSkills": installed,
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET  /v1/workspaces/{workspace_id}/skills/custom   — list custom skills
+# POST /v1/workspaces/{workspace_id}/skills/custom   — register a custom skill
+# ---------------------------------------------------------------------------
+
+@router.get("/{workspace_id}/skills/custom")
+def list_custom_skills(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """List this workspace's user-uploaded custom skills."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    from app.models import FileRecord, WorkspaceSkill, WorkspaceSkillVersion
+    from app.skill_registry import materialize_legacy_workspace_skills
+
+    materialize_legacy_workspace_skills(db, workspace)
+    # Listing is the one lazy-migration call site that has no later write, so
+    # it explicitly owns and commits the conversion transaction.
+    db.commit()
+    skills = db.execute(
+        select(WorkspaceSkill).where(
+            WorkspaceSkill.workspace_id == workspace.id,
+            WorkspaceSkill.status == "active",
+        ).order_by(WorkspaceSkill.created_at.desc())
+    ).scalars().all()
+    from app.models import RegistrySkill
+
+    payload = []
+    for skill in skills:
+        version = db.get(WorkspaceSkillVersion, skill.latest_version_id) if skill.latest_version_id else None
+        file_rec = db.get(FileRecord, version.file_id) if version else None
+        # An unlisted skill is gone from public search, so the author's own copy
+        # is the only place left that can surface — and undo — that state.
+        published = db.get(RegistrySkill, skill.registry_skill_id) if skill.registry_skill_id else None
+        payload.append({
+            "public_visibility": published.visibility if published else None,
+            "id": skill.slug,
+            "workspace_skill_id": skill.id,
+            "name": skill.name,
+            "description": skill.summary,
+            "category": skill.category,
+            "tags": skill.tags or [],
+            "author": skill.created_by,
+            "source_type": "workspace_file",
+            "file_id": version.file_id if version else None,
+            "filename": os.path.basename(file_rec.filename) if file_rec else None,
+            "content_type": file_rec.content_type if file_rec else None,
+            "package_type": version.package_type if version else None,
+            "version": version.version if version else None,
+            "version_id": version.id if version else None,
+            "registry_skill_id": skill.registry_skill_id,
+            "forked_from_version_id": skill.forked_from_version_id,
+            "unavailable": not bool(file_rec and file_rec.status == "active"),
+            "created_at": skill.created_at.isoformat() if skill.created_at else None,
+        })
+    normalized_slugs = {skill.slug for skill in skills}
+    legacy = _custom_skills_map(workspace)
+    for legacy_id, entry in legacy.items():
+        legacy_slug = entry.get("id") or legacy_id
+        if legacy_slug in normalized_slugs:
+            continue
+        file_rec = db.get(FileRecord, entry.get("file_id")) if entry.get("file_id") else None
+        payload.append({
+            **entry,
+            "id": legacy_slug,
+            "workspace_skill_id": None,
+            "source_type": "workspace_file",
+            "unavailable": not bool(file_rec and file_rec.status == "active"),
+        })
+    return success_response({"skills": payload})
+
+
+@router.post("/{workspace_id}/skills/custom")
+def register_custom_skill(
+    workspace_id: str,
+    body: CustomSkillRegisterRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Register an already-uploaded workspace file as a custom skill.
+
+    Validates that the file belongs to this workspace and that its bytes are a
+    valid ``.md`` or ``.zip`` skill package, then stores metadata under
+    ``Workspace.settings["custom_skills"]``. The file bytes are never copied
+    into settings — only a ``file_id`` reference is kept.
+    """
+    from app.custom_skills import (
+        CUSTOM_SKILL_CATEGORY,
+        CUSTOM_SKILL_SOURCE_TYPE,
+        CustomSkillError,
+        derive_skill_id,
+        inspect_package,
+        is_valid_skill_id,
+    )
+    from app.models import FileRecord, WorkspaceSkill
+    from app.skill_registry import create_workspace_version, materialize_legacy_workspace_skills
+    from app.skill_catalog import find_skill
+    from app.storage import get_file_store
+
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    # The file must exist AND belong to this workspace. The generic file
+    # download route only checks "can you access the file's own workspace", so
+    # this ownership check is genuinely required here — it stops a caller from
+    # registering another workspace's file id into this workspace.
+    file_rec = db.execute(
+        select(FileRecord).where(FileRecord.id == body.file_id)
+    ).scalar_one_or_none()
+    if not file_rec or file_rec.status != "active":
+        return json_response(ResponseCode.NOT_FOUND, "File not found")
+    if str(file_rec.workspace_id) != str(workspace.id):
+        return json_response(ResponseCode.NOT_FOUND, "File not found in this workspace")
+
+    skill_id = (body.id or "").strip() or derive_skill_id(body.filename or file_rec.filename)
+    if not is_valid_skill_id(skill_id):
+        return json_response(
+            ResponseCode.BAD_REQUEST,
+            "Invalid skill id. Use letters, digits, '.', '_' or '-' and do not start with a dash.",
+        )
+
+    # No shadowing of a built-in catalog skill, and no duplicate custom id.
+    if find_skill(skill_id):
+        return json_response(
+            ResponseCode.CONFLICT, f"'{skill_id}' conflicts with a built-in catalog skill",
+        )
+    materialize_legacy_workspace_skills(db, workspace)
+    existing = _custom_skills_map(workspace)
+    duplicate = db.execute(select(WorkspaceSkill.id).where(
+        WorkspaceSkill.workspace_id == workspace.id,
+        WorkspaceSkill.slug == skill_id,
+        WorkspaceSkill.status == "active",
+    )).first()
+    if skill_id in existing or duplicate:
+        return json_response(
+            ResponseCode.CONFLICT, f"A custom skill '{skill_id}' already exists in this workspace",
+        )
+
+    store = get_file_store()
+    try:
+        data = store.read(file_rec.storage_key)
+    except Exception:
+        return json_response(ResponseCode.BAD_REQUEST, "Could not read the uploaded file")
+
+    # Validate by inspecting bytes — do NOT trust the stored content_type.
+    try:
+        pkg = inspect_package(data, file_rec.filename)
+    except CustomSkillError as exc:
+        return json_response(ResponseCode.BAD_REQUEST, str(exc))
+
+    entry = {
+        "id": skill_id,
+        "name": (body.name or "").strip() or skill_id,
+        "description": (body.description or "").strip(),
+        "category": CUSTOM_SKILL_CATEGORY,
+        "tags": [],
+        "author": "Workspace user",
+        "source_type": CUSTOM_SKILL_SOURCE_TYPE,
+        "file_id": file_rec.id,
+        "filename": os.path.basename(body.filename or file_rec.filename),
+        "content_type": pkg["content_type"],
+        "package_type": pkg["package_type"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # The normalized tables are the new source of truth.  Keep the legacy JSON
+    # mirror for one compatibility window because older launchers/UI builds
+    # still read it; all new endpoints prefer the rows above.
+    local_skill = WorkspaceSkill(
+        workspace_id=workspace.id,
+        slug=skill_id,
+        name=entry["name"],
+        summary=entry["description"],
+        category=CUSTOM_SKILL_CATEGORY,
+        tags=[],
+        created_by=file_rec.uploaded_by,
+    )
+    db.add(local_skill)
+    db.flush()
+    local_version = create_workspace_version(
+        db, local_skill, file_rec, data, pkg["package_type"], file_rec.uploaded_by,
+        "Initial workspace version",
+    )
+    entry["workspace_skill_id"] = local_skill.id
+    entry["version"] = local_version.version
+    entry["version_id"] = local_version.id
+
+    # Persist via copy-then-reassign: SQLAlchemy does not detect in-place edits
+    # of a JSONB column (no MutableDict here), so we rebuild and reassign the
+    # whole settings dict. The copy also preserves any other custom skills.
+    current = dict(workspace.settings or {})
+    skills = dict(current.get("custom_skills") or {})
+    skills[skill_id] = entry
+    current["custom_skills"] = skills
+    workspace.settings = current
+    db.add(workspace)
+    db.commit()
+
+    logger.info(
+        "register_custom_skill: '%s' (%s) registered in workspace %s",
+        skill_id, entry["package_type"], workspace.id,
+    )
+    return success_response(entry)
+
+
+@router.get("/{workspace_id}/skills/custom/{workspace_skill_id}/versions")
+def list_custom_skill_versions(
+    workspace_id: str,
+    workspace_skill_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Return a private skill's version timeline, newest first."""
+    from app.models import WorkspaceSkill, WorkspaceSkillVersion
+
+    workspace = db.execute(select(Workspace).where(_workspace_filter(workspace_id))).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    skill = db.execute(select(WorkspaceSkill).where(
+        WorkspaceSkill.id == workspace_skill_id,
+        WorkspaceSkill.workspace_id == workspace.id,
+        WorkspaceSkill.status == "active",
+    )).scalar_one_or_none()
+    if not skill:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace skill not found")
+    versions = db.execute(
+        select(WorkspaceSkillVersion)
+        .where(WorkspaceSkillVersion.workspace_skill_id == skill.id)
+        .order_by(WorkspaceSkillVersion.version_seq.desc())
+    ).scalars().all()
+    return success_response({
+        "workspace_skill_id": skill.id,
+        "latest_version_id": skill.latest_version_id,
+        "versions": [{
+            "version_id": v.id,
+            "version": v.version,
+            "version_seq": v.version_seq,
+            "package_type": v.package_type,
+            "changelog": v.changelog,
+            "file_id": v.file_id,
+            "content_sha256": v.content_sha256,
+            "created_by": v.created_by,
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        } for v in versions],
+    })
+
+
+@router.post("/{workspace_id}/skills/custom/{workspace_skill_id}/versions")
+def create_custom_skill_version(
+    workspace_id: str,
+    workspace_skill_id: str,
+    body: CustomSkillVersionRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Create a new immutable private version from an uploaded workspace file."""
+    from app.custom_skills import CustomSkillError, inspect_package
+    from app.models import FileRecord, WorkspaceSkill
+    from app.skill_registry import create_workspace_version
+    from app.storage import get_file_store
+
+    workspace = db.execute(select(Workspace).where(_workspace_filter(workspace_id))).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    skill = db.execute(select(WorkspaceSkill).where(
+        WorkspaceSkill.id == workspace_skill_id,
+        WorkspaceSkill.workspace_id == workspace.id,
+        WorkspaceSkill.status == "active",
+    )).scalar_one_or_none()
+    if not skill:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace skill not found")
+    file_rec = db.get(FileRecord, body.file_id)
+    if not file_rec or file_rec.status != "active" or str(file_rec.workspace_id) != str(workspace.id):
+        return json_response(ResponseCode.NOT_FOUND, "File not found in this workspace")
+    try:
+        data = get_file_store().read(file_rec.storage_key)
+        pkg = inspect_package(data, file_rec.filename)
+    except (OSError, CustomSkillError) as exc:
+        return json_response(ResponseCode.BAD_REQUEST, str(exc))
+    version = create_workspace_version(
+        db, skill, file_rec, data, pkg["package_type"], file_rec.uploaded_by,
+        body.changelog.strip(),
+    )
+    db.commit()
+    return success_response({
+        "workspace_skill_id": skill.id,
+        "id": skill.slug,
+        "version_id": version.id,
+        "version": version.version,
+        "changelog": version.changelog,
+    }, "Skill version created")
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/workspaces/{workspace_id}/channels/{channel_name}
+# ---------------------------------------------------------------------------
+
+@router.get("/{workspace_id}/channels/{channel_name}")
+def get_channel(
+    workspace_id: str,
+    channel_name: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Get channel details."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    channel = db.execute(
+        select(Channel).where(
+            Channel.workspace_id == workspace.id,
+            Channel.name == channel_name,
+        )
+    ).scalar_one_or_none()
+    if not channel:
+        return json_response(ResponseCode.NOT_FOUND, "Channel not found")
+
+    from app.services.visibility import resolve_viewer, can_view_channel
+    viewer = resolve_viewer(db, workspace, x_workspace_token, authorization)
+    if not can_view_channel(db, str(workspace.id), viewer, channel):
+        return json_response(ResponseCode.FORBIDDEN, "No access to this thread")
+    return success_response(_format_channel(channel, db))
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v1/workspaces/{workspace_id}/channels/{channel_name}
+# ---------------------------------------------------------------------------
+
+@router.patch("/{workspace_id}/channels/{channel_name}")
+def update_channel(
+    workspace_id: str,
+    channel_name: str,
+    body: ChannelUpdateRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Update channel title or status."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    channel = db.execute(
+        select(Channel).where(
+            Channel.workspace_id == workspace.id,
+            Channel.name == channel_name,
+        ).with_for_update()
+    ).scalar_one_or_none()
+    if not channel:
+        return json_response(ResponseCode.NOT_FOUND, "Channel not found")
+
+    from app.services.access_model import (
+        add_channel_participant, can_view_channel, resolve_principal as resolve_viewer,
+        can_manage_thread_settings, normalize_visibility,
+    )
+    viewer = resolve_viewer(db, workspace, x_workspace_token, authorization)
+    if not can_view_channel(db, str(workspace.id), viewer, channel):
+        return json_response(ResponseCode.FORBIDDEN, "No access to this thread")
+    if body.pinned is not None and (viewer.kind != "human" or not viewer.email):
+        return json_response(ResponseCode.FORBIDDEN, "Sign in to pin a thread")
+    protected = any(value is not None for value in (
+        body.title, body.status, body.master_agent, body.visibility, body.director_email, body.is_channel,
+        body.response_mode, body.orchestration_mode, body.orchestration_instruction, body.workflow_id,
+    ))
+    if protected and not can_manage_thread_settings(db, viewer, channel):
+        return json_response(ResponseCode.FORBIDDEN, "Only the thread owner or an admin in this thread can change its settings")
+    if body.orchestration_mode is not None and body.orchestration_mode.strip().lower() not in ("dynamic", "workflow"):
+        return json_response(ResponseCode.BAD_REQUEST, "Choose proactive, passive, or a workflow; master mode is no longer supported")
+    if body.master_agent is not None:
+        return json_response(ResponseCode.BAD_REQUEST, "Master mode is no longer supported")
+    from app.services.personal_assistant import require_shareable_channel
+    if body.visibility is not None or body.is_channel or body.director_email is not None:
+        require_shareable_channel(db, channel)
+    if body.visibility is not None:
+        vis = normalize_visibility(body.visibility)
+        if vis not in ("private", "public"):
+            return json_response(ResponseCode.BAD_REQUEST, "visibility must be 'private' or 'public'")
+        channel.visibility = vis
+        if vis == "private" and channel.owner_email:
+            add_channel_participant(db, channel, channel.owner_email)
+    if body.director_email is not None:
+        channel.director_email = body.director_email.strip().lower() or None
+
+    if body.title is not None:
+        channel.title = body.title
+        if not body.auto_title:
+            channel.title_manually_set = True
+    if body.status is not None:
+        channel.status = body.status
+    if body.is_channel is not None:
+        channel.is_channel = body.is_channel
+    if body.starred is not None:
+        channel.starred = body.starred
+    if body.master_agent is not None:
+        channel.master_agent = body.master_agent
+    if body.response_mode is not None:
+        response_mode = body.response_mode.strip().lower()
+        if response_mode not in ("proactive", "passive"):
+            return json_response(ResponseCode.BAD_REQUEST, "Invalid response_mode")
+        channel.response_mode = response_mode
+        if body.orchestration_mode != "workflow" and not (body.workflow_id or "").strip():
+            from app.services.workflow import cancel_run
+            cancel_run(db, str(workspace.id), channel.name)
+            channel.orchestration_mode = "dynamic"
+            channel.workflow_id = None
+    if body.orchestration_mode is not None:
+        mode = body.orchestration_mode.strip().lower()
+        if mode not in ("dynamic", "workflow"):
+            return json_response(ResponseCode.BAD_REQUEST, "Invalid orchestration_mode")
+        if mode == "dynamic":
+            from app.services.workflow import cancel_run
+            cancel_run(db, str(workspace.id), channel.name)
+            channel.workflow_id = None
+        channel.orchestration_mode = mode
+    if body.orchestration_instruction is not None:
+        # Empty string clears the plan; otherwise store the trimmed text.
+        channel.orchestration_instruction = body.orchestration_instruction.strip() or None
+    if body.workflow_id is not None:
+        wid = body.workflow_id.strip()
+        if wid != (channel.workflow_id or "") or not wid:
+            from app.services.workflow import cancel_run
+            cancel_run(db, str(workspace.id), channel.name)
+        channel.workflow_id = wid or None
+        if not wid:
+            channel.orchestration_mode = "dynamic"
+        if wid:
+            # Picking a workflow puts the thread in workflow mode and starts a
+            # run (idempotent — an already-running run is left alone).
+            channel.orchestration_mode = "workflow"
+            from app.models import Workflow
+            from app.services.workflow import get_active_run, start_run
+            workflow = db.execute(
+                select(Workflow).where(
+                    Workflow.id == wid,
+                    Workflow.workspace_id == workspace.id,
+                )
+            ).scalar_one_or_none()
+            if workflow and (workflow.steps or []):
+                db.flush()
+                if get_active_run(db, str(workspace.id), channel.name) is None:
+                    start_run(db, workspace, channel.name, workflow, prev_output="")
+
+    if body.pinned is not None:
+        from app.models import ThreadPin
+        pin = db.get(ThreadPin, (channel.id, viewer.email))
+        if body.pinned and pin is None:
+            db.add(ThreadPin(channel_id=channel.id, user_email=viewer.email))
+        elif not body.pinned and pin is not None:
+            db.delete(pin)
+
+    db.commit()
+    db.refresh(channel)
+    return success_response(_format_channel(channel, db) | ({"pinned": body.pinned} if body.pinned is not None else {}))
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/workspaces/{workspace_id} — Delete workspace
+# ---------------------------------------------------------------------------
+
+@router.delete("/{workspace_id}")
+def delete_workspace(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Soft-delete a workspace (set status to 'deleted'). Requires workspace token or Firebase owner auth."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    workspace.status = "deleted"
+    db.commit()
+
+    return success_response({"workspaceId": str(workspace.id), "status": "deleted"})
+
+
+# ---------------------------------------------------------------------------
+# Collaborator management (email-based sharing)
+# ---------------------------------------------------------------------------
+
+def _user_cards(db: Session, emails) -> dict:
+    """`email -> (display_name, avatar_url)` for the accounts behind [emails].
+
+    `workspace_collaborators` is keyed by email and predates accounts: it
+    carries whatever display name the client happened to send and has never
+    had a picture. The `users` row is where the profile actually lives, so it
+    is looked up here rather than duplicated into the collaborator row, which
+    would go stale the moment someone changes their photo.
+
+    One query for the whole list — a per-row lookup would turn the member list
+    into an N+1.
+    """
+    wanted = {(e or "").strip().lower() for e in emails if e}
+    if not wanted:
+        return {}
+    rows = db.execute(
+        select(User.email, User.display_name, User.avatar_url).where(
+            func.lower(User.email).in_(wanted)
+        )
+    ).all()
+    return {email.lower(): (display_name, avatar_url) for email, display_name, avatar_url in rows}
+
+
+def _format_collaborator(c: WorkspaceCollaborator, cards: Optional[dict] = None) -> dict:
+    """Serialize a collaborator, enriched with their account profile.
+
+    [cards] comes from `_user_cards`. Omitting it still yields a valid row —
+    one with no picture — so a caller without a session at hand degrades to
+    the shape this endpoint always returned rather than failing.
+
+    The account's display name wins over the collaborator row's: the row's is
+    a snapshot from whichever client last posted, the account's is what its
+    owner set on purpose.
+    """
+    name, avatar = (cards or {}).get((c.email or "").lower(), (None, None))
+    return {
+        "email": c.email,
+        "displayName": name or c.display_name,
+        "avatarUrl": avatar,
+        "role": c.role,
+        "addedBy": c.added_by,
+        "addedAt": c.added_at.isoformat() if c.added_at else None,
+    }
+
+
+@router.get("/{workspace_id}/collaborators")
+def list_collaborators(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """List email-based collaborators for a workspace."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    rows = workspace.collaborators or []
+    cards = _user_cards(db, [c.email for c in rows])
+    collabs = [_format_collaborator(c, cards) for c in rows]
+    return success_response({
+        "collaborators": collabs,
+        "owner": workspace.creator_email,
+    })
+
+
+@router.post("/{workspace_id}/presence")
+def record_presence(
+    workspace_id: str,
+    body: PresencePingRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Self-register the calling human as a workspace collaborator.
+
+    Called by the web/Swift clients on workspace open once the user is
+    signed in. The mention picker reads from `workspace_collaborators`,
+    so this is what makes a freshly-logged-in human show up in @-picker
+    rows without having to post a message first.
+    """
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    email = (body.senderEmail or "").strip().lower()
+    if not email or "@" not in email:
+        return json_response(ResponseCode.BAD_REQUEST, "Invalid email address")
+
+    from app.mods.workspace_mod import _upsert_human_collaborator
+    _upsert_human_collaborator(
+        workspace,
+        {"sender_email": email, "sender_display_name": body.senderDisplayName},
+        db,
+    )
+    db.commit()
+
+    existing = db.execute(
+        select(WorkspaceCollaborator).where(
+            WorkspaceCollaborator.workspace_id == str(workspace.id),
+            WorkspaceCollaborator.email == email,
+        )
+    ).scalar_one_or_none()
+    return success_response(
+        _format_collaborator(existing, _user_cards(db, [email])) if existing else {"email": email}
+    )
+
+
+@router.post("/{workspace_id}/collaborators")
+def add_collaborator(
+    workspace_id: str,
+    body: CollaboratorAddRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Add an email-based collaborator to a workspace."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    email = body.email.strip().lower()
+    if not email or "@" not in email:
+        return json_response(ResponseCode.BAD_REQUEST, "Invalid email address")
+
+    # Can't add the owner as a collaborator
+    if workspace.creator_email and email == workspace.creator_email.lower():
+        return json_response(ResponseCode.CONFLICT, "This email is already the workspace owner")
+
+    # Determine who is adding (from bearer token if available)
+    added_by = None
+    bearer = _extract_bearer(authorization)
+    if bearer:
+        from app.firebase_auth import verify_firebase_token
+        added_by = verify_firebase_token(bearer)
+
+    # Upsert: update role if already exists
+    existing = db.execute(
+        select(WorkspaceCollaborator).where(
+            WorkspaceCollaborator.workspace_id == workspace.id,
+            WorkspaceCollaborator.email == email,
+        )
+    ).scalar_one_or_none()
+
+    if existing:
+        existing.role = body.role
+        db.commit()
+        db.refresh(existing)
+        return success_response(_format_collaborator(existing, _user_cards(db, [email])))
+
+    collab = WorkspaceCollaborator(
+        workspace_id=workspace.id,
+        email=email,
+        role=body.role,
+        added_by=added_by,
+    )
+    db.add(collab)
+    db.commit()
+    db.refresh(collab)
+    return success_response(_format_collaborator(collab, _user_cards(db, [email])))
+
+
+@router.delete("/{workspace_id}/collaborators/{email}")
+def remove_collaborator(
+    workspace_id: str,
+    email: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Remove an email-based collaborator from a workspace."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace:
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+
+    email_lower = email.strip().lower()
+    collab = db.execute(
+        select(WorkspaceCollaborator).where(
+            WorkspaceCollaborator.workspace_id == workspace.id,
+            WorkspaceCollaborator.email == email_lower,
+        )
+    ).scalar_one_or_none()
+
+    if not collab:
+        return json_response(ResponseCode.NOT_FOUND, "Collaborator not found")
+
+    db.delete(collab)
+    db.commit()
+    return success_response({"email": email_lower, "removed": True})
+
+
+# ---------------------------------------------------------------------------
+# Team — human workspace members (enforced-login v1.0)
+#
+# Distinct from the agent members (`workspace_members`, keyed by agent_name) and
+# the legacy email-only `workspace_collaborators`. These operate on the
+# first-class `workspace_memberships` (user_id ↔ workspace, role
+# owner|admin|member|viewer). Invites resolve/create a User by email so a
+# not-yet-registered teammate can be granted a role now and inherit it on their
+# first login.
+# ---------------------------------------------------------------------------
+
+class TeamMemberAddRequest(BaseModel):
+    email: str
+    role: str = Field(default="member", pattern=r"^(admin|member|viewer)$")
+
+
+class TeamMemberUpdateRequest(BaseModel):
+    role: str = Field(pattern=r"^(owner|admin|member|viewer)$")
+
+
+def _team_rows(db: Session, workspace_id: str) -> List[dict]:
+    rows = db.execute(
+        select(User.email, User.display_name, User.avatar_url, WorkspaceMembership.role, WorkspaceMembership.created_at)
+        .join(WorkspaceMembership, WorkspaceMembership.user_id == User.id)
+        .where(WorkspaceMembership.workspace_id == workspace_id)
+        .order_by(WorkspaceMembership.created_at.asc())
+    ).all()
+    # Older clients stored names on workspace collaborators before profiles.
+    workspace_names = dict(db.execute(
+        select(WorkspaceCollaborator.email, WorkspaceCollaborator.display_name)
+        .where(WorkspaceCollaborator.workspace_id == workspace_id)
+    ).all())
+    return [
+        {
+            "email": email,
+            "displayName": (display_name or "").strip() or (workspace_names.get(email) or "").strip() or None,
+            "avatarUrl": avatar_url,
+            "role": role,
+            "joinedAt": created_at.isoformat() if created_at else None,
+        }
+        for email, display_name, avatar_url, role, created_at in rows
+    ]
+
+
+def _owner_count(db: Session, workspace_id: str) -> int:
+    return len(db.execute(
+        select(WorkspaceMembership.user_id).where(
+            WorkspaceMembership.workspace_id == workspace_id,
+            WorkspaceMembership.role == "owner",
+        )
+    ).all())
+
+
+@router.get("/{workspace_id}/team")
+def list_team(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """List the workspace's human members. Any member (or a token holder) may view."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role="member"):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid workspace credentials")
+    return success_response(_team_rows(db, workspace.id))
+
+
+@router.post("/{workspace_id}/team")
+def add_team_member(
+    workspace_id: str,
+    body: TeamMemberAddRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Invite/add a human member by email with a role (admin|member|viewer).
+
+    Owner/admin only. Idempotent: re-adding an existing member updates their
+    role. Creating owners is not allowed here — transfer/grant ownership is a
+    separate, owner-only action (PATCH with role=owner)."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role="admin"):
+        return json_response(ResponseCode.FORBIDDEN, "Only an owner or admin can add members")
+
+    user = get_or_create_user_by_email(db, body.email)
+    membership = db.execute(
+        select(WorkspaceMembership).where(
+            WorkspaceMembership.workspace_id == workspace.id,
+            WorkspaceMembership.user_id == user.id,
+        )
+    ).scalar_one_or_none()
+    if membership is None:
+        membership = WorkspaceMembership(workspace_id=workspace.id, user_id=user.id, role=body.role)
+        db.add(membership)
+    else:
+        membership.role = body.role
+    db.commit()
+    return success_response({"email": user.email, "role": body.role})
+
+
+@router.patch("/{workspace_id}/team/{email}")
+def update_team_member(
+    workspace_id: str,
+    email: str,
+    body: TeamMemberUpdateRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Change a member's role. Admin+ for admin/member/viewer; owner-only to
+    grant or revoke `owner`. The last owner cannot be demoted."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    email_lower = email.strip().lower()
+    user = db.execute(select(User).where(User.email == email_lower)).scalar_one_or_none()
+    membership = None
+    if user is not None:
+        membership = db.execute(
+            select(WorkspaceMembership).where(
+                WorkspaceMembership.workspace_id == workspace.id,
+                WorkspaceMembership.user_id == user.id,
+            )
+        ).scalar_one_or_none()
+    if membership is None:
+        return json_response(ResponseCode.NOT_FOUND, "Member not found")
+
+    # Granting or revoking owner is owner-only; other changes are admin+.
+    needs_owner = body.role == "owner" or membership.role == "owner"
+    min_role = "owner" if needs_owner else "admin"
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role=min_role):
+        return json_response(ResponseCode.FORBIDDEN, "Insufficient role to change this member")
+
+    # Don't strand the workspace without an owner.
+    if membership.role == "owner" and body.role != "owner" and _owner_count(db, workspace.id) <= 1:
+        return json_response(ResponseCode.BAD_REQUEST, "Cannot demote the last owner")
+
+    membership.role = body.role
+    db.commit()
+    return success_response({"email": email_lower, "role": body.role})
+
+
+@router.delete("/{workspace_id}/team/{email}")
+def remove_team_member(
+    workspace_id: str,
+    email: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Remove a human member. Admin+; removing an owner is owner-only and the
+    last owner cannot be removed."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    email_lower = email.strip().lower()
+    user = db.execute(select(User).where(User.email == email_lower)).scalar_one_or_none()
+    membership = None
+    if user is not None:
+        membership = db.execute(
+            select(WorkspaceMembership).where(
+                WorkspaceMembership.workspace_id == workspace.id,
+                WorkspaceMembership.user_id == user.id,
+            )
+        ).scalar_one_or_none()
+    if membership is None:
+        return json_response(ResponseCode.NOT_FOUND, "Member not found")
+
+    min_role = "owner" if membership.role == "owner" else "admin"
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role=min_role):
+        return json_response(ResponseCode.FORBIDDEN, "Insufficient role to remove this member")
+
+    if membership.role == "owner" and _owner_count(db, workspace.id) <= 1:
+        return json_response(ResponseCode.BAD_REQUEST, "Cannot remove the last owner")
+
+    db.delete(membership)
+    db.commit()
+    return success_response({"email": email_lower, "removed": True})
+
+
+@router.post("/{workspace_id}/team/self")
+def join_team_self(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Add the signed-in caller to the workspace as a member.
+
+    The "add this workspace to my account" nudge: a logged-in user who reached
+    a workspace via a shared ?token= link becomes a first-class member so it
+    shows up on their Membership Home. Requires both a valid identity bearer and
+    existing access (token or membership). No-op (returns current role) if
+    already a member."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid workspace credentials")
+
+    user = resolve_current_user(db, authorization)
+    if not user:
+        return json_response(ResponseCode.UNAUTHORIZED, "Identity required to join")
+
+    membership = db.execute(
+        select(WorkspaceMembership).where(
+            WorkspaceMembership.workspace_id == workspace.id,
+            WorkspaceMembership.user_id == user.id,
+        )
+    ).scalar_one_or_none()
+    if membership is None:
+        membership = WorkspaceMembership(workspace_id=workspace.id, user_id=user.id, role="member")
+        db.add(membership)
+        db.commit()
+    return success_response({"email": user.email, "role": membership.role})
+
+
+@router.get("/{workspace_id}/me")
+def get_me(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Who am I in this workspace? Returns the caller's identity and effective
+    role so the frontend can gate admin UI client-side (the backend still
+    enforces every mutation independently).
+
+    `role` is the identity-based membership role (null for token-only or
+    anonymous callers). `effectiveRole` folds in the machine credential and the
+    open-workspace grandfather rule, both of which the access layer treats as
+    owner-equivalent."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db):
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid workspace credentials")
+
+    token_access = bool(
+        workspace.password_hash and x_workspace_token == workspace.password_hash
+    )
+    role = resolve_user_role(db, workspace, authorization)
+    open_workspace = not workspace.password_hash and not workspace.require_login
+
+    email = None
+    display_name = None
+    avatar_url = None
+    if role is not None:
+        user = resolve_current_user(db, authorization)
+        if user is not None:
+            email = user.email
+            display_name = user.display_name
+            avatar_url = user.avatar_url
+            db.commit()  # persist the lazily created/refreshed User row
+
+    effective_role = role
+    if not authorization and (token_access or open_workspace):
+        effective_role = "owner"
+
+    return success_response({
+        "email": email,
+        "displayName": display_name,
+        "avatarUrl": avatar_url,
+        "authenticated": role is not None,
+        "role": role,
+        "tokenAccess": token_access,
+        "effectiveRole": effective_role,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Invites — tokenized invitation links (never the workspace machine token).
+#
+# Created here (owner/admin), accepted on the public /v1/invites/{token}
+# endpoints (app/routers/invites.py) after the invitee signs in. Email-bound
+# invites also get the link emailed to them (best-effort — the link is always
+# returned for copy-paste).
+# ---------------------------------------------------------------------------
+
+class InviteCreateRequest(BaseModel):
+    email: Optional[str] = None  # bound invite; None = open shareable link
+    role: str = Field(default="member", pattern=r"^(admin|member|viewer)$")
+    # v1.1: where the invitee lands after accepting — the agent, thread or
+    # task that motivated the invite. Accepting also grants access to it
+    # (thread ACL row / agent grant), see app/routers/invites.py.
+    target_kind: Optional[str] = Field(default=None, pattern=r"^(agent|channel|task)$")
+    target_id: Optional[str] = None
+    note: Optional[str] = None
+
+
+def _validate_invite_target(db: Session, workspace: Workspace, kind: Optional[str], target_id: Optional[str]):
+    """Return an error response when the invite's target does not exist."""
+    if not kind:
+        return None
+    target_id = (target_id or "").strip()
+    if not target_id:
+        return json_response(ResponseCode.BAD_REQUEST, "target_id is required with target_kind")
+    if kind == "channel":
+        row = db.execute(
+            select(Channel.id).where(
+                Channel.workspace_id == workspace.id,
+                Channel.name == target_id,
+                Channel.status != "deleted",
+            )
+        ).first()
+        label = "Thread"
+    elif kind == "agent":
+        row = db.execute(
+            select(WorkspaceMember.agent_name).where(
+                WorkspaceMember.workspace_id == workspace.id,
+                WorkspaceMember.agent_name == target_id,
+                WorkspaceMember.status != "removed",
+            )
+        ).first()
+        label = "Agent"
+    else:  # task
+        from app.models import KanbanTask
+        row = db.execute(
+            select(KanbanTask.id).where(
+                KanbanTask.workspace_id == workspace.id,
+                KanbanTask.id == target_id,
+            )
+        ).first()
+        label = "Task"
+    if row is None:
+        return json_response(ResponseCode.NOT_FOUND, f"{label} not found")
+    return None
+
+
+def _invite_status(inv: WorkspaceInvite) -> str:
+    if inv.revoked_at is not None:
+        return "revoked"
+    if inv.email and inv.accepted_at is not None:
+        return "accepted"
+    expires = inv.expires_at
+    if expires is not None and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires is not None and expires < datetime.now(timezone.utc):
+        return "expired"
+    return "pending"
+
+
+def _invite_row(inv: WorkspaceInvite) -> dict:
+    return {
+        "inviteId": inv.id,
+        "email": inv.email,
+        "role": inv.role,
+        "url": f"{config.FRONTEND_BASE_URL}/invite/{inv.token}",
+        "status": _invite_status(inv),
+        "createdBy": inv.created_by,
+        "createdAt": inv.created_at.isoformat() if inv.created_at else None,
+        "expiresAt": inv.expires_at.isoformat() if inv.expires_at else None,
+        "acceptedBy": inv.accepted_by,
+        "targetKind": inv.target_kind,
+        "targetId": inv.target_id,
+        "note": inv.note,
+    }
+
+
+@router.post("/{workspace_id}/invites")
+def create_invite(
+    workspace_id: str,
+    body: InviteCreateRequest,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Create an invitation link (owner/admin only).
+
+    With `email`: a single-use invite bound to that address, and the link is
+    emailed to them when an email provider is configured. Without: an open
+    shareable link anyone can use to join (with the given role) until it
+    expires or is revoked."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role="admin"):
+        return json_response(ResponseCode.FORBIDDEN, "Only an owner or admin can create invites")
+
+    target_error = _validate_invite_target(db, workspace, body.target_kind, body.target_id)
+    if target_error is not None:
+        return target_error
+
+    inviter = resolve_current_user(db, authorization)
+    email = (body.email or "").strip().lower() or None
+    invite = WorkspaceInvite(
+        workspace_id=workspace.id,
+        token=secrets.token_urlsafe(32),
+        email=email,
+        role=body.role,
+        created_by=inviter.email if inviter else None,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=config.INVITE_TTL_DAYS),
+        target_kind=body.target_kind,
+        target_id=(body.target_id or "").strip() or None if body.target_kind else None,
+        note=(body.note or "").strip() or None,
+    )
+    db.add(invite)
+    db.commit()
+
+    email_sent = False
+    if email:
+        from app.services.email import send_invite_email
+        # Same rule as the accept page: show the inviter's display name, not
+        # their email address (fall back to the address's local part).
+        inviter_name = None
+        if inviter:
+            inviter_name = inviter.display_name or inviter.email.partition("@")[0]
+        email_sent = send_invite_email(
+            to=email,
+            workspace_name=workspace.name,
+            role=body.role,
+            invite_url=f"{config.FRONTEND_BASE_URL}/invite/{invite.token}",
+            invited_by=inviter_name,
+        )
+
+    return success_response({**_invite_row(invite), "emailSent": email_sent})
+
+
+@router.get("/{workspace_id}/invites")
+def list_invites(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """List this workspace's invites, newest first (owner/admin only)."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role="admin"):
+        return json_response(ResponseCode.FORBIDDEN, "Only an owner or admin can list invites")
+
+    invites = db.execute(
+        select(WorkspaceInvite)
+        .where(WorkspaceInvite.workspace_id == workspace.id)
+        .order_by(WorkspaceInvite.created_at.desc())
+    ).scalars().all()
+    return success_response([_invite_row(i) for i in invites])
+
+
+@router.delete("/{workspace_id}/invites/{invite_id}")
+def revoke_invite(
+    workspace_id: str,
+    invite_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Revoke an invite so its link stops working (owner/admin only)."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role="admin"):
+        return json_response(ResponseCode.FORBIDDEN, "Only an owner or admin can revoke invites")
+
+    invite = db.execute(
+        select(WorkspaceInvite).where(
+            WorkspaceInvite.id == invite_id,
+            WorkspaceInvite.workspace_id == workspace.id,
+        )
+    ).scalar_one_or_none()
+    if invite is None:
+        return json_response(ResponseCode.NOT_FOUND, "Invite not found")
+
+    if invite.revoked_at is None:
+        invite.revoked_at = datetime.now(timezone.utc)
+        db.commit()
+    return success_response({"inviteId": invite.id, "revoked": True})
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/workspaces/{id}/pairing-codes — mint a node pairing code
+# ---------------------------------------------------------------------------
+
+@router.post("/{workspace_id}/pairing-codes")
+def create_pairing_code(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    x_workspace_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Generate a short-lived, single-use code to connect a node (device) to this
+    workspace. Requires a signed-in member, who owns the connection. The
+    launcher redeems it at POST /v1/nodes/redeem."""
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    creator = resolve_current_user(db, authorization)
+    if not creator or not verify_workspace_access(workspace, None, authorization, db=db, min_role="member"):
+        return json_response(ResponseCode.FORBIDDEN, "Sign in as a workspace member to connect your device")
+
+    from app.models import NodePairingCode
+    from app.routers.nodes import generate_pairing_code, format_pairing_code, PAIRING_TTL
+
+    code = generate_pairing_code()
+    now = datetime.now(timezone.utc)
+    expires = now + PAIRING_TTL
+    creator = resolve_current_user(db, authorization)
+    db.add(NodePairingCode(
+        code=code,
+        workspace_id=workspace.id,
+        created_by=creator.email if creator else None,
+        expires_at=expires,
+    ))
+    db.commit()
+    return success_response({
+        "code": format_pairing_code(code),
+        "expiresAt": expires.isoformat(),
+        "expiresInSeconds": int(PAIRING_TTL.total_seconds()),
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/workspaces/{id}/pairing-codes/{code} — has the device redeemed it?
+# ---------------------------------------------------------------------------
+
+@router.get("/{workspace_id}/pairing-codes/{code}")
+def get_pairing_code_status(
+    workspace_id: str,
+    code: str,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    """Whether a pairing code has been redeemed, and by which device.
+
+    The screen showing the code polls this to learn the pairing worked. Watching
+    the device list for a new node cannot tell: a device that was paired before
+    is upserted on redeem and keeps its node id, so nothing new ever appears.
+    Only the member who minted the code may read it.
+    """
+    workspace = db.execute(
+        select(Workspace).where(_workspace_filter(workspace_id))
+    ).scalar_one_or_none()
+    if not workspace or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
+    user = resolve_current_user(db, authorization)
+    if not user or not verify_workspace_access(workspace, None, authorization, db=db, min_role="member"):
+        return json_response(ResponseCode.FORBIDDEN, "Sign in as a workspace member")
+
+    from app.models import NodePairingCode
+    from app.routers.nodes import format_pairing_code, normalize_pairing_code, _aware
+
+    pc = db.execute(
+        select(NodePairingCode).where(
+            NodePairingCode.code == normalize_pairing_code(code),
+            NodePairingCode.workspace_id == workspace.id,
+        )
+    ).scalar_one_or_none()
+    # Someone else's code reads as unknown rather than forbidden: whether a
+    # code exists is not theirs to learn.
+    if not pc or (pc.created_by or "").lower() != user.email.strip().lower():
+        return json_response(ResponseCode.NOT_FOUND, "Pairing code not found")
+
+    expires = _aware(pc.expires_at)
+    redeemed = _aware(pc.redeemed_at)
+    return success_response({
+        "code": format_pairing_code(pc.code),
+        "redeemed": redeemed is not None,
+        "redeemedAt": redeemed.isoformat() if redeemed else None,
+        "nodeId": str(pc.node_id) if pc.node_id else None,
+        "expired": redeemed is None and expires is not None and expires < datetime.now(timezone.utc),
+        "expiresAt": expires.isoformat() if expires else None,
+    })

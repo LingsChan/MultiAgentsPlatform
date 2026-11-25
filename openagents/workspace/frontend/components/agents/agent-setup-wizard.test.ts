@@ -1,0 +1,438 @@
+// @vitest-environment jsdom
+import React, { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { AgentSetup, type AgentSetupApi } from './agent-setup';
+import type { AgentCatalogDetail, AgentCatalogEntry, WorkspaceNode } from '@/lib/types';
+import { messages } from '@/lib/i18n/messages/en-US';
+import { translate } from '@/lib/i18n/translate';
+
+const seal = vi.hoisted(() => vi.fn());
+vi.mock('./encrypt-agent-credentials', () => ({ encryptAgentCredentials: seal }));
+vi.mock('@/lib/i18n', () => ({ useT: () => (key: string, params?: Record<string, string | number>) => translate(messages, messages, 'en-US', key, params) }));
+vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock('@/components/ui/select', () => ({
+  Select: ({ value, onValueChange, children }: { value: string; onValueChange: (v: string) => void; children: React.ReactNode }) => React.createElement('select', { value, onChange: (event: React.ChangeEvent<HTMLSelectElement>) => onValueChange(event.target.value) }, children),
+  SelectTrigger: () => null, SelectValue: () => null,
+  SelectContent: ({ children }: { children: React.ReactNode }) => children,
+  SelectGroup: ({ children }: { children: React.ReactNode }) => children,
+  SelectItem: ({ value, children }: { value: string; children: React.ReactNode }) => React.createElement('option', { value }, children),
+}));
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+// jsdom has no ResizeObserver; the Radix radio and checkbox measure with it.
+(globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= class { observe() {} unobserve() {} disconnect() {} };
+let root: Root;
+let host: HTMLDivElement;
+beforeEach(() => { seal.mockReset(); seal.mockImplementation(async (_api, _node, _action, args) => { const { apiKey, config, ...rest } = args; return { ...rest, encryptedCredentials: { ciphertext: 'sealed' } }; }); });
+afterEach(async () => { if (root) await act(async () => root.unmount()); host?.remove(); });
+
+async function open({ signedIn = false, type = 'codex', detailFails = false, detailPending = false, deviceModels = [], browserLogin = false, installed = true, existingNames = [], loginCommand, browserLoginMethods, listNodeCommands }: { signedIn?: boolean; type?: string; detailFails?: boolean; detailPending?: boolean; deviceModels?: { id: string; label: string }[]; browserLogin?: boolean; installed?: boolean; existingNames?: string[]; loginCommand?: string; browserLoginMethods?: string[]; listNodeCommands?: () => Promise<unknown> } = {}) {
+  host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+  const detail = {
+    name: type, label: type, models: [{ id: 'gpt-6', label: 'GPT-6' }],
+    check_ready: type === 'codex' ? { login_command: 'codex login' } : {},
+    resolve_env: { rules: [{ from: 'LLM_API_KEY', to: 'OPENAI_API_KEY' }] },
+  } as unknown as AgentCatalogDetail;
+  const api = {
+    getAgentCatalogDetail: detailPending ? vi.fn(() => new Promise<AgentCatalogDetail>(() => {})) : detailFails ? vi.fn().mockRejectedValue(new Error('Unavailable')) : vi.fn().mockResolvedValue(detail),
+    listModelAccess: vi.fn().mockResolvedValue([]), listNodeCommands: listNodeCommands ? vi.fn(listNodeCommands) : vi.fn(),
+    enqueueNodeCommand: vi.fn().mockResolvedValue({ commandId: 'c1' }),
+  } as unknown as AgentSetupApi;
+  const node = { nodeId: 'n1', name: 'My server', launcherVersion: '0.2.230', agents: existingNames.map(name => ({ name, type })), runtimes: [{ type, installed, ready: signedIn, signedIn, browserLogin, browserLoginMethods, loginCommand: loginCommand ?? (type === 'codex' ? 'codex login' : type === 'claude' ? 'claude auth login' : undefined), cliModels: deviceModels }] } as unknown as WorkspaceNode;
+  const onQueued = vi.fn();
+  await act(async () => root.render(React.createElement(AgentSetup, { node, catalog: [{ name: type, label: type } as AgentCatalogEntry], initialType: type, api, extensions: { guided: true }, onBack: () => {}, onChanged: () => {}, onQueued })));
+  return { api, onQueued };
+}
+async function click(text: string) {
+  const button = [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === text)!;
+  expect(button).toBeTruthy();
+  await act(async () => button.click());
+}
+async function next() {
+  const button = host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-continue"]');
+  if (button) await act(async () => button.click());
+}
+async function choose(method: string) { await next(); await act(async () => host.querySelector<HTMLButtonElement>(`[data-testid="agent-setup-auth-${method}"]`)!.click()); }
+async function typeKey(value: string) {
+  const input = host.querySelector<HTMLInputElement>('#setup-api-key')!;
+  await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value); input.dispatchEvent(new Event('input', { bubbles: true })); });
+}
+const submit = async () => { await next(); await act(async () => host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.click()); };
+const creates = (api: AgentSetupApi) => vi.mocked(api.enqueueNodeCommand).mock.calls.filter((c) => c[1] === 'create_agent');
+
+it('starts with naming and keeps account options for the next step', async () => {
+  const { api } = await open({ detailPending: true });
+  expect(api.listModelAccess).not.toHaveBeenCalled();
+  expect(host.querySelector('[data-testid="agent-setup-details-step"]')).toBeTruthy();
+  expect(host.querySelector('[data-testid="agent-setup-auth-step"]')?.closest('[hidden]')).toBeTruthy();
+  expect(host.querySelector('[data-testid="agent-setup-optional-settings"]')?.getAttribute('data-state')).toBe('closed');
+  const name = host.querySelector<HTMLInputElement>('[data-testid="agent-setup-name"]')!;
+  expect(name.required).toBe(true);
+  expect(name.closest('[data-testid="agent-setup-optional-settings"]')).toBeNull();
+  expect(host.querySelector('[data-testid="agent-setup-submit"]')).toBeNull();
+  expect(host.querySelector('[aria-current="step"]')?.textContent).toContain(messages.agentSetup.nameStep);
+  await next();
+  expect(host.querySelector('[data-testid="agent-setup-auth-step"]')?.closest('[hidden]')).toBeNull();
+  expect(host.querySelector('[data-testid="agent-setup-details-step"]')).toBeNull();
+  expect(host.querySelector('[aria-current="step"]')?.textContent).toContain(messages.agentSetup.accountStep);
+  expect(creates(api)).toHaveLength(0);
+});
+
+it.each(['claude', 'codex'])('uses a detected %s subscription without sending a key or requiring another login', async (type) => {
+  const { api } = await open({ signedIn: true, type });
+  await next();
+  expect(host.textContent).toContain('Already signed in on My server');
+  expect(host.querySelector('[data-testid="agent-setup-auth-subscription"]')?.getAttribute('aria-checked')).toBe('true');
+  await submit();
+  expect(creates(api)[0][2]).toMatchObject({ name: type, type, authMode: 'cli_login' });
+  expect(creates(api)[0][2]).not.toHaveProperty('apiKey');
+  expect(seal).not.toHaveBeenCalled();
+});
+
+it('offers the device login command and recheck without pretending sign-in succeeded', async () => {
+  const { api } = await open();
+  await choose('subscription');
+  expect(host.querySelector('code')?.textContent).toBe('codex login');
+  expect(host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.disabled).toBe(true);
+  await click(messages.agentSetup.checkAgain);
+  expect(api.enqueueNodeCommand).toHaveBeenCalledWith('n1', 'detect_runtimes', {});
+  expect(creates(api)).toEqual([]);
+});
+
+it('lets key-only agents be added explicitly for setup later', async () => {
+  const { api } = await open({ type: 'deepseek' });
+  expect(host.querySelector('[data-testid="agent-setup-auth-subscription"]')).toBeNull();
+  await choose('later'); await submit();
+  expect(creates(api)).toHaveLength(1);
+  expect(creates(api)[0][2]).not.toHaveProperty('apiKey');
+  expect(seal).not.toHaveBeenCalled();
+});
+
+it('encrypts a newly supplied key and does not retain it in queued retry data', async () => {
+  const { api, onQueued } = await open();
+  await choose('key'); await typeKey('sk-secret'); await submit();
+  expect(seal).toHaveBeenCalledWith(api, 'n1', 'create_agent', expect.objectContaining({ apiKey: 'sk-secret' }), messages.agentSetup.secureUnavailable);
+  expect(creates(api)[0][2]).toHaveProperty('encryptedCredentials');
+  expect(creates(api)[0][2]).not.toHaveProperty('apiKey');
+  expect(JSON.stringify(onQueued.mock.calls)).not.toContain('sk-secret');
+});
+
+it('does not send any create command when secure key delivery fails', async () => {
+  seal.mockRejectedValueOnce(new Error('Old connector'));
+  const { api } = await open();
+  await choose('key'); await typeKey('sk-secret'); await submit();
+  expect(creates(api)).toEqual([]);
+  expect(host.textContent).toContain(messages.agentSetup.secureUnavailable);
+});
+
+it('clears a pasted key when switching to setup later', async () => {
+  const { api } = await open();
+  await choose('key'); await typeKey('sk-secret'); await choose('later'); await submit();
+  expect(seal).not.toHaveBeenCalled();
+  expect(creates(api)[0][2]).not.toHaveProperty('apiKey');
+});
+
+it('requires metadata only for key setup and offers a retry if that fails', async () => {
+  await open({ detailFails: true });
+  await choose('key');
+  expect(host.textContent).toContain(messages.agentSetup.loadError);
+  expect(host.querySelector('[role="radiogroup"]')).toBeTruthy();
+  expect(host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.disabled).toBe(true);
+});
+
+it('can add for setup later without waiting for registry options', async () => {
+  const { api } = await open({ detailPending: true });
+  expect(host.textContent).not.toContain(messages.agentSetup.loading);
+  await choose('later'); await submit();
+  expect(creates(api)).toHaveLength(1);
+  expect(creates(api)[0][2]).not.toHaveProperty('model');
+});
+
+it('can use an already detected subscription without waiting for registry options', async () => {
+  const { api } = await open({ signedIn: true, detailPending: true });
+  expect(host.textContent).not.toContain(messages.agentSetup.loading);
+  await submit();
+  expect(creates(api)[0][2]).toMatchObject({ authMode: 'cli_login' });
+  expect(creates(api)[0][2]).not.toHaveProperty('model');
+});
+
+it('keeps model selection open-ended and does not present the registry list as current', async () => {
+  const { api } = await open();
+  const input = host.querySelector<HTMLInputElement>('#setup-model')!;
+  expect(input.value).toBe('');
+  expect(host.querySelector('select')).toBeNull();
+  expect(host.querySelector('datalist')).toBeNull();
+  expect(host.textContent).not.toContain('GPT-6');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'future-account-model');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await choose('later'); await submit();
+  expect(creates(api)[0][2]).toMatchObject({ model: 'future-account-model' });
+});
+
+async function pickModel(value: string) {
+  const select = host.querySelector<HTMLSelectElement>('select')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(select, value);
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+}
+
+it('lists only device-reported models, with Auto first and a custom id last', async () => {
+  await open({ deviceModels: [{ id: 'live-model', label: 'Device model' }] });
+  expect(host.querySelector('datalist')).toBeNull();
+  expect([...host.querySelectorAll('select option')].map((o) => o.getAttribute('value'))).toEqual(['__auto__', 'live-model', '__custom__']);
+  expect(host.querySelector('select')!.value).toBe('__auto__');
+  expect(host.querySelector('#setup-model')).toBeNull();
+  expect(host.querySelector('select')!.textContent).not.toContain('GPT-6');
+});
+
+it('sends the device model picked from the list', async () => {
+  const { api } = await open({ deviceModels: [{ id: 'live-model', label: 'Device model' }] });
+  await pickModel('live-model');
+  await choose('later'); await submit();
+  expect(creates(api)[0][2]).toMatchObject({ model: 'live-model' });
+});
+
+it('goes back from Custom to a listed model', async () => {
+  await open({ deviceModels: [{ id: 'live-model', label: 'Device model' }] });
+  await pickModel('__custom__');
+  await pickModel('live-model');
+  expect(host.querySelector('#setup-model')).toBeNull();
+  expect(host.querySelector('select')!.value).toBe('live-model');
+});
+
+async function typeModel(value: string) {
+  const input = host.querySelector<HTMLInputElement>('#setup-model')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+
+it('offers the model id for a display name typed in Custom', async () => {
+  const { api } = await open({ deviceModels: [{ id: 'opus[1m]', label: 'Opus 5 with 1M context' }] });
+  await pickModel('__custom__');
+  await typeModel('opus 5 with 1m context');
+  expect(host.querySelector('[data-testid="agent-setup-model-error"]')?.textContent).toContain('opus[1m]');
+  await click('Use opus[1m]');
+  expect(host.querySelector('select')!.value).toBe('opus[1m]');
+  expect(host.querySelector('[data-testid="agent-setup-model-error"]')).toBeNull();
+  await choose('later'); await submit();
+  expect(creates(api)[0][2]).toMatchObject({ model: 'opus[1m]' });
+});
+
+it('keeps a model with spaces from going on to the account step', async () => {
+  await open();
+  await typeModel('my model');
+  expect(host.querySelector('[data-testid="agent-setup-model-error"]')?.textContent).toContain('no spaces');
+  await next();
+  expect(host.querySelector('[data-testid="agent-setup-submit"]')).toBeNull();
+  await typeModel('my-model');
+  expect(host.querySelector('[data-testid="agent-setup-model-error"]')).toBeNull();
+  await next();
+  expect(host.querySelector('[data-testid="agent-setup-submit"]')).toBeTruthy();
+});
+
+it('keeps a display name without spaces from going on as a model id', async () => {
+  await open({ deviceModels: [{ id: 'gpt-5.1-codex', label: 'GPT-5.1-Codex-Max' }] });
+  await pickModel('__custom__');
+  await typeModel('GPT-5.1-Codex-Max');
+  expect(host.querySelector('[data-testid="agent-setup-model-error"]')?.textContent).toContain('gpt-5.1-codex');
+  await next();
+  expect(host.querySelector('[data-testid="agent-setup-submit"]')).toBeNull();
+});
+
+it('checks the model typed for a custom endpoint before adding the agent', async () => {
+  const { api } = await open();
+  await choose('key'); await typeKey('sk-endpoint');
+  await act(async () => host.querySelector<HTMLButtonElement>('#setup-custom-endpoint')!.click());
+  const model = host.querySelector<HTMLInputElement>('#setup-key-model')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(model, 'Opus 5 with 1M context');
+    model.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  expect(host.textContent).toContain('no spaces');
+  await act(async () => host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.click());
+  expect(creates(api)).toHaveLength(0);
+});
+
+it('takes a model id the device does not list through Custom', async () => {
+  const { api } = await open({ deviceModels: [{ id: 'live-model', label: 'Device model' }] });
+  await pickModel('__custom__');
+  const input = host.querySelector<HTMLInputElement>('#setup-model')!;
+  expect(input.value).toBe('');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'unlisted-model');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  expect(host.querySelector('select')!.value).toBe('__custom__');
+  await choose('later'); await submit();
+  expect(creates(api)[0][2]).toMatchObject({ model: 'unlisted-model' });
+});
+
+
+it('offers browser sign-in only when the connector advertises support', async () => {
+  await open({ browserLogin: true });
+  await choose('subscription');
+  expect(host.querySelector('[data-testid="browser-agent-login"]')).toBeTruthy();
+  expect(host.querySelector('code')).toBeNull();
+  expect(host.textContent).toContain('Sign in to Codex');
+  expect(host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.disabled).toBe(true);
+});
+
+ it('blocks an empty or whitespace-only name before creating an agent', async () => {
+  const { api } = await open({ signedIn: true });
+  const input = host.querySelector<HTMLInputElement>('[data-testid="agent-setup-name"]')!;
+  for (const value of ['', '   ']) {
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-continue"]')!.disabled).toBe(true);
+    await next();
+  }
+  expect(creates(api)).toEqual([]);
+});
+
+it('preserves name, model, key and chosen authentication when going back', async () => {
+  await open();
+  const name = host.querySelector<HTMLInputElement>('[data-testid="agent-setup-name"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(name, 'my-codex');
+    name.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  const model = host.querySelector<HTMLInputElement>('#setup-model')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(model, 'my-model');
+    model.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await choose('key'); await typeKey('sk-stays-in-memory');
+  await click(messages.agentSetup.back);
+  expect(host.querySelector<HTMLInputElement>('[data-testid="agent-setup-name"]')!.value).toBe('my-codex');
+  expect(host.querySelector<HTMLInputElement>('#setup-model')!.value).toBe('my-model');
+  await next();
+  expect(host.querySelector('[data-testid="agent-setup-auth-key"]')?.getAttribute('aria-checked')).toBe('true');
+  expect(host.querySelector<HTMLInputElement>('#setup-api-key')!.value).toBe('sk-stays-in-memory');
+});
+
+it('rejects an invalid name before authentication', async () => {
+  const { api } = await open();
+  const name = host.querySelector<HTMLInputElement>('[data-testid="agent-setup-name"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(name, 'bad name!');
+    name.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await next();
+  expect(host.querySelector('[data-testid="agent-setup-name-error"]')?.textContent).toBe(messages.connect.agentNameInvalid);
+  expect(host.querySelector('[data-testid="agent-setup-submit"]')).toBeNull();
+  expect(creates(api)).toHaveLength(0);
+});
+
+it('blocks a duplicate name on the naming step', async () => {
+  const { api } = await open({ existingNames: ['already-used'] });
+  const name = host.querySelector<HTMLInputElement>('[data-testid="agent-setup-name"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(name, 'already-used');
+    name.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  expect(host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-continue"]')!.disabled).toBe(true);
+  expect(host.querySelector('[data-testid="agent-setup-name-error"]')?.textContent).toBe(messages.connect.agentNameExists);
+  await next();
+  expect(host.querySelector('[data-testid="agent-setup-submit"]')).toBeNull();
+  expect(creates(api)).toHaveLength(0);
+});
+
+it('offers browser sign-in before Codex is installed and waits for authentication', async () => {
+  await open({ browserLogin: true, installed: false });
+  await choose('subscription');
+  expect(host.textContent).toContain('Install and sign in to Codex');
+  expect(host.querySelector('code')).toBeNull();
+  expect(host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.disabled).toBe(true);
+});
+
+const codes = () => [...host.querySelectorAll('code')].map((c) => c.textContent);
+
+it('keeps a terminal sign-in one click away under the browser link', async () => {
+  await open({ browserLogin: true, loginCommand: 'agn login codex' });
+  await choose('subscription');
+  expect(host.querySelector('[data-testid="manual-sign-in"]')).toBeNull();
+  await click(messages.agentSetup.manualToggle);
+  expect(host.querySelector('[data-testid="manual-sign-in"]')).toBeTruthy();
+  // The device's own command first, then the CLI's for a device without agn on PATH.
+  expect(codes()).toEqual(['agn login codex', 'codex login --device-auth']);
+  expect(host.textContent).toContain(messages.agentSetup.manualTip.codex);
+  await click(messages.agentSetup.manualUseKey);
+  expect(host.querySelector('#setup-api-key')).toBeTruthy();
+  expect(host.querySelector('[data-testid="agent-setup-key-link"] a')?.getAttribute('href')).toBe('https://platform.openai.com/api-keys');
+});
+
+it('opens the terminal sign-in when the browser link fails', async () => {
+  const { api } = await open({ browserLogin: true, listNodeCommands: async () => [{ commandId: 'c1', status: 'error', result: { ok: false } }] });
+  await choose('subscription');
+  await click('Sign in to Codex');
+  expect(api.enqueueNodeCommand).toHaveBeenCalledWith('n1', 'login_start', { type: 'codex' });
+  expect(host.textContent).toContain(messages.agentSetup.browserLoginFailed);
+  expect(host.querySelector('[data-testid="manual-sign-in"]')).toBeTruthy();
+});
+
+it('lets the user add a not-yet-installed agent and sign in from the terminal', async () => {
+  await open({ browserLogin: true, installed: false });
+  await choose('subscription');
+  expect(host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.disabled).toBe(true);
+  await click(messages.agentSetup.manualToggle);
+  expect(host.textContent).toContain('Add the agent first');
+  expect(host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.disabled).toBe(false);
+});
+
+it('asks which account OpenCode should sign in to and sends that choice', async () => {
+  const { api } = await open({ type: 'opencode', browserLogin: true, loginCommand: 'agn login opencode', browserLoginMethods: ['chatgpt', 'copilot'] });
+  await choose('subscription');
+  const chatgpt = host.querySelector<HTMLButtonElement>('[data-testid="agent-login-method-chatgpt"]')!;
+  expect(chatgpt.getAttribute('data-state')).toBe('on');
+  await act(async () => host.querySelector<HTMLButtonElement>('[data-testid="agent-login-method-copilot"]')!.click());
+  await click('Sign in to opencode');
+  expect(api.enqueueNodeCommand).toHaveBeenCalledWith('n1', 'login_start', { type: 'opencode', method: 'copilot' });
+});
+
+it('leaves an account choice this page does not know to the terminal', async () => {
+  await open({ type: 'opencode', browserLogin: true, loginCommand: 'agn login opencode', browserLoginMethods: ['someday'] });
+  await choose('subscription');
+  expect(host.querySelector('[data-testid="browser-agent-login"]')).toBeNull();
+  expect(codes()).toEqual(['agn login opencode', 'opencode auth login']);
+});
+
+it('shows step-by-step terminal sign-in for agents without a browser link', async () => {
+  await open({ type: 'hermes', loginCommand: 'agn login hermes' });
+  await choose('subscription');
+  expect(host.querySelector('[data-testid="manual-sign-in"]')).toBeTruthy();
+  expect(codes()).toEqual(['agn login hermes', 'hermes setup']);
+  expect(host.textContent).toContain(messages.agentSetup.manualTip.hermes);
+});
+
+it('points DeepSeek, which has no sign-in, to where its keys come from', async () => {
+  await open({ type: 'deepseek' });
+  await next();
+  expect(host.querySelector('[data-testid="agent-setup-auth-subscription"]')).toBeNull();
+  await choose('key');
+  expect(host.querySelector('[data-testid="agent-setup-key-link"] a')?.getAttribute('href')).toBe('https://platform.deepseek.com/api_keys');
+});
+
+it('puts the API key first for OpenCode and names its sign-in as another product\'s plan', async () => {
+  await open({ type: 'opencode', browserLogin: true, loginCommand: 'agn login opencode', browserLoginMethods: ['chatgpt', 'copilot'] });
+  await next();
+  const ids = [...host.querySelectorAll('[data-testid^="agent-setup-auth-"]')].map((el) => el.getAttribute('data-testid')).filter((id) => /-(key|subscription|later)$/.test(id!));
+  expect(ids).toEqual(['agent-setup-auth-key', 'agent-setup-auth-subscription', 'agent-setup-auth-later']);
+  expect(host.querySelector('#setup-api-key')).toBeTruthy();
+  expect(host.textContent).toContain(messages.agentSetup.subscriptionPlan);
+  expect(host.textContent).not.toContain(messages.agentSetup.subscriptionHint);
+});
+
+it('keeps the subscription first for Codex', async () => {
+  await open();
+  await next();
+  const ids = [...host.querySelectorAll('[data-testid^="agent-setup-auth-"]')].map((el) => el.getAttribute('data-testid')).filter((id) => /-(key|subscription|later)$/.test(id!));
+  expect(ids[0]).toBe('agent-setup-auth-subscription');
+  expect(host.querySelector('#setup-api-key')).toBeNull();
+});

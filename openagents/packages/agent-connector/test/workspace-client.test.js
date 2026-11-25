@@ -1,0 +1,379 @@
+'use strict';
+
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const { WorkspaceClient, SessionRevokedError } = require('../src/workspace-client');
+const http = require('http');
+
+describe('WorkspaceClient', () => {
+  it('constructs with default endpoint', () => {
+    const client = new WorkspaceClient();
+    assert.equal(client.endpoint, 'https://workspace-endpoint.openagents.org');
+  });
+
+  it('constructs with custom endpoint and strips trailing slash', () => {
+    const client = new WorkspaceClient('https://custom.api.com/');
+    assert.equal(client.endpoint, 'https://custom.api.com');
+  });
+
+  it('_wsHeaders returns correct auth headers', () => {
+    const client = new WorkspaceClient();
+    const headers = client._wsHeaders('test-token-123');
+    assert.equal(headers['Content-Type'], 'application/json');
+    assert.equal(headers['X-Workspace-Token'], 'test-token-123');
+  });
+
+  it('_post rejects on network error', async () => {
+    // Use a port that nothing is listening on
+    const client = new WorkspaceClient('http://127.0.0.1:19999');
+    await assert.rejects(
+      () => client._post('/v1/test', { foo: 'bar' }),
+      (err) => {
+        assert.ok(err.message.includes('ECONNREFUSED') || err.message.includes('connect'));
+        return true;
+      }
+    );
+  });
+
+  it('registerAgent builds correct request shape', async () => {
+    // We can't easily test the full HTTP flow without a server,
+    // but we can verify the method signature works
+    const client = new WorkspaceClient('http://127.0.0.1:19999');
+    await assert.rejects(
+      () => client.registerAgent('test-agent', { apiKey: 'sk-123' }),
+    );
+  });
+
+  it('createWorkspace builds correct url format', () => {
+    const client = new WorkspaceClient('https://workspace-endpoint.openagents.org/v1');
+    // Test the frontend URL derivation logic
+    const frontendUrl = client.endpoint
+      .replace('workspace-endpoint', 'workspace')
+      .replace('/v1', '');
+    assert.equal(frontendUrl, 'https://workspace.openagents.org');
+  });
+
+  it('SessionRevokedError is thrown when server returns session_revoked message', async () => {
+    // Spin up a one-shot HTTP server that returns the error shape.
+    const server = http.createServer((_req, res) => {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        code: 401,
+        message: 'session_revoked: another client is now running as this agent',
+      }));
+    });
+    await new Promise((r) => server.listen(0, r));
+    const port = server.address().port;
+    try {
+      const client = new WorkspaceClient(`http://127.0.0.1:${port}`);
+      let caught = null;
+      try {
+        await client._post('/v1/heartbeat', { agent_name: 'x', network: 'n', session_id: 'stale' });
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught, 'expected error to be thrown');
+      assert.ok(caught instanceof SessionRevokedError, 'expected SessionRevokedError');
+      assert.equal(caught.code, 'session_revoked');
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  it('removeMember rejects with the HTTP status, so a 404 reads as already gone', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 404, message: 'Member not found' }));
+    });
+    await new Promise((r) => server.listen(0, r));
+    const port = server.address().port;
+    try {
+      const client = new WorkspaceClient(`http://127.0.0.1:${port}`);
+      await assert.rejects(
+        () => client.removeMember('ws1', 'tok', 'gone-agent'),
+        (e) => e.status === 404 && e.message === 'Member not found',
+      );
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  it('sendEvent embeds session_id in event.metadata when provided', () => {
+    const client = new WorkspaceClient('http://127.0.0.1:19999');
+    // Capture what _post receives by stubbing it
+    let capturedBody = null;
+    client._post = async (_path, body) => { capturedBody = body; return { data: {} }; };
+    return client.sendEvent('ws-1', { type: 't', source: 's', target: 'ch' }, 'tok', 'sess-xyz')
+      .then(() => {
+        assert.equal(capturedBody.metadata.session_id, 'sess-xyz');
+        assert.equal(capturedBody.network, 'ws-1');
+      });
+  });
+
+  it('heartbeat includes session_id when provided', () => {
+    const client = new WorkspaceClient('http://127.0.0.1:19999');
+    let capturedBody = null;
+    client._post = async (_path, body) => { capturedBody = body; return { data: {} }; };
+    return client.heartbeat('ws-1', 'bary-bot', 'tok', 'sess-abc')
+      .then(() => {
+        assert.equal(capturedBody.agent_name, 'bary-bot');
+        assert.equal(capturedBody.network, 'ws-1');
+        assert.equal(capturedBody.session_id, 'sess-abc');
+      });
+  });
+
+  it('nodeHeartbeat forwards agents, runtimes and fs', () => {
+    const client = new WorkspaceClient('http://127.0.0.1:19999');
+    let capturedBody = null;
+    client._post = async (_path, body) => { capturedBody = body; return { data: {} }; };
+    return client.nodeHeartbeat('node-1', 'tok', {
+      hostname: 'sin1',
+      agents: [{ name: 'a', type: 'claude', status: 'running' }],
+      runtimes: [{ type: 'claude', installed: true }],
+      fs: { home: '/home/ubuntu', dirs: ['projects'] },
+    }).then(() => {
+      assert.equal(capturedBody.node_id, 'node-1');
+      assert.deepEqual(capturedBody.fs, { home: '/home/ubuntu', dirs: ['projects'] });
+      assert.equal(capturedBody.agents.length, 1);
+      assert.equal(capturedBody.runtimes.length, 1);
+    });
+  });
+
+  describe('pollPending server-side targeting', () => {
+    it('sends target_agents so the server pre-filters, and still client-filters', async () => {
+      const client = new WorkspaceClient('http://127.0.0.1:19999');
+      let capturedPath = null;
+      client._get = async (path) => {
+        capturedPath = path;
+        return { data: { events: [
+          // targeted at this agent → kept
+          { id: 'e1', source: 'human:user', target: 'channel/c', payload: { content: 'hi', message_type: 'chat' }, metadata: { target_agents: ['bary-bot'] } },
+          // targeted at someone else → dropped by client filter (server would
+          // normally exclude it too; included here to prove the safety net)
+          { id: 'e2', source: 'human:user', target: 'channel/c', payload: { content: 'other', message_type: 'chat' }, metadata: { target_agents: ['other'] } },
+        ], next_cursor: 'HEAD' } };
+      };
+
+      const { messages, cursor } = await client.pollPending('ws-1', 'bary-bot', 'tok', { after: 'x' });
+
+      assert.ok(capturedPath.includes('target_agents=bary-bot'), `expected target_agents in ${capturedPath}`);
+      assert.equal(cursor, 'HEAD');                       // uses server next_cursor
+      assert.equal(messages.length, 1);                   // client filter kept only ours
+      assert.equal(messages[0].messageId, 'e1');
+    });
+
+    it('falls back to last event id when the backend sends no next_cursor', async () => {
+      const client = new WorkspaceClient('http://127.0.0.1:19999');
+      client._get = async () => ({ data: { events: [
+        { id: 'e9', source: 'human:user', target: 'channel/c', payload: { content: 'hi', message_type: 'chat' }, metadata: { target_agents: ['bary-bot'] } },
+      ] } });  // no next_cursor (older backend)
+
+      const { cursor } = await client.pollPending('ws-1', 'bary-bot', 'tok', {});
+      assert.equal(cursor, 'e9');
+    });
+  });
+
+  describe('getRecentMessages', () => {
+    // OA-026: agent progress events must not eat the history window.
+    it('excludes agent progress events server-side by default', async () => {
+      const client = new WorkspaceClient('http://127.0.0.1:19999');
+      let capturedPath = null;
+      client._get = async (path) => { capturedPath = path; return { data: { events: [] } }; };
+
+      await client.getRecentMessages('ws-1', 'c', 'tok', 100, { before: 'e5' });
+
+      const params = new URL(capturedPath, 'http://x').searchParams;
+      assert.equal(params.get('exclude_message_types'), 'status,thinking,todos,loading');
+      assert.equal(params.get('before'), 'e5');
+      assert.equal(params.get('limit'), '100');
+    });
+
+    it('sends no exclusion when excludeMessageTypes is empty', async () => {
+      const client = new WorkspaceClient('http://127.0.0.1:19999');
+      let capturedPath = null;
+      client._get = async (path) => { capturedPath = path; return { data: { events: [] } }; };
+
+      await client.getRecentMessages('ws-1', 'c', 'tok', 30, { excludeMessageTypes: '' });
+
+      assert.ok(!capturedPath.includes('exclude_message_types'), capturedPath);
+    });
+  });
+});
+
+// Regression guard for the "online but deaf" wedge: a request whose socket
+// never receives a response must reject within its deadline instead of hanging
+// forever and stalling the caller's single poll loop. (AbortSignal.timeout ALSO
+// covers the DNS/connect phase, which the socket `timeout` option cannot —
+// it is not armed until a socket exists — but exercising that needs real
+// unroutable network state, which isn't hermetic across CI platforms. The
+// deterministic local case below is what we assert; the DNS/connect rationale
+// lives in the workspace-client.js comment.)
+describe('WorkspaceClient request deadlines', () => {
+  it('_get rejects promptly when the server accepts but never responds', { timeout: 10000 }, async () => {
+    const server = http.createServer(() => { /* intentionally never respond */ });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    const client = new WorkspaceClient(`http://127.0.0.1:${port}`);
+    const start = Date.now();
+    try {
+      // Says what happened. The deadline used to surface as a bare
+      // "AbortError: The operation was aborted", which reads like a cancel.
+      await assert.rejects(() => client._get('/v1/events', {}, 400), (err) => {
+        assert.equal(err.message, 'Request timed out after 400ms');
+        assert.equal(err.code, 'ETIMEDOUT');
+        return true;
+      });
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 5000, `expected reject within 5s, took ${elapsed}ms`);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('_get errors carry the HTTP status, including a proxy\'s HTML error page', async () => {
+    const server = http.createServer((req, res) => {
+      if (req.url === '/json') {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ message: 'database unavailable' }));
+      } else {
+        res.writeHead(502, { 'Content-Type': 'text/html' });
+        res.end('<html>Bad Gateway</html>');
+      }
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const client = new WorkspaceClient(`http://127.0.0.1:${server.address().port}`);
+    try {
+      await assert.rejects(() => client._get('/json'), { message: 'database unavailable', status: 503 });
+      await assert.rejects(() => client._get('/html'), (err) => {
+        assert.equal(err.status, 502);
+        assert.match(err.message, /^Invalid response: <html>/);
+        return true;
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  // The other way a request never settles, and the one that silenced a
+  // daemon's control poller for days: the response STARTS, then the
+  // connection closes before the body is complete (a backend restarting
+  // mid-reply, a proxy losing its upstream). Node raises that on the response
+  // only, so a helper that waits for 'end' hangs — past its own deadline,
+  // because by then the abort signal has nothing left to destroy.
+  const cutOff = {
+    'closes cleanly mid-body': (res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '500' });
+      res.write('{"data":{"events":[');
+      setTimeout(() => res.socket.end(), 20);
+    },
+    'is reset mid-body': (res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.write('{"data":{"events":[');
+      setTimeout(() => res.socket.destroy(), 20);
+    },
+  };
+  const requests = {
+    _get: (client) => client._get('/v1/events', {}, 400),
+    _getRaw: (client) => client._getRaw('/v1/files/x', {}, 400),
+    _post: (client) => client._post('/v1/events', { a: 1 }, {}, 400),
+    _put: (client) => client._put('/v1/todos', { a: 1 }, {}, 400),
+    _patch: (client) => client._patch('/v1/members/x', { a: 1 }, {}, 400),
+    _delete: (client) => client._delete('/v1/workspaces/x', {}),
+  };
+  for (const [how, respond] of Object.entries(cutOff)) {
+    for (const [method, send] of Object.entries(requests)) {
+      it(`${method} rejects when the response ${how}`, { timeout: 10000 }, async () => {
+        const server = http.createServer((_req, res) => respond(res));
+        await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const client = new WorkspaceClient(`http://127.0.0.1:${server.address().port}`);
+        try {
+          const outcome = await Promise.race([
+            send(client).then(() => 'resolved', () => 'rejected'),
+            new Promise((resolve) => setTimeout(() => resolve('never settled'), 3000)),
+          ]);
+          assert.equal(outcome, 'rejected');
+        } finally {
+          server.closeAllConnections();
+          await new Promise((resolve) => server.close(resolve));
+        }
+      });
+    }
+  }
+});
+
+describe('WorkspaceClient.updateRoutine', () => {
+  const capture = () => {
+    const client = new WorkspaceClient('http://127.0.0.1:19999');
+    const seen = {};
+    client._patch = async (path, body) => {
+      seen.path = path;
+      seen.body = body;
+      return { data: { id: 'r1' } };
+    };
+    return { client, seen };
+  };
+
+  it('PATCHes the routine and sends only the fields given', async () => {
+    const { client, seen } = capture();
+    await client.updateRoutine('ws-1', 'tok', 'r1', { name: 'Renamed' });
+    assert.equal(seen.path, '/v1/routines/r1');
+    assert.deepEqual(seen.body, { network: 'ws-1', name: 'Renamed' });
+  });
+
+  it('keeps the schedule modes exclusive', async () => {
+    const { client, seen } = capture();
+    await client.updateRoutine('ws-1', 'tok', 'r1', { interval_minutes: 30, hour: 9, minute: 0 });
+    assert.equal(seen.body.interval_minutes, 30);
+    assert.ok(!('hour' in seen.body), 'hour must not ride along in interval mode');
+    assert.ok(!('minute' in seen.body), 'minute must not ride along in interval mode');
+  });
+
+  it('sends a days-only edit without inventing a time', async () => {
+    const { client, seen } = capture();
+    await client.updateRoutine('ws-1', 'tok', 'r1', { days: [0, 4] });
+    assert.deepEqual(seen.body, { network: 'ws-1', days: [0, 4] });
+  });
+
+  it('forwards a pause', async () => {
+    const { client, seen } = capture();
+    await client.updateRoutine('ws-1', 'tok', 'r1', { status: 'paused' });
+    assert.deepEqual(seen.body, { network: 'ws-1', status: 'paused' });
+  });
+});
+
+describe('reliable message delivery', () => {
+  it('preserves HTTP status for HTML 503 responses', async () => {
+    const server = http.createServer((req, res) => { res.writeHead(503, { 'Content-Type': 'text/html' }); res.end('<html>Unavailable</html>'); });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const client = new WorkspaceClient(`http://127.0.0.1:${server.address().port}`);
+      await assert.rejects(client.sendMessage('ws', 'general', 'token', 'answer'), e => e.status === 503);
+    } finally { server.close(); }
+  });
+  it('includes delivery keys for channel messages and DMs', async () => {
+    const client = new WorkspaceClient(); const events = [];
+    client.sendEvent = async (ws, event) => events.push(event);
+    for (const channel of ['general', 'dm:human:person@example.com']) {
+      await client.sendMessage('ws', channel, 'token', 'answer', { idempotencyKey: 'key' });
+    }
+    assert.ok(events.every(e => e.idempotency_key === 'key'));
+  });
+  it('detects old servers without assuming safe retry support', async () => {
+    const client = new WorkspaceClient();
+    client._get = async () => { throw Object.assign(new Error('Not Found'), { status: 404 }); };
+    assert.equal(await client.supportsMessageDelivery(), false);
+  });
+});
+
+describe('WorkspaceClient routine conversation links', () => {
+  it('retains the originating conversation separately from background execution', async () => {
+    const client = new WorkspaceClient('http://127.0.0.1:19999');
+    let body;
+    client._post = async (_path, value) => { body = value; return { data: { id: 'r1' } }; };
+    await client.createRoutine('ws-1', 'team-thread', 'tok', { name: 'Feedback', message: 'Check feedback', interval_minutes: 60, source: 'claude' });
+    assert.equal(body.source_channel, 'team-thread');
+    assert.equal(body.channel, 'team-thread');
+    await client.createRoutine('ws-1', 'routines:claude', 'tok', { name: 'Feedback', message: 'Check feedback', interval_minutes: 60, source: 'claude' });
+    assert.equal(body.source_channel, undefined);
+  });
+});

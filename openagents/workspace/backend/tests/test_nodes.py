@@ -1,0 +1,490 @@
+# -*- coding: utf-8 -*-
+"""Tests for the connect-a-node flow: pairing codes + node register/heartbeat."""
+
+from datetime import datetime, timedelta, timezone
+
+from app.models import NodePairingCode, Workspace
+import pytest
+import app.access as access
+
+@pytest.fixture(autouse=True)
+def pairing_identity(monkeypatch):
+    monkeypatch.setattr(access, 'verify_identity_claims', lambda token: {
+        'provider': 'firebase', 'email': 'a@x.com', 'firebase_uid': 'a@x.com',
+        'apple_sub': None, 'display_name': 'Owner'
+    } if token == 'owner' else None)
+
+def _owner():
+    return {'Authorization': 'Bearer owner'}
+
+
+def _make_workspace(client, name="WS"):
+    r = client.post("/v1/workspaces", json={"name": name, "creator_email": "a@x.com"})
+    assert r.status_code == 200
+    return r.json()["data"]  # {workspaceId, slug, name, token, ...}
+
+
+def _tok(token):
+    return {"X-Workspace-Token": token}
+
+
+class TestPairingCode:
+    def test_create_with_identity(self, client):
+        ws = _make_workspace(client)
+        r = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner())
+        assert r.status_code == 200
+        data = r.json()["data"]
+        assert "-" in data["code"] and data["expiresInSeconds"] == 1800
+
+    def test_create_requires_privilege(self, client):
+        ws = _make_workspace(client)
+        # No token, no identity → not owner/admin → denied.
+        r = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes")
+        assert r.status_code in (401, 403)
+
+
+class TestPairingCodeStatus:
+    def _code(self, client, ws):
+        return client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+
+    def _status(self, client, ws, code, headers=None):
+        return client.get(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes/{code}",
+                          headers=_owner() if headers is None else headers)
+
+    def test_pending_then_redeemed(self, client):
+        ws = _make_workspace(client)
+        code = self._code(client, ws)
+        r = self._status(client, ws, code)
+        assert r.status_code == 200
+        data = r.json()["data"]
+        assert data["redeemed"] is False and data["nodeId"] is None and data["expired"] is False
+
+        node_id = client.post("/v1/nodes/redeem", json={"code": code, "node_key": "dev-s"}).json()["data"]["nodeId"]
+        data = self._status(client, ws, code.lower().replace("-", "")).json()["data"]
+        assert data["redeemed"] is True and data["nodeId"] == node_id and data["redeemedAt"]
+
+    def test_repair_of_known_device_is_reported(self, client):
+        """The case a node-list watch misses: the same device, the same node id."""
+        ws = _make_workspace(client)
+        first = client.post("/v1/nodes/redeem", json={"code": self._code(client, ws), "node_key": "dev-r"}).json()["data"]
+        code = self._code(client, ws)
+        again = client.post("/v1/nodes/redeem", json={"code": code, "node_key": "dev-r"}).json()["data"]
+        assert again["nodeId"] == first["nodeId"]
+        data = self._status(client, ws, code).json()["data"]
+        assert data["redeemed"] is True and data["nodeId"] == first["nodeId"]
+
+    def test_expired_code(self, client, db):
+        ws = _make_workspace(client)
+        code = self._code(client, ws)
+        pc = db.query(NodePairingCode).filter_by(code=code.replace("-", "")).one()
+        pc.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+        assert self._status(client, ws, code).json()["data"]["expired"] is True
+
+    def test_requires_identity_and_hides_unknown(self, client):
+        ws = _make_workspace(client)
+        code = self._code(client, ws)
+        assert self._status(client, ws, code, headers={}).status_code in (401, 403)
+        assert self._status(client, ws, "ZZZZ-ZZZZ").status_code == 404
+
+
+class TestRedeem:
+    def test_redeem_registers_node_and_returns_token(self, client):
+        ws = _make_workspace(client)
+        code = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+        r = client.post("/v1/nodes/redeem", json={
+            "code": code, "node_key": "dev-abc", "hostname": "mbp", "device_type": "laptop", "os": "darwin",
+        })
+        assert r.status_code == 200
+        data = r.json()["data"]
+        # New contract (pairing-first): redeem mints a PER-NODE token, not the
+        # shared workspace credential. It must still be accepted everywhere —
+        # covered by test_node_tokens.py's verify⇔resolve invariant.
+        assert data["token"] and data["token"] != ws["token"]
+        assert data["workspaceId"] == ws["workspaceId"]
+        assert data["nodeId"]
+
+    def test_redeem_is_single_use(self, client):
+        ws = _make_workspace(client)
+        code = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+        assert client.post("/v1/nodes/redeem", json={"code": code, "node_key": "d1"}).status_code == 200
+        r2 = client.post("/v1/nodes/redeem", json={"code": code, "node_key": "d1"})
+        assert r2.status_code == 409
+
+    def test_redeem_invalid_code(self, client):
+        r = client.post("/v1/nodes/redeem", json={"code": "ZZZZ-ZZZZ", "node_key": "d1"})
+        assert r.status_code == 404
+
+    def test_redeem_expired_code(self, client, db):
+        ws = _make_workspace(client)
+        past = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.add(NodePairingCode(code="EXPIRED1", workspace_id=ws["workspaceId"], expires_at=past))
+        db.commit()
+        r = client.post("/v1/nodes/redeem", json={"code": "EXPIRED1", "node_key": "d1"})
+        assert r.status_code == 410
+
+    def test_redeem_normalizes_and_upserts(self, client):
+        ws = _make_workspace(client)
+        code = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+        node1 = client.post("/v1/nodes/redeem", json={"code": code, "node_key": "same"}).json()["data"]["nodeId"]
+        # A second code for the same device key → same node row (upsert).
+        code2 = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+        node2 = client.post("/v1/nodes/redeem", json={"code": code2.lower(), "node_key": "same"}).json()["data"]["nodeId"]
+        assert node1 == node2
+
+
+class TestHeartbeatAndList:
+    def test_heartbeat_and_list(self, client):
+        ws = _make_workspace(client)
+        code = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+        connection = client.post("/v1/nodes/redeem", json={
+            "code": code, "node_key": "d1", "hostname": "mbp", "device_type": "laptop",
+        }).json()["data"]
+        node_id, ws['device_token'] = connection['nodeId'], connection['token']
+
+        # Redeeming is not reporting in: the device is offline until its daemon
+        # sends a heartbeat, so setup cannot move on with nothing running.
+        listed = client.get(f"/v1/nodes?network={ws['workspaceId']}", headers=_owner()).json()["data"]
+        assert listed[0]["status"] == "offline" and listed[0]["lastHeartbeatAt"] is None
+
+        hb = client.post("/v1/nodes/heartbeat", json={"node_id": node_id}, headers=_tok(ws["device_token"]))
+        assert hb.status_code == 200 and hb.json()["data"]["status"] == "online"
+
+        listed = client.get(f"/v1/nodes?network={ws['workspaceId']}", headers=_owner()).json()["data"]
+        assert len(listed) == 1
+        assert listed[0]["deviceType"] == "laptop" and listed[0]["status"] == "online"
+
+    def test_delete_node(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        # Privilege required.
+        assert client.delete(f"/v1/nodes/{node_id}").status_code in (401, 403)
+        # Owner/admin (workspace token) can remove it.
+        r = client.delete(f"/v1/nodes/{node_id}", headers=_tok(ws["device_token"]))
+        assert r.status_code == 200 and r.json()["data"]["removed"] is True
+        listed = client.get(f"/v1/nodes?network={ws['workspaceId']}", headers=_owner()).json()["data"]
+        assert listed == []
+
+    def test_heartbeat_wrong_token_rejected(self, client):
+        ws = _make_workspace(client)
+        code = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+        node_id = client.post("/v1/nodes/redeem", json={"code": code, "node_key": "d1"}).json()["data"]["nodeId"]
+        r = client.post("/v1/nodes/heartbeat", json={"node_id": node_id}, headers=_tok("wrong-token"))
+        assert r.status_code == 401
+
+    def test_heartbeat_reports_agent_roster(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        roster = [{"name": "coder", "type": "claude", "status": "running"}]
+        client.post("/v1/nodes/heartbeat", json={"node_id": node_id, "agents": roster}, headers=_tok(ws["device_token"]))
+        listed = client.get(f"/v1/nodes?network={ws['workspaceId']}", headers=_owner()).json()["data"]
+        assert listed[0]["agents"] == roster
+
+
+def _connect_node(client, ws, node_key="d1"):
+    code = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+    connection = client.post("/v1/nodes/redeem", json={"code": code, "node_key": node_key}).json()["data"]
+    ws['device_token'] = connection['token']
+    return connection['nodeId']
+
+
+class TestNodeCommands:
+    def test_enqueue_requires_privilege(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "create_agent", "args": {"name": "x", "type": "claude"}})
+        assert r.status_code in (401, 403)
+
+    def test_enqueue_rejects_unknown_action(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "rm_rf", "args": {"name": "x"}}, headers=_tok(ws["device_token"]))
+        assert r.status_code == 400
+
+    def test_enqueue_requires_name_and_type(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        assert client.post(f"/v1/nodes/{node_id}/commands", json={"action": "create_agent", "args": {"type": "claude"}}, headers=_tok(ws["device_token"])).status_code == 400
+        assert client.post(f"/v1/nodes/{node_id}/commands", json={"action": "create_agent", "args": {"name": "x"}}, headers=_tok(ws["device_token"])).status_code == 400
+
+    def test_command_delivered_on_heartbeat_then_result(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        # Enqueue with an API key in the args.
+        enq = client.post(
+            f"/v1/nodes/{node_id}/commands",
+            json={"action": "create_agent", "args": {"name": "coder", "type": "claude", "apiKey": "sk-secret"}},
+            headers=_tok(ws["device_token"]),
+        ).json()["data"]
+        cmd_id = enq["commandId"]
+        assert enq["status"] == "pending"
+
+        # Daemon heartbeats → receives the command with raw args (incl. the key).
+        hb = client.post("/v1/nodes/heartbeat", json={"node_id": node_id}, headers=_tok(ws["device_token"])).json()["data"]
+        assert len(hb["commands"]) == 1
+        delivered = hb["commands"][0]
+        assert delivered["commandId"] == cmd_id
+        assert delivered["args"]["apiKey"] == "sk-secret"
+
+        # Same command is not delivered twice.
+        hb2 = client.post("/v1/nodes/heartbeat", json={"node_id": node_id}, headers=_tok(ws["device_token"])).json()["data"]
+        assert hb2["commands"] == []
+
+        # Daemon posts the result.
+        res = client.post(f"/v1/nodes/commands/{cmd_id}/result", json={"ok": True, "message": "created"}, headers=_tok(ws["device_token"]))
+        assert res.status_code == 200 and res.json()["data"]["status"] == "done"
+
+        # History no longer exposes the API key.
+        hist = client.get(f"/v1/nodes/{node_id}/commands", headers=_tok(ws["device_token"])).json()["data"]
+        assert hist[0]["status"] == "done"
+        assert "args" not in hist[0]
+        # A page opened later can show and refill the add, without the key.
+        assert hist[0]["agentType"] == "claude"
+        assert hist[0]["draft"] == {"name": "coder", "type": "claude"}
+
+    def test_create_history_keeps_only_safe_draft_fields(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        args = {"name": "coder", "type": "codex", "workingDir": "/work", "model": "gpt-5", "codexWireApi": "chat",
+                "apiKey": "sk-secret", "baseUrl": "https://relay.example/v1", "config": {"SK": "secret"}}
+        client.post(f"/v1/nodes/{node_id}/commands", json={"action": "create_agent", "args": args}, headers=_tok(ws["device_token"]))
+        hist = client.get(f"/v1/nodes/{node_id}/commands", headers=_tok(ws["device_token"])).json()["data"]
+        assert hist[0]["draft"] == {"name": "coder", "type": "codex", "workingDir": "/work", "model": "gpt-5", "codexWireApi": "chat"}
+        assert "secret" not in str(hist[0])
+
+    def test_device_credential_key_command_is_owner_only(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        url = f"/v1/nodes/{node_id}/commands"
+        body = {"action": "credential_key", "args": {}}
+        assert client.post(url, json=body).status_code in (401, 403)
+        assert client.post(url, json=body, headers=_tok(ws["device_token"])).status_code == 200
+
+    def test_browser_sign_in_is_owner_only_and_requires_encrypted_codes(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        url = f"/v1/nodes/{node_id}/commands"
+        for action, args in (("login_start", {"type": "claude"}), ("login_status", {"sessionId": "session"}), ("login_cancel", {"sessionId": "session"})):
+            body = {"action": action, "args": args}
+            assert client.post(url, json=body).status_code in (401, 403)
+            assert client.post(url, json=body, headers=_tok(ws["device_token"])).status_code == 200
+        assert client.post(url, json={"action": "login_start", "args": {"type": "shell"}}, headers=_tok(ws["device_token"])).status_code == 400
+        for args in ({"type": "cursor"}, {"type": "opencode", "method": "chatgpt"}, {"type": "opencode", "method": "copilot"}):
+            assert client.post(url, json={"action": "login_start", "args": args}, headers=_tok(ws["device_token"])).status_code == 200
+        for args in ({"type": "opencode"}, {"type": "opencode", "method": "anthropic"}, {"type": "claude", "method": "copilot"}, {"type": "deepseek"}):
+            assert client.post(url, json={"action": "login_start", "args": args}, headers=_tok(ws["device_token"])).status_code == 400
+        assert client.post(url, json={"action": "login_input", "args": {"sessionId": "session", "config": {"code": "plaintext"}}}, headers=_tok(ws["device_token"])).status_code == 400
+        encrypted = {"sessionId": "session", "encryptedCredentials": {"algorithm": "RSA-OAEP-256+A256GCM", "ciphertext": "opaque"}}
+        assert client.post(url, json={"action": "login_input", "args": encrypted}, headers=_tok(ws["device_token"])).status_code == 200
+
+    def test_encrypted_setup_is_relayed_without_resolving_a_server_key(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        envelope = {"algorithm": "RSA-OAEP-256+A256GCM", "ciphertext": "opaque-browser-ciphertext"}
+        args = {"name": "sealed", "type": "claude", "encryptedCredentials": envelope}
+        url = f"/v1/nodes/{node_id}/commands"
+        assert client.post(url, json={"action": "create_agent", "args": args}, headers=_tok(ws["device_token"])).status_code == 200
+        hb = client.post("/v1/nodes/heartbeat", json={"node_id": node_id}, headers=_tok(ws["device_token"])).json()["data"]
+        assert hb["commands"][0]["args"] == args
+        for field, value in (("apiKey", "secret"), ("config", {}), ("modelAccessId", "saved-key")):
+            assert client.post(url, json={"action": "create_agent", "args": {**args, field: value}}, headers=_tok(ws["device_token"])).status_code == 400
+
+    def test_result_wrong_token_rejected(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        cmd_id = client.post(
+            f"/v1/nodes/{node_id}/commands",
+            json={"action": "stop_agent", "args": {"name": "coder"}},
+            headers=_tok(ws["device_token"]),
+        ).json()["data"]["commandId"]
+        r = client.post(f"/v1/nodes/commands/{cmd_id}/result", json={"ok": True}, headers=_tok("wrong"))
+        assert r.status_code == 401
+
+    def test_detect_runtimes_needs_no_agent_name(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "detect_runtimes", "args": {}}, headers=_tok(ws["device_token"]))
+        assert r.status_code == 200 and r.json()["data"]["action"] == "detect_runtimes"
+
+    def test_probe_agent_accepts_type_or_name_but_not_neither(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        hdr = _tok(ws["device_token"])
+        # Neither type nor name → rejected.
+        assert client.post(f"/v1/nodes/{node_id}/commands", json={"action": "probe_agent", "args": {}}, headers=hdr).status_code == 400
+        # A bare type is enough (smoke-test a runtime with no agent yet).
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "probe_agent", "args": {"type": "claude"}}, headers=hdr)
+        assert r.status_code == 200 and r.json()["data"]["action"] == "probe_agent"
+        # An agent name alone also works (the daemon resolves its type).
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "probe_agent", "args": {"name": "coder"}}, headers=hdr)
+        assert r.status_code == 200
+
+    def test_list_models_needs_an_agent_name(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        hdr = _tok(ws["device_token"])
+        assert client.post(f"/v1/nodes/{node_id}/commands", json={"action": "list_models", "args": {}}, headers=hdr).status_code == 400
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "list_models", "args": {"name": "coder"}}, headers=hdr)
+        assert r.status_code == 200 and r.json()["data"]["action"] == "list_models"
+
+
+class TestNodeRuntimes:
+    def test_heartbeat_reports_runtimes(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        runtimes = [
+            {"type": "claude", "installed": True, "ready": True, "version": "1.2.3", "reason": "ready"},
+            {"type": "codex", "installed": False, "ready": False, "reason": "not_installed"},
+        ]
+        client.post("/v1/nodes/heartbeat", json={"node_id": node_id, "runtimes": runtimes}, headers=_tok(ws["device_token"]))
+        listed = client.get(f"/v1/nodes?network={ws['workspaceId']}", headers=_owner()).json()["data"]
+        assert listed[0]["runtimes"] == runtimes
+
+    def test_heartbeat_reports_fs(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        fs = {"home": "D:\\Users\\alice", "dirs": ["projects", "work"], "roots": ["C:\\", "D:\\"]}
+        client.post("/v1/nodes/heartbeat", json={"node_id": node_id, "fs": fs}, headers=_tok(ws["device_token"]))
+        listed = client.get(f"/v1/nodes?network={ws['workspaceId']}", headers=_owner()).json()["data"]
+        assert listed[0]["fs"] == fs
+
+    def test_list_dir_command_no_agent_name(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "list_dir", "args": {"path": "/home"}}, headers=_tok(ws["device_token"]))
+        assert r.status_code == 200 and r.json()["data"]["action"] == "list_dir"
+        # Daemon reports back folder data.
+        cmd_id = r.json()["data"]["commandId"]
+        res = client.post(f"/v1/nodes/commands/{cmd_id}/result", json={"ok": True, "data": {"path": "/home", "parent": "/", "dirs": ["ubuntu"]}}, headers=_tok(ws["device_token"]))
+        assert res.status_code == 200
+        hist = client.get(f"/v1/nodes/{node_id}/commands", headers=_tok(ws["device_token"])).json()["data"]
+        assert hist[0]["result"]["data"]["dirs"] == ["ubuntu"]
+
+
+class TestListLocalSessions:
+    """The device owner's own past CLI sessions are private: only that person,
+    signed in, may ask the device to list them."""
+
+    def test_owner_lists_sessions_and_reads_the_result(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "list_local_sessions", "args": {"type": "codex"}}, headers=_owner())
+        assert r.status_code == 200, r.text
+        cmd_id = r.json()["data"]["commandId"]
+        sessions = [{"id": "s1", "type": "codex", "title": "Add pagination", "cwd": "/work/api", "updatedAt": "2026-11-02T09:00:00Z", "messageCount": 2}]
+        assert client.post(f"/v1/nodes/commands/{cmd_id}/result", json={"ok": True, "data": {"type": "codex", "sessions": sessions}},
+                           headers=_tok(ws["device_token"])).status_code == 200
+        hist = client.get(f"/v1/nodes/{node_id}/commands", headers=_owner()).json()["data"]
+        assert hist[0]["result"]["data"]["sessions"] == sessions
+
+    def test_machine_credentials_cannot_list_sessions(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "list_local_sessions", "args": {"type": "claude"}}, headers=_tok(ws["device_token"]))
+        assert r.status_code == 403
+
+    def test_only_supported_types(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = client.post(f"/v1/nodes/{node_id}/commands", json={"action": "list_local_sessions", "args": {"type": "aider"}}, headers=_owner())
+        assert r.status_code == 400
+
+
+def _soft_delete(db, workspace_id):
+    ws = db.query(Workspace).filter(Workspace.id == workspace_id).one()
+    ws.status = "deleted"
+    db.commit()
+
+
+class TestDeletedWorkspaceRefusesNodes:
+    """A soft-deleted workspace's token (shared or per-node) must not keep a
+    daemon heartbeating or reporting results into it."""
+
+    def test_heartbeat_refused_after_delete(self, client, db):
+        ws = _make_workspace(client)
+        code = client.post(f"/v1/workspaces/{ws['workspaceId']}/pairing-codes", headers=_owner()).json()["data"]["code"]
+        redeemed = client.post("/v1/nodes/redeem", json={"code": code, "node_key": "d1"}).json()["data"]
+        node_id = redeemed["nodeId"]
+        assert client.post("/v1/nodes/heartbeat", json={"node_id": node_id}, headers=_tok(redeemed["token"])).status_code == 200
+
+        _soft_delete(db, ws["workspaceId"])
+
+        r = client.post("/v1/nodes/heartbeat", json={"node_id": node_id}, headers=_tok(ws["token"]))
+        assert r.status_code == 404
+        # The node's own token is refused too.
+        r = client.post("/v1/nodes/heartbeat", json={"node_id": node_id}, headers=_tok(redeemed["token"]))
+        assert r.status_code == 404
+
+    def test_command_result_refused_after_delete(self, client, db):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        cmd_id = client.post(
+            f"/v1/nodes/{node_id}/commands",
+            json={"action": "stop_agent", "args": {"name": "coder"}},
+            headers=_owner(),
+        ).json()["data"]["commandId"]
+
+        _soft_delete(db, ws["workspaceId"])
+
+        r = client.post(f"/v1/nodes/commands/{cmd_id}/result", json={"ok": True}, headers=_tok(ws["token"]))
+        assert r.status_code == 404
+
+
+class TestAgentNameCheck:
+    def _check(self, client, ws, node_id, name, headers=None):
+        return client.get(
+            f"/v1/nodes/{node_id}/agent-name",
+            params={"name": name},
+            headers=headers if headers is not None else _tok(ws["device_token"]),
+        )
+
+    def test_free_name_is_available(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = self._check(client, ws, node_id, "fresh-bot")
+        assert r.status_code == 200
+        assert r.json()["data"] == {"name": "fresh-bot", "available": True, "reason": None}
+
+    def test_blank_name_is_rejected(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = self._check(client, ws, node_id, "   ")
+        assert r.status_code == 400
+
+    def test_name_on_this_device_is_taken(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        roster = [{"name": "coder", "type": "claude", "status": "running"}]
+        client.post("/v1/nodes/heartbeat", json={"node_id": node_id, "agents": roster}, headers=_tok(ws["device_token"]))
+        data = self._check(client, ws, node_id, "coder").json()["data"]
+        assert data["available"] is False and data["reason"] == "on_device"
+
+    def test_name_held_by_another_connection_is_taken(self, client, db):
+        from app.models import WorkspaceMember
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        # A member the device does not know about — e.g. another person's
+        # personal agent, which discovery hides from this viewer.
+        db.add(WorkspaceMember(workspace_id=ws["workspaceId"], agent_name="private-bot", agent_type="claude", status="online"))
+        db.commit()
+        data = self._check(client, ws, node_id, "private-bot").json()["data"]
+        assert data["available"] is False and data["reason"] == "workspace"
+        # And create_agent refuses it for the same reason.
+        r = client.post(
+            f"/v1/nodes/{node_id}/commands",
+            json={"action": "create_agent", "args": {"name": "private-bot", "type": "claude"}},
+            headers=_tok(ws["device_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_requires_connection_access(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        assert self._check(client, ws, node_id, "x", headers={}).status_code in (401, 403)
+
+    def test_devices_alias(self, client):
+        ws = _make_workspace(client)
+        node_id = _connect_node(client, ws)
+        r = client.get(f"/v1/devices/{node_id}/agent-name", params={"name": "x"}, headers=_tok(ws["device_token"]))
+        assert r.status_code == 200
+

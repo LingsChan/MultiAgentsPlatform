@@ -1,0 +1,268 @@
+'use client';
+
+import { memo, type ReactNode, useMemo, isValidElement, cloneElement } from 'react';
+import ReactMarkdown, { type Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import type { Root } from 'mdast';
+import { getAgentColor } from '@/lib/helpers';
+import { cn } from '@/lib/utils';
+import { MarkdownCodeBlock } from './markdown-code-block';
+import { MermaidBlock } from './mermaid-block';
+import { getMermaidSource, hasOpenMermaidFence } from './mermaid-utils';
+import { MarkdownImage } from './markdown-image';
+import { Separator } from '@/components/ui/separator';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+
+// Stable plugin arrays — avoids re-creating on every render
+const remarkPlugins = [remarkGfm];
+
+/** Parse the full Markdown first so shortening it never breaks a fence or link. */
+function remarkExcerpt({ limit }: { limit: number }) {
+  return (tree: Root) => {
+    const firstHidden = tree.children.findIndex(node => (node.position?.end.offset ?? 0) > limit);
+    if (firstHidden === -1) return;
+    const block = tree.children[firstHidden];
+    let visible = Math.max(1, firstHidden);
+    if (block.type === 'paragraph' && (block.position?.start.offset ?? 0) < limit) {
+      const boundary = block.children.findIndex(child => (child.position?.end.offset ?? 0) > limit);
+      if (boundary !== -1) {
+        const inline = block.children[boundary];
+        const start = inline.position?.start.offset ?? limit;
+        const children = block.children.slice(0, boundary);
+        if (inline.type === 'text' && start < limit) {
+          const excerpt = inline.value.slice(0, limit - start).replace(/[\uD800-\uDBFF]$/, '').trimEnd();
+          children.push({ type: 'text', value: `${excerpt}…` });
+        }
+        if (children.length) {
+          block.children = children;
+          visible = firstHidden + 1;
+        }
+      }
+    }
+    tree.children = [
+      ...tree.children.slice(0, visible),
+      ...tree.children.slice(visible).filter(node => node.type === 'definition'),
+    ];
+  };
+}
+
+interface MarkdownContentProps {
+  content: string;
+  agentNames: string[];
+  excerptLimit?: number;
+  textOnlyImages?: boolean;
+  /** agentName → display label; mentions render as @<label> (Slack-style)
+   * while the underlying text keeps the ASCII agent name. */
+  agentLabels?: Record<string, string>;
+  /** Stable human mention handles mapped to display names. */
+  humanNames?: Record<string, string>;
+  /** The viewer's own mention handle (their email). Mentions of it render
+   * with a stronger, Slack-style highlight. */
+  selfMention?: string;
+}
+
+/** Render human and agent handles in prose, preserving code and links. */
+function renderMentions(children: ReactNode, agentNames: string[], agentLabels?: Record<string, string>, humanNames: Record<string, string> = {}, selfMention?: string): ReactNode {
+  const self = selfMention && !humanNames[selfMention] ? { [selfMention]: selfMention } : {};
+  humanNames = { ...humanNames, ...self };
+  const names = [...agentNames, ...Object.keys(humanNames)].sort((a, b) => b.length - a.length);
+  if (!children) return children;
+
+  const escaped = names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  escaped.push('[aA][lL][lL]');
+  const mentionRegex = new RegExp(`(?<![\\p{L}\\p{N}_@.-])(@(?:${escaped.join('|')}))(?![\\p{L}\\p{N}_@-]|\\.[\\p{L}\\p{N}])`, 'gu');
+
+  let keyCounter = 0;
+
+  const processNode = (node: ReactNode): ReactNode => {
+    if (typeof node === 'string') {
+      const parts = node.split(mentionRegex);
+      if (parts.length === 1) return node;
+      return parts.map((part) => {
+        keyCounter++;
+        if (part.startsWith('@') && (names.includes(part.slice(1)) || part.toLowerCase() === '@all')) {
+          const name = part.slice(1);
+          const color = getAgentColor(name, agentNames);
+          return (
+            <span
+              key={`mention-${keyCounter}`}
+              title={name}
+              data-mention={name}
+              data-self-mention={selfMention && name === selfMention ? 'true' : undefined}
+              className={cn(
+                'font-medium rounded px-0.5',
+                selfMention && name === selfMention
+                  ? 'bg-warning/20 text-warning'
+                  : (humanNames[name] || name.toLowerCase() === 'all') ? 'bg-muted text-foreground' : color.text,
+              )}
+            >
+              @{humanNames[name] || agentLabels?.[name] || name}
+            </span>
+          );
+        }
+        return part;
+      });
+    }
+    if (Array.isArray(node)) {
+      const parts: ReactNode[] = [];
+      for (let i = 0; i < node.length; i++) {
+        const child = node[i];
+        const next = node[i + 1];
+        // GFM parses the email portion of @alice@example.com as an autolink.
+        // Rejoin only known mentions; ordinary email links stay untouched.
+        if (typeof child === 'string' && child.endsWith('@') && isValidElement<{ href?: string; children?: ReactNode }>(next)) {
+          const email = next.props.href?.startsWith('mailto:') ? next.props.href.slice(7) : undefined;
+          if (email && humanNames[email] && next.props.children === email && (child + email).match(mentionRegex)?.includes('@' + email)) {
+            parts.push(<span key={`node-${++keyCounter}`}>{processNode(child + email)}</span>);
+            i++;
+            continue;
+          }
+        }
+        parts.push(<span key={`node-${++keyCounter}`}>{processNode(child)}</span>);
+      }
+      return parts;
+    }
+    if (isValidElement<{ children?: ReactNode; node?: { tagName?: string } }>(node) && !['code', 'pre', 'a'].includes(node.props.node?.tagName || String(node.type))) {
+      return cloneElement(node, {}, processNode(node.props.children));
+    }
+    return node;
+  };
+
+  return processNode(children);
+}
+
+export const MarkdownContent = memo(function MarkdownContent({ content, agentNames, agentLabels, humanNames, selfMention, excerptLimit, textOnlyImages }: MarkdownContentProps) {
+  const hasStreamingMermaidFence = hasOpenMermaidFence(content);
+
+  const components: Components = useMemo(() => ({
+    // Block elements
+    h1: ({ children }) => (
+      <h1 className="text-lg font-bold mt-4 mb-2 first:mt-0">{renderMentions(children, agentNames, agentLabels, humanNames, selfMention)}</h1>
+    ),
+    h2: ({ children }) => (
+      <h2 className="text-base font-bold mt-3 mb-1.5 first:mt-0">{renderMentions(children, agentNames, agentLabels, humanNames, selfMention)}</h2>
+    ),
+    h3: ({ children }) => (
+      <h3 className="font-semibold text-sm mt-3 mb-1 first:mt-0">{renderMentions(children, agentNames, agentLabels, humanNames, selfMention)}</h3>
+    ),
+    p: ({ children }) => (
+      <p className="leading-relaxed mb-2 last:mb-0">{renderMentions(children, agentNames, agentLabels, humanNames, selfMention)}</p>
+    ),
+    blockquote: ({ children }) => (
+      <blockquote className="border-l-2 border-border pl-3 my-2 text-muted-foreground italic">
+        {children}
+      </blockquote>
+    ),
+    hr: () => <Separator className="my-3" />,
+
+    // Lists
+    ul: ({ children }) => (
+      <ul className="my-2 ml-4 flex flex-col gap-0.5 list-disc">{children}</ul>
+    ),
+    ol: ({ children }) => (
+      <ol className="my-2 ml-4 flex flex-col gap-0.5 list-decimal">{children}</ol>
+    ),
+    li: ({ children }) => (
+      <li className="leading-relaxed">{renderMentions(children, agentNames, agentLabels, humanNames, selfMention)}</li>
+    ),
+
+    // Tables
+    table: ({ children }) => (
+      <div className="my-3 overflow-hidden rounded-md border border-border">
+        <Table>{children}</Table>
+      </div>
+    ),
+    thead: ({ children }) => <TableHeader className="bg-muted">{children}</TableHeader>,
+    tbody: ({ children }) => <TableBody>{children}</TableBody>,
+    tr: ({ children }) => <TableRow className="hover:bg-transparent">{children}</TableRow>,
+    // Prose cells wrap; the component's nowrap is for data grids.
+    th: ({ children }) => (
+      <TableHead className="h-auto px-3 py-1.5 text-xs font-semibold whitespace-normal text-muted-foreground">
+        {children}
+      </TableHead>
+    ),
+    td: ({ children }) => (
+      <TableCell className="px-3 py-1.5 whitespace-normal">{renderMentions(children, agentNames, agentLabels, humanNames, selfMention)}</TableCell>
+    ),
+
+    // Code
+    code: ({ className, children, ...props }) => {
+      // Fenced blocks render through `pre` below; this branch only keeps the
+      // language class on the element it reads.
+      if (className?.startsWith('language-')) {
+        return (
+          <code className={cn('text-sm', className)} {...props}>
+            {children}
+          </code>
+        );
+      }
+      return (
+        <code className="text-sm px-1.5 py-0.5 rounded bg-muted font-mono">
+          {children}
+        </code>
+      );
+    },
+    pre: ({ children }) => {
+      const mermaidSource = getMermaidSource(children);
+      if (mermaidSource !== null) {
+        return (
+          <MermaidBlock
+            chart={mermaidSource}
+            deferErrors={hasStreamingMermaidFence}
+          />
+        );
+      }
+      return <MarkdownCodeBlock>{children}</MarkdownCodeBlock>;
+    },
+
+    // Links
+    a: ({ href, children }) => (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-primary underline underline-offset-2 hover:text-primary/80"
+      >
+        {children}
+      </a>
+    ),
+
+    // Inline
+    img: ({ src, alt, title }) => (
+      textOnlyImages ? (alt || null) : <MarkdownImage src={src} alt={alt} title={title} className="max-w-full h-auto rounded-md" />
+    ),
+    strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+    del: ({ children }) => <del className="text-muted-foreground">{children}</del>,
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [agentNames, agentLabels, hasStreamingMermaidFence, humanNames, selfMention, textOnlyImages]);
+
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown
+        remarkPlugins={excerptLimit ? [remarkGfm, [remarkExcerpt, { limit: excerptLimit }]] : remarkPlugins}
+        components={components}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}, arePropsEqual);
+
+// Compare props by VALUE, not identity. The `agentNames` array is rebuilt on
+// every discovery poll (every ~5s while an agent is active) even when the set
+// of names is unchanged; the default shallow memo would then re-render and make
+// ReactMarkdown re-parse and re-highlight every code block,
+// which reads as a flash. Skipping the re-render when content and names are
+// value-equal keeps rendered messages static between polls.
+function arePropsEqual(prev: MarkdownContentProps, next: MarkdownContentProps): boolean {
+  return (
+    prev.content === next.content &&
+    prev.excerptLimit === next.excerptLimit &&
+    prev.textOnlyImages === next.textOnlyImages &&
+    prev.agentNames.length === next.agentNames.length &&
+    prev.agentNames.every((name, i) => name === next.agentNames[i]) &&
+    prev.agentNames.every((name) => prev.agentLabels?.[name] === next.agentLabels?.[name]) &&
+    JSON.stringify(prev.humanNames || {}) === JSON.stringify(next.humanNames || {}) &&
+    prev.selfMention === next.selfMention
+  );
+}

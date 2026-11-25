@@ -1,0 +1,1617 @@
+# -*- coding: utf-8 -*-
+"""
+Yumi — the first-party, built-in onboarding assistant.
+
+Yumi is a *cloud agent* (runs in-process on the backend, see
+``services/cloud_agent.py``) but differs from user-added cloud agents in three
+ways:
+
+1. It is **auto-provisioned** into every workspace (see ``provision_yumi``),
+   rather than added by hand via ``POST /v1/cloud-agents``.
+2. Its credentials are **server-held** and shared across all workspaces
+   (``config.YUMI_*``) — never entered by the user, never persisted per
+   workspace (the ``api_key`` column stores only a placeholder).
+3. It runs a **tool-calling loop** (category ``"assistant"``) instead of a
+   single chat round-trip, so it can actually help the user set things up.
+
+Tool calls go through the REAL workspace HTTP API via an in-process ASGI
+client (``WorkspaceApi``) — never direct DB queries — so auth, validation,
+serialization, and side effects (SSE publish, background tasks) behave exactly
+as they do for any other client.
+
+The built-in identity is the reserved provider ``"openagents"`` — that is what
+``builtin`` is derived from everywhere (discover/workspace serializers,
+frontend gating).
+"""
+
+import logging
+import re
+from typing import Any, Optional
+
+import httpx
+from sqlalchemy import select
+
+from app.config import config
+from app.models import CloudAgentConfig, WorkspaceMember
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Identity constants — the single source of truth for "what is the built-in".
+# ---------------------------------------------------------------------------
+
+YUMI_AGENT_NAME = "yumi"
+YUMI_PROVIDER = "openagents"
+YUMI_AGENT_TYPE = f"cloud:{YUMI_PROVIDER}"     # stored on the WorkspaceMember row
+YUMI_CATEGORY = "assistant"                    # triggers the tool loop
+# Placeholder stored in CloudAgentConfig.api_key (NOT NULL). The real key is
+# resolved from config at call time so it can be rotated in one place.
+YUMI_KEY_PLACEHOLDER = "__server_managed__"
+
+
+def is_builtin_agent_type(agent_type: Optional[str]) -> bool:
+    """True if a WorkspaceMember.agent_type belongs to the built-in assistant."""
+    return (agent_type or "") == YUMI_AGENT_TYPE
+
+
+def resolve_credentials(cloud_config: CloudAgentConfig) -> tuple[str, Optional[str]]:
+    """Return (api_key, base_url) to use for a cloud agent.
+
+    For the built-in ``openagents`` provider the key/base_url come from
+    server config (shared, rotatable), NOT from the stored row.
+    """
+    if cloud_config.provider == YUMI_PROVIDER:
+        return config.YUMI_API_KEY, (config.YUMI_BASE_URL or None)
+    return cloud_config.api_key, cloud_config.base_url
+
+
+def resolve_model(cloud_config: CloudAgentConfig) -> str:
+    """The model to run a cloud agent with.
+
+    Built-in Yumi is server-managed end to end: the model comes from
+    ``config.YUMI_MODEL`` at call time (like the key), NOT from the row
+    persisted at provision time — so one env/config change switches every
+    workspace's Yumi at the next deploy, with no backfill.
+    """
+    if cloud_config.provider == YUMI_PROVIDER and config.YUMI_MODEL:
+        return config.YUMI_MODEL
+    return cloud_config.model
+
+
+# ---------------------------------------------------------------------------
+# Provisioning
+# ---------------------------------------------------------------------------
+
+def should_provision() -> bool:
+    """Only seed Yumi when enabled AND a server key is configured, so
+    self-hosted deployments without a key don't get a broken agent."""
+    return bool(config.YUMI_ENABLED and config.YUMI_API_KEY)
+
+
+def provision_yumi(db, workspace) -> bool:
+    """Idempotently add the built-in Yumi agent to a workspace.
+
+    Creates the ``WorkspaceMember`` + ``CloudAgentConfig`` rows (mirroring
+    ``POST /v1/cloud-agents``) if Yumi isn't already present. Caller is
+    responsible for committing. Returns True if a row was added.
+
+    NOTE: does not run when ``should_provision()`` is False.
+    """
+    if not should_provision():
+        return False
+
+    workspace_id = str(workspace.id)
+
+    # Namespace lock BEFORE the reads, so a concurrent rename/join can't
+    # invalidate what we read here before we write.
+    from app import naming
+    naming.lock_member_namespace(db, workspace.id)
+
+    existing_member = db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.agent_name == YUMI_AGENT_NAME,
+        )
+    ).scalar_one_or_none()
+
+    existing_cfg = db.execute(
+        select(CloudAgentConfig).where(
+            CloudAgentConfig.workspace_id == workspace_id,
+            CloudAgentConfig.agent_name == YUMI_AGENT_NAME,
+        )
+    ).scalar_one_or_none()
+
+    # A live Yumi already exists — nothing to do. (If the user removed Yumi it's
+    # a hard delete, so both rows are gone and we'd re-provision; that's only on
+    # explicit re-add, not here.)
+    if existing_member and existing_member.status != "removed" and existing_cfg:
+        return False
+
+    # The name may be taken by a REAL agent (a user's daemon that happens to
+    # be called "yumi"). Backfilling would rewrite its agent_type/description
+    # and attach the built-in config — a takeover, not a repair. Only a member
+    # that already is the built-in type may be repaired; a removed real agent
+    # counts too, since backfill would resurrect it as the built-in.
+    if existing_member and (existing_member.agent_type or "") != YUMI_AGENT_TYPE:
+        logger.warning(
+            "yumi: skipped backfill in %s — a %s agent (status=%s) already "
+            "owns the name",
+            workspace_id, existing_member.agent_type, existing_member.status,
+        )
+        return False
+
+    # Namespace guard runs BEFORE any session mutation: the backfill loop
+    # shares one session across workspaces, so bailing out after a db.add()
+    # would leave an orphan pending object that the next workspace's commit
+    # persists.
+    if existing_member is None:
+        alias_clash = naming.find_alias_clash(
+            db, workspace_id, YUMI_AGENT_NAME, exclude_agent=YUMI_AGENT_NAME,
+        )
+        if alias_clash:
+            logger.warning(
+                "yumi: skipped backfill in %s — name clashes with display "
+                "name of member %s", workspace_id, alias_clash,
+            )
+            return False
+
+    if existing_cfg is None:
+        db.add(CloudAgentConfig(
+            workspace_id=workspace_id,
+            agent_name=YUMI_AGENT_NAME,
+            provider=YUMI_PROVIDER,
+            model=config.YUMI_MODEL,
+            category=YUMI_CATEGORY,
+            api_key=YUMI_KEY_PLACEHOLDER,
+            base_url=None,
+            system_prompt=None,
+            max_tokens=None,
+        ))
+    else:
+        existing_cfg.provider = YUMI_PROVIDER
+        existing_cfg.model = config.YUMI_MODEL
+        existing_cfg.category = YUMI_CATEGORY
+        existing_cfg.api_key = YUMI_KEY_PLACEHOLDER
+        existing_cfg.status = "active"
+
+    description = "OpenAgents built-in assistant — helps you get started"
+    if existing_member is None:
+        db.add(WorkspaceMember(
+            workspace_id=workspace.id,
+            agent_name=YUMI_AGENT_NAME,
+            role="member",
+            agent_type=YUMI_AGENT_TYPE,
+            status="online",
+            description=description,
+        ))
+    else:
+        existing_member.status = "online"
+        existing_member.last_heartbeat = None
+        existing_member.agent_type = YUMI_AGENT_TYPE
+        existing_member.description = description
+
+    logger.info("yumi: provisioned built-in assistant in workspace %s", workspace_id)
+    return True
+
+
+# Plain-text fallbacks for clients without the structured location choices.
+WELCOME_SUGGESTIONS = [
+    "On my computer",
+    "On a remote machine",
+    "From an agent I’m already using",
+    "Use a cloud agent",
+]
+
+WELCOME_GREETING = (
+    "Hi, I'm **Yumi**. I can help you set up your first agent or show you around "
+    "the workspace. Ask me a question anytime.\n\n"
+    "How would you like to connect an agent?"
+)
+
+
+def seed_welcome_thread(db, workspace) -> bool:
+    """Create the first thread with a proactive greeting from Yumi.
+
+    Identity-created workspaces get zero channels and Yumi only ever *reacts*,
+    so a brand-new user lands in an empty room — a dead end on mobile, where
+    the launcher can't be installed. Seed one Yumi-led thread with a greeting
+    and tappable suggestions so the first minute delivers a working agent
+    conversation instead. Caller commits; call inside try/except — this must
+    never block workspace creation.
+    """
+    import time
+    import uuid
+
+    from app.models import Channel, ChannelHumanMember, ChannelMember, EventRecord
+
+    if not should_provision():
+        return False
+
+    # Only ever for a truly fresh workspace — if any channel exists we're not
+    # first-run (re-provisioning, backfill, agent-created workspace…).
+    has_channel = db.execute(
+        select(Channel.id).where(Channel.workspace_id == workspace.id).limit(1)
+    ).scalar_one_or_none()
+    if has_channel:
+        return False
+
+    channel = Channel(
+        workspace_id=workspace.id,
+        name="welcome",
+        title="Welcome",
+        created_by=YUMI_AGENT_NAME,
+        master_agent=YUMI_AGENT_NAME,
+        owner_email=workspace.creator_email,
+        visibility="private",
+        participants_can_invite=False,
+        members_can_add_agents=False,
+        status="active",
+    )
+    db.add(channel)
+    db.flush()
+    db.add(ChannelMember(channel_id=channel.id, agent_name=YUMI_AGENT_NAME))
+    if workspace.creator_email:
+        db.add(ChannelHumanMember(channel_id=channel.id, user_email=workspace.creator_email.strip().lower()))
+
+    # Persist the greeting directly (same shape as a pipeline-posted Yumi chat
+    # message). No SSE publish needed: the workspace was created milliseconds
+    # ago, nobody is subscribed yet — the first page load reads it from the DB.
+    db.add(EventRecord(
+        id=str(uuid.uuid4()),
+        network_id=workspace.id,
+        type="workspace.message.posted",
+        source=f"openagents:{YUMI_AGENT_NAME}",
+        target=f"channel/{channel.name}",
+        payload={"content": WELCOME_GREETING, "message_type": "chat"},
+        metadata_={
+            "target_agents": ["__no_response__"],
+            "suggestions": WELCOME_SUGGESTIONS,
+            "onboarding": "agent_location",
+        },
+        timestamp=int(time.time() * 1000),
+        visibility="channel",
+    ))
+    db.flush()
+    logger.info("yumi: seeded welcome thread in workspace %s", workspace.id)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# In-process API client
+# ---------------------------------------------------------------------------
+
+class WorkspaceApi:
+    """Calls the workspace's own HTTP API in-process (ASGI transport).
+
+    Every Yumi tool goes through the real FastAPI app — routing, auth,
+    validation, serialization, and side effects like SSE publishes — instead
+    of querying the database directly. No network hop.
+
+    Yumi works for one person at a time, so it calls as that person: a
+    minutes-long workspace session for ``acting_email``, never the workspace
+    token. It can then see and do exactly what that person can. With nobody
+    to act for, every call is refused.
+    """
+
+    def __init__(self, workspace_id: str, acting_email: Optional[str] = None):
+        self.workspace_id = workspace_id
+        self.acting_email = acting_email
+        self._user = None
+
+    def _authorization(self) -> Optional[str]:
+        """A fresh short session per call: a long tool loop outlives one."""
+        if not self.acting_email:
+            return None
+        from app.services.hub_auth import acting_authorization
+        if self._user is None:
+            from app.database import SessionLocal
+            from app.models import User
+            db = SessionLocal()
+            try:
+                self._user = db.execute(select(User).where(
+                    User.email == self.acting_email,
+                )).scalars().first()
+                if self._user is not None:
+                    db.expunge(self._user)
+            finally:
+                db.close()
+        return acting_authorization(self._user) if self._user is not None else None
+
+    async def request(
+        self, method: str, path: str, *,
+        json: Optional[dict] = None, params: Optional[dict] = None,
+    ) -> dict:
+        """Perform a request; return {"ok": True, "data": ...} or
+        {"ok": False, "error": ...}. Never raises."""
+        # Imported lazily: app.main transitively imports this module.
+        from app.main import app
+
+        try:
+            authorization = self._authorization()
+        except Exception:
+            logger.exception("yumi api: could not act for %s", self.acting_email)
+            authorization = None
+        if not authorization:
+            return {"ok": False, "status": 403, "error": (
+                "I can only do this when the person I'm helping asks me directly."
+            )}
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://yumi.internal",
+                timeout=30,
+            ) as client:
+                resp = await client.request(
+                    method, path,
+                    json=json, params=params,
+                    headers={"Authorization": authorization},
+                )
+        except Exception as exc:
+            logger.exception("yumi api: %s %s failed", method, path)
+            return {"ok": False, "error": f"internal request failed: {exc}"[:200]}
+
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        if resp.status_code == 200:
+            return {"ok": True, "data": body.get("data")}
+        return {
+            "ok": False,
+            "error": body.get("message") or f"HTTP {resp.status_code}",
+            "status": resp.status_code,
+        }
+
+    async def get(self, path: str, **params: Any) -> dict:
+        return await self.request("GET", path, params=params or None)
+
+    async def post(self, path: str, json: Optional[dict] = None) -> dict:
+        return await self.request("POST", path, json=json)
+
+    async def patch(self, path: str, json: Optional[dict] = None) -> dict:
+        return await self.request("PATCH", path, json=json)
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+YUMI_SYSTEM_PROMPT = """\
+You are Yumi, the built-in assistant and workspace manager for OpenAgents — a
+multi-agent workspace where humans collaborate with AI agents in chat threads.
+
+Your two jobs:
+1. ONBOARDING — welcome new users, explain how OpenAgents works, help them
+connect nodes and agents and take their first steps.
+2. MANAGING THE WORKSPACE — keep an accurate picture of agents, nodes,
+threads and tasks; get the human's requests to the right agent; coordinate
+specialist work in separate threads while keeping your own conversation personal.
+
+You are a CLOUD agent on the OpenAgents server: no shell, no filesystem, no
+code execution. You act only through your tools; for everything else you give
+precise instructions. You are NOT a coding or research agent — you never do
+the specialist work yourself; you route it to an agent that can.
+
+Be friendly and concise. Use the user's language and familiar terms like
+"computer" or "device." Give one concrete next step and say what they'll see
+when it works. Use the exact labels for their app. Expand into a walkthrough
+only when they ask for one.
+
+FIRST-USE GUIDANCE:
+- Start from their goal. If they want to explore, answer their question and
+  give one small example of what they can do. A good default on web is
+  Threads → Welcome → ask Yumi what threads are for. They can talk to you
+  before adding another agent. Don't offer to create a card or start work
+  when the user only asked to look around.
+- If they want to add an agent and haven't chosen a path, offer the four
+  setup choices in one line each: Desktop app on their computer, Command
+  line on a server they manage, From your agent if they're already using
+  Claude Code, Codex or OpenCode, or Cloud Agents if they want it hosted.
+  An existing agent can be on their laptop or a server. If they already have
+  an agent session open, recommend From your agent. If they want remote
+  execution but have no machine to manage, recommend Cloud Agents. Ask one
+  question only if their choice is unclear. Follow the mobile guide below.
+- Check the current state before sending someone back to a step. A device
+  that's already connected can add an agent directly. If an agent is online,
+  say Threads → New thread → select the agent → send the instruction. Put
+  a short example in plain text immediately after those steps so it wraps
+  in narrow chats. Use their agent's
+  actual handle if known; for a hypothetical scenario, use the example
+  handle they gave. Use a task that needs no assumed repo or files unless
+  they mentioned one. Avoid estimating how soon the agent will respond.
+- Treat unavailable state as unknown. Never infer that setup failed or
+  succeeded from a missing result. Keep pairing codes and API keys in the
+  setup screen. Never ask for them in chat.
+- If desktop pairing is still waiting, check the workspace's device list.
+  An empty list only means the workspace doesn't show a paired device yet;
+  it doesn't reveal whether the desktop app accepted the code or why pairing
+  stalled. Ask what the desktop app shows now (success, an error, or the
+  code prompt) before suggesting a retry. If it explicitly says the code
+  expired, point to Connect Agent → Local Agents for a fresh code. Don't ask
+  the user to sign in again as a prerequisite for the pairing-code flow.
+
+READING THE CONVERSATION: this is the user's personal conversation with you.
+Messages may include attributed history or automated watch updates; distinguish
+these from the user's own instructions.
+
+Core concepts (explain when helpful):
+- A *workspace* contains *threads* (chat channels). In a thread the human
+talks with one or more *agents*. A message that @mentions an agent goes to
+that agent; a message with no @mention goes to the thread's *leader*.
+- A *node* is a device (laptop, desktop, server) running the OpenAgents
+launcher/daemon. Local agents (Claude Code, Codex, Gemini CLI, ...) run on
+nodes. *Cloud agents* (like you) run server-side and need no node.
+
+DELEGATING — getting another agent to do something:
+- Keep this conversation personal. Never add another agent or person here,
+  and never add yourself to a team or issue thread.
+- Check `list_agents` for an online specialist. For a user-requested task,
+  use `create_thread` with that specialist (without yourself), then
+  `post_to_thread` with a clear @agent-name instruction. You may also use an
+  existing work thread the user asks you to continue.
+- Creating a thread alone starts nothing. Only say you handed off the work
+  after `post_to_thread` succeeds. Set a watch when promising to relay results.
+- If no capable agent is available, help the user connect one.
+
+WHEN AN AGENT REPORTS BACK (to you or to the thread): summarize the outcome
+for the human in plain terms and stop — do not @mention the agent again
+unless the human asks for the next step. Delegation is always started by the
+human, never by you on your own initiative.
+
+HELPING THE HUMAN TALK TO AGENTS: recommend which agent fits a request (use
+their descriptions), turn a vague ask into a clear instruction before
+delegating, check that an agent is online before the human waits on it, and
+remind them that a message with no @mention goes to the thread's leader.
+
+YOUR PRESENCE IN THREADS: you are a personal assistant. People reach you
+through their direct conversation or their private Welcome conversation.
+You cannot be shared, invited into group or issue threads, or have other
+participants added to this personal conversation. Explain this if asked.
+Posting to another work thread does not add you to it. Use a watch to relay
+results here, or `read_thread` to check progress when asked.
+
+WATCHING OTHER THREADS / AGENTS (how news comes back to you): right after
+you start work elsewhere (`post_to_thread`, or a task's thread), call
+`watch_thread` (that thread id) or `watch_agent` (that agent) with a `note`
+that says who asked and what to relay — e.g. "Li Lei asked for the sales
+report; relay the result here". A watch is bounded: it expires after
+`minutes` (default 2 hours, max 24) and fires at most `max_fires` times. It
+wakes you HERE, in this thread, with a message from `[system:watch]` that
+starts with "👀 Watch update" whenever the watched agent posts a final reply
+or an error there (or its task card changes column); status/thinking lines
+never wake you. When you get one:
+- It is automated — no human just spoke. Relay the outcome (or the agent's
+question) to the human in plain words, then stop. Do NOT @mention anyone
+and do NOT call `post_to_thread` in that turn.
+- If the agent asked something, ask the human; when the human answers,
+pass it on with `post_to_thread` to the same thread — the watch is still
+armed (or set a new one if it expired).
+- A "⌛ Watch expired" message means nothing came back in time: tell the
+human, offer to `read_thread` and re-watch.
+`list_watches` shows your active watches; `stop_watch` ends one early (e.g.
+the human says they no longer care). Never set a watch on this thread — you
+already see it.
+
+THREAD MANAGEMENT tools: use `create_thread`, `post_to_thread`, `read_thread`,
+`list_threads` and the watch tools for work delegated outside this personal
+conversation. Never change this conversation's membership or share it.
+
+SETUP PATHS ON WEB AND DESKTOP:
+- THEIR COMPUTER: Connect Agent → Local Agents → Desktop app. Install and
+  open the app on the computer where the agent will run. Follow the
+  app's pairing instructions. Once that device appears online, add an agent
+  on it and wait for the agent to come online.
+- THEIR SERVER: Connect Agent → Local Agents → Command line. Follow the
+  install and pairing steps on that screen in a terminal on the server,
+  over SSH if needed. Once the server appears online, add an agent on it
+  and wait for the agent to come online. If the CLI is already installed
+  and the device isn't paired, use the code from that screen with
+  `agn device connect <code>`.
+- EXISTING CLAUDE CODE, CODEX, OR OPENCODE SESSION: Connect Agent → Local
+  Agents → From your agent → Copy instructions. Paste into the active agent's
+  chat on the machine where it is already running. Use the instructions
+  generated by OpenAgents; don't write a pairing command with a guessed
+  code. This path pairs the device and joins the agent. Once the device is
+  paired, wait for the agent itself to come online before starting a task.
+  If the command fails, ask for the error without the pairing code or keys.
+- HOSTED: Connect Agent → Cloud Agents. Pick an available hosted option or
+  a provider and model. Follow the provider's setup screen; an API key is
+  only needed when the provider asks for one. This path requires no paired
+  device. The agent can be used after it appears online in the workspace.
+
+Setup choices in the Welcome message open the matching screens. Pairing codes
+and credentials stay in those screens. You cannot mint codes or pair a device
+on the user's behalf. Use list_nodes to check device status and list_agents
+to check agent status. A paired device alone does not mean the agent is ready.
+Once the agent is online, help the user send a first message in its thread.
+
+MANAGING AGENTS ON CONNECTED NODES (your tools, run remotely by the node's
+daemon): use `manage_node_agent` to create/install an agent of some type on
+a node (`create_agent` — needs name + type), start it (`start_agent`), stop
+it (`stop_agent`), or re-detect installed runtimes (`detect_runtimes`).
+Rules: pick the node from `list_nodes` (ask if ambiguous); ALWAYS confirm
+with the user before a create/start/stop; commands run on the node's next
+heartbeat (seconds up to ~a minute) — verify afterwards with
+`get_node_commands` and `list_nodes` instead of assuming success.
+
+ISSUES: the web sidebar says Issues. It opens the board for tracking work.
+When asked to create an issue card, use `create_task` (goes to Backlog;
+optionally pre-assign an agent). Use `list_tasks` to read the board. Creating
+a card does not start an agent. Point the user to Issues to run, move, or
+delete a card.
+
+REMOVALS: you never remove anything — no nodes, no agents, no threads.
+Instead, tell the user how: a cloud agent — click it in the roster, then
+"Remove" in its profile panel (or the Connect view's Cloud tab trash icon);
+a node — the Connect view's node list (owner/admin only), after stopping the
+daemon on the device (`agn down`); a local agent — `agn disconnect <name>`
+on its node, or the Desktop app.
+
+DEBUGGING CONNECTIONS — when something "doesn't respond", work through this
+with tools, not guesses:
+1. `list_agents`: does the agent exist, and is it online? A stale/absent
+heartbeat means its daemon isn't running or lost connection.
+2. If it lives on a node: `list_nodes` — is the node online? An offline node
+means the launcher/daemon is down on that device → have the user start the
+Desktop app or run `agn up` (check with `agn status`).
+3. `get_node_commands`: did a recent create/start command fail? Read the error.
+4. Is the agent actually in this thread, and was it @mentioned? Suggest
+mentioning it explicitly.
+5. Still stuck: ask what the user sees on the device (`agn status` output)
+and iterate.
+
+Rules:
+- Use read tools (`list_agents`, `list_threads`, `list_nodes`,
+`get_agent_catalog`, `read_thread`) before making claims about what exists
+or what was said elsewhere. Never invent agents, nodes, threads, messages,
+or features.
+- Only call `create_thread` when the user asks to create/start a thread.
+- Keep replies to a few sentences unless the user asks for more detail.
+"""
+
+
+MOBILE_CLIENT_GUIDE = """\
+THE USER IS ON THE OPENAGENTS MOBILE APP (iOS / Android). This overrides the
+web and desktop directions above: describe only what exists in the app. Never
+mention the sidebar, the Connect Agent view, Local Agents, the Cloud tab, the
+roster's profile panel — those are web controls. Issues is a bottom tab.
+
+The phone cannot run local agents itself; they run on a computer or server
+paired to the workspace. Label every step that happens there "on your
+computer" (or "on the server"); everything else is a tap in the app.
+
+App layout — bottom tabs: Chats, Issues, Routines, Members, More.
+- A workspace with no agent yet shows a three-step setup on the Chats tab:
+  Connect a device -> Add an agent -> Start collaborating.
+- Connecting a device: in the app, step 1 of that setup, or Members ->
+  "Connect another device", shows a pairing code. On the computer, download
+  the desktop app from openagents.org and either sign in with the same account
+  (recommended, no code needed) or click "Join workspace" and enter the code.
+  On a remote machine or server, install the CLI and run
+  `agn device connect <code>`. The app notices the device by itself.
+- Adding an agent: step 2 of the setup, or Members -> tap the device ->
+  "Add an agent". Fill in Name (unique in the workspace), Type, Model and
+  Credentials, then "Create agent". The device installs it; this can take a
+  few minutes.
+- Cloud agents (OpenAI, Anthropic, ...) cannot be added in the app; say they
+  are added from the web app, only if the user asks.
+- Talking to agents: Chats -> "+" at the bottom right to start a thread and
+  pick its agents; in a thread type @ to mention an agent. The "..." at the top
+  right of a thread has share, new issue and "Mark as channel". Swipe a thread
+  in the list for pin / more / delete.
+- Notifications, files, knowledge and settings are under More.
+- Removing: a device - Members -> the device -> "Forget this device"
+  (owner/admin; stop the launcher on the computer with `agn down` first, or it
+  reappears); an agent - Members -> the agent -> "Remove agent".
+"""
+
+
+def client_platform_guide(metadata: Optional[dict]) -> str:
+    """Extra system-prompt directions for the client the user wrote from.
+
+    The mobile app tags every message with `metadata.client_platform =
+    "mobile"`; without this, Yumi answered phone users with web and launcher
+    steps (sidebar, Connect Agent view) that do not exist in the app.
+    """
+    platform = (metadata or {}).get("client_platform") if isinstance(metadata, dict) else None
+    if isinstance(platform, str) and platform.strip().lower() == "mobile":
+        return MOBILE_CLIENT_GUIDE
+    return ""
+
+
+async def workspace_state_summary(api: WorkspaceApi) -> str:
+    """A short, live snapshot (via the API) injected into the system prompt so
+    Yumi is grounded in what actually exists. Never raises — on API failure it
+    returns a minimal note rather than blocking the reply."""
+    lines = ["Current workspace state (live):"]
+
+    discover = await api.get("/v1/discover", network=api.workspace_id)
+    if discover["ok"] and discover["data"]:
+        agents = discover["data"].get("agents") or []
+        real = []
+        for a in agents:
+            if a.get("builtin"):
+                continue
+            name = (a.get("address") or "").removeprefix("openagents:")
+            desc = (a.get("description") or "").strip().replace("\n", " ")
+            entry = f"{name} ({a.get('status')})"
+            if desc:
+                entry += f" — {desc[:70]}"
+            real.append(entry)
+        if real:
+            lines.append(f"- Connected agents (besides you): {', '.join(real)}")
+        else:
+            lines.append(
+                "- No other agents are connected yet — the user has only you "
+                "(Yumi). If they want to set up, help choose their first agent."
+            )
+        channels = discover["data"].get("channels") or []
+        if channels:
+            titles = [c.get("title") or c.get("address", "") for c in channels[:15]]
+            lines.append(f"- Existing threads: {', '.join(t for t in titles if t)}")
+        else:
+            lines.append("- No threads created yet.")
+    else:
+        lines.append("- (agent/thread state unavailable right now)")
+
+    nodes = await api.get("/v1/nodes", network=api.workspace_id)
+    if nodes["ok"] and isinstance(nodes["data"], list):
+        if nodes["data"]:
+            descs = [
+                f"{n.get('name') or n.get('hostname') or n.get('nodeId')} ({n.get('status')})"
+                for n in nodes["data"][:10]
+            ]
+            lines.append(f"- Connected nodes: {', '.join(descs)}")
+        else:
+            lines.append("- No nodes (devices) connected yet.")
+
+    return "\n".join(lines)
+
+
+async def thread_context(
+    api: WorkspaceApi, channel_name: Optional[str],
+    trigger_source: str = "", trigger_payload: Optional[dict] = None,
+) -> str:
+    """Live facts about the thread Yumi is replying in — title, who is in it
+    (with online status and role description), who leads it, and who the
+    human is. Without this the assistant can't tell whether an agent it is
+    asked about is even in the room. Never raises."""
+    if not channel_name:
+        return ""
+    from app.services.cloud_agent import speaker_label
+
+    lines = ["THIS THREAD (live):"]
+    statuses: dict = {}
+    descs: dict = {}
+    disc = await api.get("/v1/discover", network=api.workspace_id)
+    if disc["ok"] and disc["data"]:
+        for a in disc["data"].get("agents") or []:
+            name = (a.get("address") or "").removeprefix("openagents:")
+            statuses[name] = a.get("status") or "unknown"
+            descs[name] = (a.get("description") or "").strip().replace("\n", " ")
+
+    ch = await api.get(f"/v1/workspaces/{api.workspace_id}/channels/{channel_name}")
+    if ch["ok"] and ch["data"]:
+        d = ch["data"]
+        lines.append(f"- Title: {d.get('title') or channel_name} (thread id: {channel_name})")
+        parts = []
+        for p in d.get("participants") or []:
+            if p == "__no_response__":
+                continue
+            if p == YUMI_AGENT_NAME:
+                parts.append("yumi (you)")
+                continue
+            entry = f"{p} ({statuses.get(p, 'unknown')})"
+            if descs.get(p):
+                entry += f" — {descs[p][:70]}"
+            parts.append(entry)
+        lines.append("- Agents in this thread: " + (", ".join(parts) if parts else "(only you)"))
+        leader = d.get("masterAgent")
+        if leader == YUMI_AGENT_NAME:
+            lines.append("- Leader: you — messages with no @mention come to you.")
+        elif leader:
+            lines.append(f"- Leader: {leader} — messages with no @mention go to it.")
+        else:
+            lines.append("- Leader: none set.")
+    else:
+        lines.append(f"- thread id: {channel_name} (details unavailable right now)")
+
+    if (trigger_source or "").startswith("human:"):
+        who = speaker_label(trigger_source, trigger_payload or {})
+        lines.append(f"- You are talking with: {who} (human)")
+    elif trigger_source == "system:watch":
+        lines.append(
+            "- Trigger: an automated Watch update (see WATCHING) — no human just "
+            "spoke. Relay it to the human here; do not delegate in this turn."
+        )
+
+    bridge = bridged_thread_context(channel_name)
+    if bridge:
+        lines += ["", bridge]
+    return "\n".join(lines)
+
+
+def bridged_thread_context(channel_name: Optional[str]) -> str:
+    """Front-desk instructions for a thread bridged from Slack / Telegram /
+    Lark (``ext-<platform>-…``, see services/integrations). The human there
+    sees only final chat replies — no UI, no other threads — so the
+    assistant's job is to route work elsewhere and relay the outcome back
+    via watches. Empty for ordinary threads."""
+    if not channel_name:
+        return ""
+    from app.services.integrations import parse_channel_name
+    parsed = parse_channel_name(channel_name)
+    if parsed is None:
+        return ""
+    platform = {"slack": "Slack", "telegram": "Telegram", "lark": "Feishu/Lark"}.get(
+        parsed[0], parsed[0]
+    )
+    return (
+        f"BRIDGED THREAD — FRONT DESK MODE: this thread is a bridge to {platform}. "
+        f"The human is chatting from {platform} and sees ONLY the final chat replies "
+        "posted in this thread (yours and any agent's) — not the workspace UI, not "
+        "other threads, not buttons, not status lines. Write plain text (no tables, "
+        "minimal markdown). You are the front desk for the whole workspace:\n"
+        "- Keep this conversation personal. Delegate specialist work in a separate "
+        "thread and relay the result here using a watch.\n"
+        "- Substantial or long-running work: start it in a NEW thread "
+        "(`create_thread` with the agent, then `post_to_thread` with a clear "
+        "instruction) and IMMEDIATELY `watch_thread` it with a note naming who asked "
+        "and what to relay. Tell the human you'll message them here when there is "
+        "news, and roughly how long the watch lasts.\n"
+        "- On a Watch update: relay the outcome, or the agent's question, in plain "
+        "words. When the human answers a question, pass it on with `post_to_thread` "
+        "to that same thread.\n"
+        "- Approvals, files and the Issues board live in the workspace web app; "
+        "when something needs them, say so and point the human to the workspace."
+    )
+
+
+async def is_thread_participant(api: WorkspaceApi, channel_name: str, agent_name: str) -> bool:
+    """Whether ``agent_name`` is a participant of the thread. Fails OPEN on an
+    API error so a lookup hiccup can't silence a legitimate reply."""
+    ch = await api.get(f"/v1/workspaces/{api.workspace_id}/channels/{channel_name}")
+    if not (ch["ok"] and ch["data"]):
+        return True
+    return agent_name in ((ch["data"] or {}).get("participants") or [])
+
+
+async def workspace_member_names(api: WorkspaceApi) -> list[str]:
+    """Agent names in the workspace (for validating @mentions)."""
+    disc = await api.get("/v1/discover", network=api.workspace_id)
+    if not (disc["ok"] and disc["data"]):
+        return []
+    return [
+        (a.get("address") or "").removeprefix("openagents:")
+        for a in disc["data"].get("agents") or []
+    ]
+
+
+_MENTION_RE = re.compile(r"@([\w-]+)")
+
+
+def delegation_targets(text: str, member_names, self_name: str = YUMI_AGENT_NAME) -> list[str]:
+    """Agents a reply hands off to: its @mentions that are real workspace
+    members, excluding the sender, in order, de-duplicated."""
+    known = set(member_names or [])
+    out: list[str] = []
+    for m in _MENTION_RE.findall(text or ""):
+        if m in known and m != self_name and m not in out:
+            out.append(m)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tools (OpenAI function-calling schemas + executor)
+# ---------------------------------------------------------------------------
+
+# Remote actions Yumi may enqueue. Deliberately excludes remove_agent —
+# removals are user-only (Yumi gives UI instructions instead).
+YUMI_NODE_ACTIONS = ("create_agent", "start_agent", "stop_agent", "detect_runtimes")
+
+
+def build_tools() -> list[dict]:
+    """OpenAI-style tool schemas Yumi may call. Onboarding-focused."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_agents",
+                "description": (
+                    "List the agents in this workspace (name, type, online "
+                    "status, which host/node they run on). Use before "
+                    "describing who is available or debugging connectivity."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_threads",
+                "description": (
+                    "List the existing threads (channels) in this workspace."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_nodes",
+                "description": (
+                    "List the nodes (devices running the OpenAgents launcher/"
+                    "daemon) connected to this workspace, with online status, "
+                    "OS, the agents on each node, and detected runtimes."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_agent_catalog",
+                "description": (
+                    "List the local agent types that can be installed on a "
+                    "node (claude, codex, gemini, ...), with descriptions."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "manage_node_agent",
+                "description": (
+                    "Queue an agent-management command on a connected node "
+                    "(runs on the node's next heartbeat). Actions: "
+                    "create_agent (install/create an agent — requires "
+                    "agent_name + agent_type), start_agent, stop_agent "
+                    "(require agent_name), detect_runtimes. Confirm with the "
+                    "user before calling. Cannot remove agents."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node_id": {
+                            "type": "string",
+                            "description": "nodeId from list_nodes.",
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": list(YUMI_NODE_ACTIONS),
+                        },
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Agent to create/start/stop.",
+                        },
+                        "agent_type": {
+                            "type": "string",
+                            "description": (
+                                "For create_agent: a type from "
+                                "get_agent_catalog (e.g. 'claude')."
+                            ),
+                        },
+                    },
+                    "required": ["node_id", "action"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_node_commands",
+                "description": (
+                    "Recent remote commands for a node with their status "
+                    "(pending/running/done/error). Use to verify a "
+                    "manage_node_agent command or debug a failure."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node_id": {
+                            "type": "string",
+                            "description": "nodeId from list_nodes.",
+                        },
+                    },
+                    "required": ["node_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_task",
+                "description": (
+                    "Create an issue card on the workspace's Issues board "
+                    "(Kanban). Defaults to the Backlog column. Optionally "
+                    "pre-assign an agent (does NOT start it running — the "
+                    "user runs it from the Issues board)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "priority": {
+                            "type": "string",
+                            "enum": ["low", "normal", "high"],
+                        },
+                        "assignee": {
+                            "type": "string",
+                            "description": (
+                                "Optional agent name from list_agents to "
+                                "pre-assign."
+                            ),
+                        },
+                    },
+                    "required": ["title"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_tasks",
+                "description": (
+                    "List issue cards on the workspace's Issues board "
+                    "(title, status column, priority, assignee)."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_agent_to_thread",
+                "description": (
+                    "Add an agent that exists in this workspace to the CURRENT "
+                    "thread, so it can be @mentioned and receive messages here. "
+                    "Use it before delegating to an agent that isn't in the thread."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Agent name from list_agents.",
+                        },
+                    },
+                    "required": ["agent_name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "set_thread_leader",
+                "description": (
+                    "Make an agent the leader of the CURRENT thread. The leader "
+                    "receives every message that has no @mention. The agent must "
+                    "already be in the thread."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Agent name (a participant of this thread).",
+                        },
+                    },
+                    "required": ["agent_name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_thread",
+                "description": (
+                    "Read the most recent messages of ANOTHER thread (by its "
+                    "thread_id from list_threads), speaker-attributed and oldest "
+                    "first, to catch up on or summarize it."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "thread": {"type": "string", "description": "thread_id from list_threads."},
+                        "limit": {
+                            "type": "integer",
+                            "description": "How many recent messages (1-60, default 30).",
+                        },
+                    },
+                    "required": ["thread"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "post_to_thread",
+                "description": (
+                    "For ANOTHER thread only (refuses the current one): post a "
+                    "message as yourself into that thread by thread_id, e.g. to kick "
+                    "off work in a thread you created — @mention the agent and give "
+                    "a clear, self-contained instruction. Only when the human asked "
+                    "for it. To hand off in the CURRENT thread, do not use a tool: "
+                    "just write @agent-name + instruction in your reply."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "thread": {"type": "string", "description": "thread_id from list_threads."},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["thread", "message"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_thread",
+                "description": (
+                    "Create a new thread (channel). Only call when the user "
+                    "explicitly asks to create/start a thread."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Short human-readable title.",
+                        },
+                        "agents": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Optional agent names to add as participants."
+                            ),
+                        },
+                    },
+                    "required": ["title"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "watch_thread",
+                "description": (
+                    "Watch ANOTHER thread for a bounded time: you get woken in "
+                    "the CURRENT thread with a 'Watch update' whenever an agent "
+                    "posts a final reply or error there (or its task changes "
+                    "column). Call right after post_to_thread / starting a task "
+                    "when the human expects news here. Refuses the current thread."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "thread": {"type": "string", "description": "thread_id from list_threads / create_thread."},
+                        "note": {
+                            "type": "string",
+                            "description": (
+                                "Reminder to yourself, echoed on every wake-up: who "
+                                "asked, what to relay, anything to remember."
+                            ),
+                        },
+                        "minutes": {
+                            "type": "integer",
+                            "description": "How long to watch (default 120, max 1440).",
+                        },
+                        "max_fires": {
+                            "type": "integer",
+                            "description": "Max wake-ups before the watch ends (default 10).",
+                        },
+                    },
+                    "required": ["thread", "note"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "watch_agent",
+                "description": (
+                    "Watch an AGENT for a bounded time: you get woken in the "
+                    "CURRENT thread whenever that agent posts a final reply or "
+                    "error in any other thread. Use when you don't know which "
+                    "thread the agent will work in; prefer watch_thread otherwise."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {"type": "string", "description": "Agent name from list_agents."},
+                        "note": {"type": "string", "description": "Reminder to yourself, echoed on every wake-up."},
+                        "minutes": {"type": "integer", "description": "How long to watch (default 120, max 1440)."},
+                        "max_fires": {"type": "integer", "description": "Max wake-ups (default 10)."},
+                    },
+                    "required": ["agent", "note"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_watches",
+                "description": "List your active watches (what you are waiting on, and until when).",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stop_watch",
+                "description": "Stop one of your active watches early (id from list_watches or from the watch you set).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"watch_id": {"type": "string"}},
+                    "required": ["watch_id"],
+                },
+            },
+        },
+    ]
+
+
+async def execute_tool(
+    api: WorkspaceApi, agent_name: str, name: str, args: dict,
+    channel_name: Optional[str] = None, allow_delegation: bool = True,
+) -> dict:
+    """Execute one tool call via the workspace API; JSON-serialisable result.
+
+    ``channel_name`` is the thread the assistant is replying in (needed by
+    the thread-management tools). ``allow_delegation`` is False when the
+    trigger came from another agent: hand-offs are human-initiated only.
+    """
+    try:
+        if name == "list_agents":
+            return await _tool_list_agents(api)
+        if name == "list_threads":
+            return await _tool_list_threads(api)
+        if name == "list_nodes":
+            return await _tool_list_nodes(api)
+        if name == "get_agent_catalog":
+            return await _tool_get_agent_catalog(api)
+        if name == "create_pairing_code":
+            return await _tool_create_pairing_code(api)
+        if name == "manage_node_agent":
+            return await _tool_manage_node_agent(api, args)
+        if name == "get_node_commands":
+            return await _tool_get_node_commands(api, args)
+        if name == "create_task":
+            return await _tool_create_task(api, agent_name, args)
+        if name == "list_tasks":
+            return await _tool_list_tasks(api)
+        if name == "add_agent_to_thread":
+            return await _tool_add_agent_to_thread(api, agent_name, channel_name, args)
+        if name == "set_thread_leader":
+            return await _tool_set_thread_leader(api, channel_name, args)
+        if name == "read_thread":
+            return await _tool_read_thread(api, args)
+        if name == "post_to_thread":
+            return await _tool_post_to_thread(api, agent_name, channel_name, args, allow_delegation)
+        if name == "create_thread":
+            return await _tool_create_thread(api, agent_name, args)
+        if name == "watch_thread":
+            return await _tool_watch(api, agent_name, channel_name, "thread", args)
+        if name == "watch_agent":
+            return await _tool_watch(api, agent_name, channel_name, "agent", args)
+        if name == "list_watches":
+            return await _tool_list_watches(api, agent_name)
+        if name == "stop_watch":
+            return await _tool_stop_watch(api, args)
+        return {"ok": False, "error": f"Unknown tool: {name}"}
+    except Exception as exc:  # never let a tool crash the loop
+        logger.exception("yumi: tool %s failed", name)
+        return {"ok": False, "error": str(exc)[:200]}
+
+
+async def _tool_list_agents(api: WorkspaceApi) -> dict:
+    res = await api.get("/v1/discover", network=api.workspace_id)
+    if not res["ok"]:
+        return res
+    agents = []
+    for a in (res["data"] or {}).get("agents") or []:
+        skills = a.get("enabled_skills") or {}
+        agents.append({
+            "name": (a.get("address") or "").removeprefix("openagents:"),
+            "type": a.get("agent_type"),
+            "status": a.get("status"),
+            "builtin": bool(a.get("builtin")),
+            "description": a.get("description"),
+            "host": a.get("server_host"),
+            "working_dir": a.get("working_dir"),
+            "installed_skills": skills.get("installed") or [],
+            "last_heartbeat_at": a.get("last_heartbeat_at"),
+        })
+    return {"ok": True, "agents": agents}
+
+
+async def _tool_list_threads(api: WorkspaceApi) -> dict:
+    res = await api.get("/v1/discover", network=api.workspace_id)
+    if not res["ok"]:
+        return res
+    threads = []
+    for c in (res["data"] or {}).get("channels") or []:
+        name = (c.get("address") or "").removeprefix("channel/")
+        if name.startswith("routines:") or (c.get("status") or "active") == "deleted":
+            continue
+        threads.append({
+            "thread_id": name,
+            "title": c.get("title"),
+            "leader": c.get("master"),
+            "agents": [p for p in (c.get("participants") or []) if p != "__no_response__"],
+            "last_activity_at": c.get("last_event_at"),
+        })
+    return {"ok": True, "threads": threads[:40]}
+
+
+async def _tool_list_nodes(api: WorkspaceApi) -> dict:
+    res = await api.get("/v1/nodes", network=api.workspace_id)
+    if not res["ok"]:
+        return res
+    nodes = []
+    for n in res["data"] or []:
+        nodes.append({
+            "node_id": n.get("nodeId"),
+            "name": n.get("name"),
+            "hostname": n.get("hostname"),
+            "status": n.get("status"),
+            "os": n.get("os"),
+            "device_type": n.get("deviceType"),
+            "agents": n.get("agents") or [],
+            "runtimes": n.get("runtimes") or [],
+            "last_heartbeat_at": n.get("lastHeartbeatAt"),
+        })
+    return {"ok": True, "nodes": nodes}
+
+
+async def _tool_get_agent_catalog(api: WorkspaceApi) -> dict:
+    res = await api.get("/v1/agent-catalog")
+    if not res["ok"]:
+        return res
+    data = res["data"] or []
+    entries = data if isinstance(data, list) else data.get("agents") or []
+    catalog = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            catalog.append({
+                "type": entry.get("name"),
+                "label": entry.get("label"),
+                "description": entry.get("description"),
+                "featured": bool(entry.get("featured")),
+            })
+    return {"ok": True, "agent_types": catalog}
+
+
+async def _tool_create_pairing_code(api: WorkspaceApi) -> dict:
+    res = await api.post(f"/v1/workspaces/{api.workspace_id}/pairing-codes")
+    if not res["ok"]:
+        return res
+    data = res["data"] or {}
+    return {
+        "ok": True,
+        "code": data.get("code"),
+        "expires_in_minutes": int((data.get("expiresInSeconds") or 1800) / 60),
+        "note": (
+            "Single use. On the device: Desktop app → 'Connect a node' → enter "
+            "the code, or CLI: agn node connect <code>."
+        ),
+    }
+
+
+async def _tool_manage_node_agent(api: WorkspaceApi, args: dict) -> dict:
+    node_id = (args.get("node_id") or "").strip()
+    action = (args.get("action") or "").strip()
+    if action not in YUMI_NODE_ACTIONS:
+        return {"ok": False, "error": f"Action not allowed: {action}"}
+    if not node_id:
+        return {"ok": False, "error": "Missing node_id (see list_nodes)"}
+
+    cmd_args: dict = {}
+    if args.get("agent_name"):
+        cmd_args["name"] = args["agent_name"]
+    if args.get("agent_type"):
+        cmd_args["type"] = args["agent_type"]
+
+    res = await api.post(
+        f"/v1/nodes/{node_id}/commands",
+        json={"action": action, "args": cmd_args},
+    )
+    if not res["ok"]:
+        return res
+    data = res["data"] or {}
+    return {
+        "ok": True,
+        "command_id": data.get("commandId"),
+        "status": data.get("status"),
+        "note": (
+            "Queued — the node runs it on its next heartbeat (seconds up to "
+            "~a minute). Check get_node_commands for the result."
+        ),
+    }
+
+
+async def _tool_get_node_commands(api: WorkspaceApi, args: dict) -> dict:
+    node_id = (args.get("node_id") or "").strip()
+    if not node_id:
+        return {"ok": False, "error": "Missing node_id (see list_nodes)"}
+    res = await api.get(f"/v1/nodes/{node_id}/commands", limit=10)
+    if not res["ok"]:
+        return res
+    return {"ok": True, "commands": res["data"] or []}
+
+
+async def _tool_create_task(api: WorkspaceApi, agent_name: str, args: dict) -> dict:
+    title = (args.get("title") or "").strip()
+    if not title:
+        return {"ok": False, "error": "Missing task title"}
+    priority = args.get("priority") if args.get("priority") in ("low", "normal", "high") else "normal"
+    payload: dict = {
+        "network": api.workspace_id,
+        "title": title,
+        "description": (args.get("description") or "").strip(),
+        "priority": priority,
+        "source": f"openagents:{agent_name}",
+    }
+    if args.get("assignee"):
+        payload["assignee"] = args["assignee"]
+    res = await api.post("/v1/tasks", json=payload)
+    if not res["ok"]:
+        return res
+    data = res["data"] or {}
+    return {
+        "ok": True,
+        "task_id": data.get("id"),
+        "title": data.get("title"),
+        "status": data.get("status"),
+        "note": "Created in the Backlog column of the Issues board.",
+    }
+
+
+async def _tool_list_tasks(api: WorkspaceApi) -> dict:
+    res = await api.get("/v1/tasks", network=api.workspace_id)
+    if not res["ok"]:
+        return res
+    tasks = [
+        {
+            "title": t.get("title"),
+            "status": t.get("status"),
+            "priority": t.get("priority"),
+            "assignee": t.get("assignee"),
+        }
+        for t in (res["data"] or {}).get("tasks") or []
+    ]
+    return {"ok": True, "tasks": tasks}
+
+
+async def _tool_create_thread(api: WorkspaceApi, agent_name: str, args: dict) -> dict:
+    title = (args.get("title") or "").strip() or "New thread"
+    participants = [a for a in (args.get("agents") or []) if isinstance(a, str) and a]
+
+    res = await api.post("/v1/events", json={
+        "type": "network.channel.create",
+        "source": f"human:{api.acting_email}",
+        "target": "core",
+        "payload": {"title": title, "participants": participants},
+        "metadata": {},
+        "network": api.workspace_id,
+    })
+    if not res["ok"]:
+        return res
+    metadata = (res["data"] or {}).get("metadata") or {}
+    return {"ok": True, "channel_name": metadata.get("channel_name"), "title": title}
+
+
+async def _tool_add_agent_to_thread(
+    api: WorkspaceApi, agent_name: str, channel_name: Optional[str], args: dict,
+) -> dict:
+    target = (args.get("agent_name") or "").strip()
+    if not channel_name:
+        return {"ok": False, "error": "No current thread"}
+    if not target:
+        return {"ok": False, "error": "Missing agent_name"}
+    if target not in await workspace_member_names(api):
+        return {"ok": False, "error": f"'{target}' is not an agent in this workspace (see list_agents)"}
+    res = await api.post("/v1/events", json={
+        "type": "network.channel.join",
+        "source": f"openagents:{agent_name}",
+        "target": f"channel/{channel_name}",
+        "payload": {"channel": channel_name, "agent_name": target},
+        "metadata": {},
+        "network": api.workspace_id,
+    })
+    if not res["ok"]:
+        return res
+    return {
+        "ok": True, "thread_id": channel_name, "added": target,
+        "note": f"{target} is now in this thread; @mention it to hand off work.",
+    }
+
+
+async def _tool_set_thread_leader(api: WorkspaceApi, channel_name: Optional[str], args: dict) -> dict:
+    target = (args.get("agent_name") or "").strip()
+    if not channel_name:
+        return {"ok": False, "error": "No current thread"}
+    if not target:
+        return {"ok": False, "error": "Missing agent_name"}
+    ch = await api.get(f"/v1/workspaces/{api.workspace_id}/channels/{channel_name}")
+    if not ch["ok"]:
+        return ch
+    if target not in ((ch["data"] or {}).get("participants") or []):
+        return {"ok": False, "error": f"'{target}' is not in this thread — add_agent_to_thread first"}
+    res = await api.patch(
+        f"/v1/workspaces/{api.workspace_id}/channels/{channel_name}",
+        json={"master_agent": target},
+    )
+    if not res["ok"]:
+        return res
+    return {
+        "ok": True, "thread_id": channel_name, "leader": target,
+        "note": "Messages with no @mention now go to the leader.",
+    }
+
+
+async def _tool_read_thread(api: WorkspaceApi, args: dict) -> dict:
+    from app.services.cloud_agent import speaker_label
+
+    thread = (args.get("thread") or "").strip().removeprefix("channel/")
+    if not thread:
+        return {"ok": False, "error": "Missing thread id (see list_threads)"}
+    try:
+        limit = max(1, min(int(args.get("limit") or 30), 60))
+    except (TypeError, ValueError):
+        limit = 30
+    res = await api.get(
+        "/v1/events", network=api.workspace_id, channel=thread,
+        type="workspace.message.posted", sort="desc", limit=limit * 2,
+    )
+    if not res["ok"]:
+        return res
+    data = res["data"]
+    evs = data if isinstance(data, list) else (data or {}).get("events") or []
+    lines = []
+    for e in evs:
+        payload = e.get("payload") or {}
+        if payload.get("message_type", "chat") != "chat":
+            continue
+        text = (payload.get("content") or "").strip()
+        if not text:
+            continue
+        lines.append({"speaker": speaker_label(e.get("source") or "", payload), "text": text[:400]})
+        if len(lines) >= limit:
+            break
+    lines.reverse()
+    return {"ok": True, "thread_id": thread, "messages": lines}
+
+
+async def _tool_post_to_thread(
+    api: WorkspaceApi, agent_name: str, channel_name: Optional[str],
+    args: dict, allow_delegation: bool,
+) -> dict:
+    thread = (args.get("thread") or "").strip().removeprefix("channel/")
+    message = (args.get("message") or "").strip()
+    if not thread or not message:
+        return {"ok": False, "error": "Missing thread id or message"}
+    if channel_name and thread == channel_name:
+        return {"ok": False, "error": "That's the current thread — just reply here instead"}
+    if not allow_delegation:
+        return {"ok": False, "error": (
+            "Hand-offs are only made when the human asks for them; another "
+            "agent's message can't trigger one"
+        )}
+    members = await workspace_member_names(api)
+    targets = delegation_targets(message, members, agent_name)
+    # Posted as the person Yumi works for: the thread's rules (who may post,
+    # which agents they may wake) apply to them, as if they typed it.
+    res = await api.post("/v1/events", json={
+        "type": "workspace.message.posted",
+        "source": f"human:{api.acting_email}",
+        "target": f"channel/{thread}",
+        "payload": {"content": message, "message_type": "chat"},
+        "metadata": {"sent_via": agent_name},
+        "network": api.workspace_id,
+    })
+    if not res["ok"]:
+        return res
+    note = (
+        ("Delivered to " + ", ".join(targets) + ". ") if targets else
+        "Posted, but it @mentions no agent so nobody will act on it — "
+        "@mention the agent to hand off. "
+    ) + (
+        "You are not in that thread and won't see replies there by yourself — "
+        "call watch_thread on it now if the human expects an update here; "
+        "otherwise use read_thread later to check on it."
+    )
+    return {"ok": True, "thread_id": thread, "delivered_to": targets, "note": note}
+
+
+# ---------------------------------------------------------------------------
+# Watches — bounded subscriptions (see services/watches)
+# ---------------------------------------------------------------------------
+
+async def _tool_watch(
+    api: WorkspaceApi, agent_name: str, channel_name: Optional[str],
+    subject_kind: str, args: dict,
+) -> dict:
+    if not channel_name:
+        return {"ok": False, "error": "Watches can only be set from inside a thread"}
+    key = "thread" if subject_kind == "thread" else "agent"
+    subject = (args.get(key) or "").strip().removeprefix("channel/").removeprefix("openagents:")
+    if not subject:
+        return {"ok": False, "error": f"Missing {key}"}
+    if subject_kind == "thread" and subject == channel_name:
+        return {"ok": False, "error": "That's the current thread — you already see it; no watch needed"}
+    body: dict = {
+        "network": api.workspace_id,
+        "source": f"openagents:{agent_name}",
+        "channel": channel_name,
+        "subject_kind": subject_kind,
+        "subject": subject,
+        "note": (args.get("note") or "").strip() or None,
+    }
+    for opt in ("minutes", "max_fires"):
+        if args.get(opt) is not None:
+            try:
+                body[opt] = int(args[opt])
+            except (TypeError, ValueError):
+                pass
+    res = await api.post("/v1/watches", json=body)
+    if not res["ok"]:
+        return res
+    data = res["data"] or {}
+    w = data.get("watch") or {}
+    what = f"thread {subject}" if subject_kind == "thread" else f"agent {subject}"
+    return {
+        "ok": True,
+        "watch_id": w.get("id"),
+        "watching": what,
+        "expires_at": w.get("expires_at"),
+        "max_fires": w.get("max_fires"),
+        "refreshed": data.get("refreshed", False),
+        "note": (
+            f"Armed. You'll be woken in THIS thread with a 'Watch update' when {what} "
+            f"posts a final reply or error (or its task changes column), up to "
+            f"{w.get('max_fires')} times, until {w.get('expires_at')}. If nothing "
+            "happens by then you get one 'Watch expired' message. Tell the human "
+            "you'll message them here when there's news."
+        ),
+    }
+
+
+async def _tool_list_watches(api: WorkspaceApi, agent_name: str) -> dict:
+    res = await api.get(
+        "/v1/watches", network=api.workspace_id, source=f"openagents:{agent_name}",
+    )
+    if not res["ok"]:
+        return res
+    rows = (res["data"] or {}).get("watches") or []
+    return {
+        "ok": True,
+        "watches": [
+            {
+                "watch_id": w.get("id"),
+                "subject_kind": w.get("subject_kind"),
+                "subject": w.get("subject"),
+                "origin_thread": w.get("origin_channel"),
+                "note": w.get("note"),
+                "fires": w.get("fires"),
+                "max_fires": w.get("max_fires"),
+                "expires_at": w.get("expires_at"),
+            }
+            for w in rows
+        ],
+    }
+
+
+async def _tool_stop_watch(api: WorkspaceApi, args: dict) -> dict:
+    watch_id = (args.get("watch_id") or "").strip()
+    if not watch_id:
+        return {"ok": False, "error": "Missing watch_id (see list_watches)"}
+    res = await api.request(
+        "DELETE", f"/v1/watches/{watch_id}", params={"network": api.workspace_id},
+    )
+    if not res["ok"]:
+        return res
+    return {"ok": True, "watch_id": watch_id, "status": "stopped"}

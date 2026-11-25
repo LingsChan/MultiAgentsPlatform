@@ -1,0 +1,110 @@
+/**
+ * Adapter registry — maps agent type names to adapter classes.
+ */
+
+'use strict';
+
+const BaseAdapter = require('./base');
+const OpenClawAdapter = require('./openclaw');
+const ClaudeAdapter = require('./claude');
+const CodexAdapter = require('./codex');
+const OpenCodeAdapter = require('./opencode');
+const NanoClawAdapter = require('./nanoclaw');
+const CursorAdapter = require('./cursor');
+const HermesAdapter = require('./hermes');
+const GeminiAdapter = require('./gemini');
+const KimiAdapter = require('./kimi');
+const AiderAdapter = require('./aider');
+const GooseAdapter = require('./goose');
+const CopilotAdapter = require('./copilot');
+const ClineAdapter = require('./cline');
+const AmpAdapter = require('./amp');
+const MiniSweAgentAdapter = require('./mini');
+const PiAdapter = require('./pi');
+const DeepSeekAdapter = require('./deepseek');
+const AntigravityAdapter = require('./antigravity');
+const CommandCodeAdapter = require('./commandcode');
+const OpenWorkerAdapter = require('./openworker');
+const CodeBuddyAdapter = require('./codebuddy');
+const CodeArtsAdapter = require('./codearts');
+const MiMoCodeAdapter = require('./mimo-code');
+const QoderAdapter = require('./qoder');
+const QoderCnAdapter = require('./qoder-cn');
+const QwenCodeAdapter = require('./qwen-code');
+const KiroAdapter = require('./kiro');
+
+const ADAPTER_MAP = {
+  openclaw: OpenClawAdapter,
+  claude: ClaudeAdapter,
+  codex: CodexAdapter,
+  opencode: OpenCodeAdapter,
+  nanoclaw: NanoClawAdapter,
+  cursor: CursorAdapter,
+  hermes: HermesAdapter,
+  gemini: GeminiAdapter,
+  kimi: KimiAdapter,
+  aider: AiderAdapter,
+  goose: GooseAdapter,
+  copilot: CopilotAdapter,
+  cline: ClineAdapter,
+  amp: AmpAdapter,
+  'mini-swe-agent': MiniSweAgentAdapter,
+  pi: PiAdapter,
+  deepseek: DeepSeekAdapter,
+  antigravity: AntigravityAdapter,
+  commandcode: CommandCodeAdapter,
+  openworker: OpenWorkerAdapter,
+  codebuddy: CodeBuddyAdapter,
+  codearts: CodeArtsAdapter,
+  'mimo-code': MiMoCodeAdapter,
+  qoder: QoderAdapter,
+  'qoder-cn': QoderCnAdapter,
+  'qwen-code': QwenCodeAdapter,
+  kiro: KiroAdapter,
+};
+
+/**
+ * Create an adapter instance for the given agent type.
+ * @param {string} type - Agent type (openclaw, claude, codex, opencode, nanoclaw, cursor, hermes, gemini, kimi, aider, goose, copilot, cline, amp, mini-swe-agent, pi, deepseek, antigravity, commandcode, openworker, codebuddy, codearts, mimo-code, qoder, qoder-cn, qwen-code, kiro)
+ * @param {object} opts - Adapter constructor options
+ * @returns {BaseAdapter}
+ */
+function createAdapter(type, opts) {
+  const AdapterClass = ADAPTER_MAP[type];
+  if (!AdapterClass) {
+    throw new Error(`Unknown agent type: ${type}. Supported: ${Object.keys(ADAPTER_MAP).join(', ')}`);
+  }
+  return new AdapterClass(opts);
+}
+
+module.exports = {
+  BaseAdapter,
+  OpenClawAdapter,
+  ClaudeAdapter,
+  CodexAdapter,
+  OpenCodeAdapter,
+  NanoClawAdapter,
+  CursorAdapter,
+  HermesAdapter,
+  GeminiAdapter,
+  KimiAdapter,
+  AiderAdapter,
+  GooseAdapter,
+  CopilotAdapter,
+  ClineAdapter,
+  AmpAdapter,
+  MiniSweAgentAdapter,
+  PiAdapter,
+  DeepSeekAdapter,
+  AntigravityAdapter,
+  CommandCodeAdapter,
+  OpenWorkerAdapter,
+  CodeArtsAdapter,
+  MiMoCodeAdapter,
+  QoderAdapter,
+  QoderCnAdapter,
+  QwenCodeAdapter,
+  KiroAdapter,
+  createAdapter,
+  ADAPTER_MAP,
+};

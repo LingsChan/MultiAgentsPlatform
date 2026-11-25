@@ -1,0 +1,317 @@
+'use client';
+import { workspaceApi } from '@/lib/api';
+import { ArtifactPanel } from '@/components/artifacts/artifact-panel';
+import { useThreadArtifactPreview } from '@/components/artifacts/thread-artifact-controller';
+import { resourcePath } from '@/lib/resource-link';
+import { threadPath, messagePath, requestedThreadId, requestedMessageId } from '@/lib/thread-link';
+import { desktopHost } from '@/lib/desktop-host';
+import { Activity, useEffect, useRef, useState } from 'react';
+import { useDesktopWorkspaceState } from './use-desktop-workspace-state';
+import { useSignalNotifications } from './use-signal-notifications';
+import { useLandingNote } from './use-landing-note';
+import { useDesktopThreadLinks } from './use-desktop-thread-links';
+import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar';
+import { AppSidebar } from './app-sidebar';
+import { ArtifactSplitView } from './artifact-split-view';
+import { AppHeader } from './app-header';
+import { OnboardingSurfaceContext } from './onboarding-surface';
+import { MobileShell } from './mobile-shell';
+import { ImportSessionsHost } from '@/components/agents/import-sessions-host';
+import { useLayout, RAIL_WIDTH_COLLAPSED, RAIL_WIDTH_EXPANDED } from './layout-context';
+import { cn } from '@/lib/utils';
+import { hasAddedWorkspaceAgent, shouldOpenFirstRunOnboarding } from '@/lib/first-run-entry';
+import { RoutineList } from '@/components/routines/routine-list';
+import { ChatView } from '@/components/chat/chat-view';
+import { FilePreview } from '@/components/files/file-preview';
+import { TrashView } from '@/components/files/trash-view';
+import { BrowserView } from '@/components/browser/browser-view';
+import { ConnectAgentView } from '@/components/connect/connect-agent-view';
+import { FirstRunOnboarding } from '@/components/connect/first-run-onboarding';
+import { AgentProfilePanel } from '@/components/agents/agent-profile-panel';
+import { MonitorGrid } from '@/components/monitor/monitor-grid';
+import { IssuesView } from '@/components/issues/issues-view';
+import { WorkflowsView } from '@/components/workflows/workflows-view';
+import { SkillsView } from '@/components/skills/skills-view';
+import { InboxView } from '@/components/inbox/inbox-view';
+import { KnowledgeView } from '@/components/knowledge/knowledge-view';
+import { AgentDirectoryView } from '@/components/agents/agent-directory-view';
+ // v1.1 M2
+import { useWorkspace } from '@/lib/workspace-context';
+import { dmCounterpart, myAddress } from '@/lib/dm';
+import { useT } from '@/lib/i18n';
+import { NewThreadDialogHost } from '@/components/threads/new-thread-dialog-host';
+import { WorkspaceLoadError } from './workspace-load-error';
+import { WorkspaceLoadingScreen } from './workspace-loading-screen';
+import { useSearchParams } from 'next/navigation';
+
+/** Narrowest the workspace shell lays out at — the desktop app's minimum window width. */
+export const WORKSPACE_MIN_WIDTH = 960;
+
+export function Wrapper() {
+  const t = useT();
+  useThreadArtifactPreview();
+  useDesktopWorkspaceState();
+  useSignalNotifications();
+  useDesktopThreadLinks();
+  useLandingNote();
+  const {
+    isMobile, viewMode, isAgentPanelOpen, isSidebarOpen, setSidebarOpen,
+    hasListPanel, mobilePane, splitBrowser, showBrowserPreview, isRailExpanded, conversationWidth, setConversationWidth,
+    filesSection, selectedAgentName, setSelectedAgentName, openView, connectSetupRequest,
+  } = useLayout();
+
+  // v1.1 M2: `#?agent=<name>` (where an agent invite lands) opens the agent
+  // directory; the directory itself picks the agent out of the hash.
+  useEffect(() => {
+    const hash = window.location.hash;
+    const q = hash.indexOf('?');
+    if (q >= 0 && new URLSearchParams(hash.slice(q + 1)).has('agent')) openView('agents');
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const { workspace, workspaceLoadError, retryWorkspace, monitorMode, agents, loading, sessions, currentSessionId, currentUser, selectedFileId, selectedKnowledgeId } = useWorkspace();
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const [welcomeActive, setWelcomeActive] = useState(false);
+  const [welcomeKey, setWelcomeKey] = useState(0);
+  const [forceWelcome, setForceWelcome] = useState(false);
+  const openWelcome = () => {
+    setOnboardingDismissed(false);
+    setForceWelcome(true);
+    setWelcomeKey(key => key + 1);
+    openView('connect');
+  };
+  const finishWelcome = () => setForceWelcome(false);
+  const openConnect = () => {
+    setOnboardingDismissed(true);
+    setForceWelcome(false);
+    openView('connect');
+  };
+  const previewWelcome = useSearchParams().get('welcome') === 'preview';
+  useEffect(() => {
+    if (previewWelcome) openView('connect');
+    // This is an explicit preview entry, not a navigation lock.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewWelcome]);
+  // Resolve a stable identity before writing the URL; never expose DM participants.
+  useEffect(() => {
+    if (loading || workspaceLoadError || desktopHost()) return;
+    let active = true;
+    const update = async () => {
+      const url = new URL(window.location.href);
+      const workspaceSlug = decodeURIComponent(url.pathname.split('/')[1]);
+      if (viewMode === 'issues') return;
+      if (viewMode === 'files' || viewMode === 'knowledge') {
+        url.pathname = resourcePath(workspaceSlug, viewMode, viewMode === 'files' ? selectedFileId : selectedKnowledgeId);
+      } else if (viewMode === 'threads' && currentSessionId) {
+        try {
+          const link = await workspaceApi.getThreadLink(currentSessionId);
+          if (!active) return;
+          const linkedThread = requestedThreadId(url.href);
+          const messageId = linkedThread === link.id || linkedThread === currentSessionId ? requestedMessageId(url.href) : null;
+          url.pathname = messageId ? messagePath(workspaceSlug, link.id, messageId) : threadPath(workspaceSlug, link.id);
+        } catch { return; }
+      } else if (viewMode !== 'threads') {
+        url.pathname = `/${encodeURIComponent(workspaceSlug)}`;
+      }
+      for (const key of ['thread', 'issue', 'knowledge', 'file', 'message']) url.searchParams.delete(key);
+      if (active && url.href !== window.location.href) window.history.replaceState(window.history.state, '', url);
+    };
+    void update();
+    return () => { active = false; };
+  }, [loading, workspaceLoadError, currentSessionId, viewMode, selectedFileId, selectedKnowledgeId, currentUser.id]);
+  const visitedViews = useRef(new Set([viewMode]));
+  visitedViews.current.add(viewMode);
+
+  // Auto-dismiss the docked agent-profile panel when the user navigates away:
+  // switching to another thread (incl. starting a new chat) or to another view
+  // should not leave the profile pinned to the right. It stays open only while
+  // the selected agent's own DM is the active session in the threads view.
+  // Compared against previous values so merely *opening* the panel (which sets
+  // session+view+agent in the same tick) doesn't immediately close it.
+  const prevNavRef = useRef<{ session: string | null; view: string }>({ session: currentSessionId, view: viewMode });
+  useEffect(() => {
+    const navChanged =
+      prevNavRef.current.session !== currentSessionId || prevNavRef.current.view !== viewMode;
+    prevNavRef.current = { session: currentSessionId, view: viewMode };
+    if (!navChanged || !selectedAgentName) return;
+    // Either the viewer's own DM id or a legacy `human:user` one with this agent.
+    const isAgentDm = dmCounterpart(currentSessionId, myAddress(currentUser)) === `openagents:${selectedAgentName}`;
+    if (viewMode !== 'threads' || !isAgentDm) setSelectedAgentName(null);
+  }, [currentSessionId, viewMode, selectedAgentName, setSelectedAgentName, currentUser]);
+  // Registered agents count even while offline. Yumi is built in and does not
+  // complete setup; removing the last added agent makes Welcome available again.
+  const hasAgents = hasAddedWorkspaceAgent(agents);
+  const welcomeAvailable = !hasAgents;
+  // Keep setup available from Connect Agent without replacing conversations.
+  const userSessions = sessions.filter(
+    (s) => !(s.master && agents.some((a) => a.builtin && a.agentName === s.master)),
+  );
+  const firstRunEntryChecked = useRef<string | null>(null);
+  useEffect(() => {
+    if (loading || workspaceLoadError || !workspace || !currentUser.id) return;
+    const key = `oa:firstRunEntry:${workspace.workspaceId}:${currentUser.id}`;
+    if (firstRunEntryChecked.current === key) return;
+    firstRunEntryChecked.current = key;
+    const path = window.location.pathname.split('/').filter(Boolean);
+    const inviteHash = window.location.hash.split('?')[1];
+    if (!shouldOpenFirstRunOnboarding({
+      needsFirstDevice: workspace.needsFirstDevice === true,
+      hasAgents,
+      hasUserSessions: userSessions.length > 0,
+      isDirectMessage: currentSessionId?.startsWith('dm:') === true,
+      isWorkspaceLanding: (path.length === 1 || (path.length === 3 && path[1] === 'threads')) &&
+        !(inviteHash && new URLSearchParams(inviteHash).has('agent')),
+      viewMode,
+    })) return;
+    try {
+      if (localStorage.getItem(key) === '1' && localStorage.getItem('oa:welcomeFilmSeen') === '1') return;
+      localStorage.setItem(key, '1');
+    } catch { /* Private browsing still gets setup once per mounted workspace. */ }
+    openView('connect');
+  }, [loading, workspaceLoadError, workspace, currentUser.id, hasAgents, userSessions.length, currentSessionId, viewMode, openView]);
+  const showOnboarding =
+    !onboardingDismissed && viewMode === 'connect' &&
+    (forceWelcome || !connectSetupRequest) &&
+    (previewWelcome || !hasAgents);
+
+  const dismissOnboarding = () => {
+    setOnboardingDismissed(true);
+    if (viewMode === 'connect') openView('threads');
+  };
+
+  if (loading) {
+    return <WorkspaceLoadingScreen />;
+  }
+
+  if (workspaceLoadError) {
+    return <WorkspaceLoadError status={workspaceLoadError.status} onRetry={retryWorkspace} />;
+  }
+
+  if (isMobile) {
+    return <>
+      <MobileShell showOnboarding={showOnboarding} dismissOnboarding={dismissOnboarding}
+        welcomeActive={welcomeActive} onWelcomeChange={setWelcomeActive} previewWelcome={previewWelcome}
+        welcomeAvailable={welcomeAvailable} openWelcome={openWelcome} openConnect={openConnect} welcomeKey={welcomeKey}
+        forceWelcome={forceWelcome} onWelcomeComplete={finishWelcome} />
+      <ImportSessionsHost />
+    </>;
+  }
+
+  // ── Desktop layout (app-shell-4) ──
+  // The sidebar holds both the icon rail and the list panel; SidebarInset is
+  // the detail area, and each view brings its own `--header-height` header so
+  // rail, list and detail line up on a single row.
+  //
+  // A few views take over the whole detail area, so the list collapses away:
+  // onboarding (no agents yet), monitor mode, and the split browser preview.
+  const listSuppressed =
+    showOnboarding ||
+    (viewMode === 'threads' && monitorMode) ||
+    (viewMode === 'threads' && splitBrowser && showBrowserPreview);
+  const sidebarOpen = isSidebarOpen && hasListPanel && !listSuppressed;
+
+  // The shell sizes itself: rail width plus the list panel when it is showing.
+  // Expanding the rail to show labels widens the shell by the same amount.
+  const railWidth = isRailExpanded ? RAIL_WIDTH_EXPANDED : RAIL_WIDTH_COLLAPSED;
+  const shellWidth = railWidth + (sidebarOpen ? 388 : 0);
+
+  // On a computer a narrow window stays the desktop shell: one narrower than
+  // the shell's minimum scrolls it sideways inside this frame rather than
+  // squeezing rail, list and detail out of shape (or switching to the phone
+  // layout); the frame keeps the height exact so no vertical page scroll
+  // appears with it.
+  return (
+    <OnboardingSurfaceContext.Provider value={{ active: showOnboarding, welcome: showOnboarding && welcomeActive,
+      welcomeAvailable, onOpenWelcome: openWelcome, onOpenConnect: openConnect, onDismiss: dismissOnboarding }}>
+    <div className="h-[calc(100vh-var(--oa-banner-h,0px))] w-full overflow-x-auto overflow-y-hidden">
+    <SidebarProvider
+      open={sidebarOpen}
+      onOpenChange={setSidebarOpen}
+      className="relative h-full min-h-0 bg-sidebar [&_.container-fluid]:px-5"
+      style={{
+        minWidth: WORKSPACE_MIN_WIDTH,
+        '--sidebar-width': `${shellWidth}px`,
+        '--sidebar-width-icon': `${railWidth}px`,
+        '--header-height': '48px',
+      } as React.CSSProperties}
+    >
+      <AppSidebar />
+
+      {/* The inset card of shadcn's dashboard-01: the rail sits on the sidebar
+          colour and the list and detail panes share one card in front of it.
+          The list pane draws the card's leading edge and the seam (see
+          ListPanel); with no list showing, the detail pane closes the card. */}
+      <SidebarInset
+        className={cn(
+          'my-2 me-2 min-w-0 overflow-hidden rounded-e-xl border-y border-e',
+          !sidebarOpen && 'rounded-s-xl border-s',
+        )}
+      >
+        {!showOnboarding && viewMode !== 'connect' && <AppHeader />}
+        <div className="relative flex min-h-0 grow overflow-hidden">
+          {showOnboarding ? (
+            /* Guided first-agent setup owns the full Connect Agent surface. */
+            <div className="relative flex-1 min-w-0 overflow-hidden bg-background">
+              <FirstRunOnboarding key={welcomeKey} onDismiss={dismissOnboarding} onWelcomeChange={setWelcomeActive}
+                previewWelcome={previewWelcome} forceWelcome={forceWelcome} onWelcomeComplete={finishWelcome} />
+            </div>
+          ) : viewMode === 'threads' && monitorMode ? (
+            /* Monitor mode: 2x3 grid over the whole detail area */
+            <div className="relative flex-1 min-w-0">
+              <MonitorGrid />
+              {isAgentPanelOpen && <AgentProfilePanel />}
+            </div>
+          ) : viewMode === 'threads' && splitBrowser && showBrowserPreview ? (
+            /* Split view: conversation + artifact side by side */
+            <ArtifactSplitView width={conversationWidth} onResize={setConversationWidth} conversation={
+              <>
+                <div className="h-full">
+                  <ChatView />
+                </div>
+                {isAgentPanelOpen && <AgentProfilePanel />}
+              </>
+            } preview={<ArtifactPanel />} />
+          ) : (
+            <div className="relative flex-1 min-w-0 overflow-hidden bg-background">
+              {/* Kept mounted like the views below: remounting a long thread or
+                  a large file grid on every switch back was the visible lag. */}
+              {visitedViews.current.has('threads') && (
+                <Activity mode={viewMode === 'threads' ? 'visible' : 'hidden'}>
+                  {/* In the chat view the profile DOCKS beside the thread instead
+                      of sliding over it: clicking an agent opens their DM in the
+                      middle with the profile alongside, so neither hides the other. */}
+                  <div className="h-full flex">
+                    <div className="relative flex-1 min-w-0 overflow-hidden">
+                      <ChatView />
+                    </div>
+                    {isAgentPanelOpen && viewMode === 'threads' && <AgentProfilePanel docked />}
+                  </div>
+                </Activity>
+              )}
+              {visitedViews.current.has('routines') && <Activity mode={viewMode === 'routines' ? 'visible' : 'hidden'}><RoutineList /></Activity>}
+              {visitedViews.current.has('files') && (
+                <Activity mode={viewMode === 'files' ? 'visible' : 'hidden'}>
+                  {filesSection === 'trash' ? <TrashView /> : <FilePreview />}
+                </Activity>
+              )}
+              {visitedViews.current.has('browser') && <Activity mode={viewMode === 'browser' ? 'visible' : 'hidden'}><BrowserView /></Activity>}
+              {visitedViews.current.has('connect') && <Activity mode={viewMode === 'connect' ? 'visible' : 'hidden'}><ConnectAgentView /></Activity>}
+              {visitedViews.current.has('issues') && <Activity mode={viewMode === 'issues' ? 'visible' : 'hidden'}><IssuesView /></Activity>}
+              {visitedViews.current.has('workflows') && <Activity mode={viewMode === 'workflows' ? 'visible' : 'hidden'}><WorkflowsView /></Activity>}
+              {visitedViews.current.has('inbox') && <Activity mode={viewMode === 'inbox' ? 'visible' : 'hidden'}><InboxView /></Activity>}
+              {visitedViews.current.has('skills') && <Activity mode={viewMode === 'skills' ? 'visible' : 'hidden'}><SkillsView /></Activity>}
+              {visitedViews.current.has('agents') && <Activity mode={viewMode === 'agents' ? 'visible' : 'hidden'}><AgentDirectoryView /></Activity>}
+              {visitedViews.current.has('knowledge') && <Activity mode={viewMode === 'knowledge' ? 'visible' : 'hidden'}><KnowledgeView /></Activity>}
+
+              {/* Agent profile slide-over (non-chat views keep the overlay) */}
+              {isAgentPanelOpen && viewMode !== 'threads' && <AgentProfilePanel />}
+            </div>
+          )}
+        </div>
+      </SidebarInset>
+
+      <NewThreadDialogHost />
+      <ImportSessionsHost />
+    </SidebarProvider>
+    </div>
+    </OnboardingSurfaceContext.Provider>
+  );
+}

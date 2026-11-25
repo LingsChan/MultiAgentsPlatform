@@ -1,0 +1,181 @@
+'use client';
+import { useEffect, useId, useState } from 'react';
+import { CircleDot } from 'lucide-react';
+import { useWorkspace } from '@/lib/workspace-context';
+import { workspaceApi } from '@/lib/api';
+import { useT } from '@/lib/i18n';
+import type { WorkspaceIssue } from '@/lib/types';
+import { Button } from '@/components/ui/button';
+import { Field, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { AttachmentPicker } from '@/components/tasks/new-task-dialog';
+import { IssueAssigneePicker } from './issue-assignee-picker';
+import { IssueMentionInput } from './issue-mention-input';
+import { useIssueMentions } from './use-issue-mentions';
+import {
+  Dialog,
+  DialogContent,
+  DialogBody,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/responsive-dialog';
+import { ErrorNotice, errorMessage } from './issue-ui';
+
+export function IssueEditor({
+  open,
+  onOpenChange,
+  issue,
+  onSaved,
+  boardId,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  issue?: WorkspaceIssue;
+  /** Board a new issue is filed on (default: Team issues). */
+  boardId?: string;
+  onSaved: (issue: WorkspaceIssue) => void;
+}) {
+  const t = useT();
+  const descriptionId = useId();
+  const assigneeId = useId();
+  const { currentUser } = useWorkspace();
+  const mentions = useIssueMentions(issue);
+  const [title, setTitle] = useState(issue?.title ?? '');
+  const [description, setDescription] = useState(issue?.description ?? '');
+  const [assignee, setAssignee] = useState('');
+  const [fileIds, setFileIds] = useState<string[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    if (open) {
+      setTitle(issue?.title ?? '');
+      setDescription(issue?.description ?? '');
+      setAssignee(issue?.assignee ?? '');
+      setFileIds(issue?.file_ids ?? []);
+      setUploading(false);
+      setError('');
+    }
+  }, [open, issue?.id]);
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    if (busy || uploading) return;
+    setBusy(true);
+    setError('');
+    try {
+      const input = {
+        title: title.trim(),
+        description,
+        ...(!issue || JSON.stringify(fileIds) !== JSON.stringify(issue.file_ids ?? []) ? { file_ids: fileIds } : {}),
+        source: `human:${currentUser.id}`,
+        source_name: currentUser.name,
+      };
+      const result = issue
+        ? await workspaceApi.updateIssue(issue.id, input)
+        : await workspaceApi.createIssue({
+            ...input,
+            assignee: assignee || null,
+            ...(boardId ? { board_id: boardId } : {}),
+          });
+      onSaved(result);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(value) => {
+        // Closing while files upload is fine: the picker unmounts and aborts them.
+        if (!busy) onOpenChange(value);
+      }}
+    >
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader className="border-b">
+          <DialogTitle className="flex items-center gap-2 text-sm font-medium">
+            <CircleDot className="size-4 text-muted-foreground" />
+            {t(issue ? 'issues.editIssue' : 'issues.newIssue')}
+          </DialogTitle>
+        </DialogHeader>
+        <form onSubmit={save} className="flex min-h-0 flex-1 flex-col">
+          <DialogBody className="flex flex-col gap-5">
+            <label className="block">
+              <span className="sr-only">{t('issues.title')}</span>
+              <Input
+                autoFocus
+                disabled={busy}
+                value={title}
+                maxLength={240}
+                required
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder={t('issues.titlePlaceholder')}
+                className="h-auto rounded-none border-0 px-0 py-1 text-xl font-medium leading-7 tracking-tight shadow-none placeholder:font-normal focus-visible:ring-0"
+              />
+            </label>
+            <div className="block">
+              <label htmlFor={descriptionId} className="sr-only">
+                {t('issues.description')}
+              </label>
+              <IssueMentionInput
+                id={descriptionId}
+                inlineSuggestions
+                mentions={mentions}
+                disabled={busy}
+                value={description}
+                maxLength={50000}
+                onValueChange={setDescription}
+                placeholder={t('issues.descriptionPlaceholder')}
+                className="min-h-44 resize-y rounded-none border-0 px-0 text-sm leading-6 shadow-none focus-visible:ring-0"
+              />
+            </div>
+            {!issue && (
+              <Field className="border-t border-border/60 pt-4">
+                <FieldLabel htmlFor={assigneeId}>{t('issues.assignee')}</FieldLabel>
+                <IssueAssigneePicker id={assigneeId} value={assignee} onChange={setAssignee} disabled={busy} choices={[
+                  ...mentions.filter(m => m.kind === 'human').map(m => ({ id: m.source, name: m.name })),
+                ]} />
+              </Field>
+            )}
+            <AttachmentPicker value={fileIds} onChange={setFileIds} disabled={busy} onUploadingChange={setUploading} />
+            <p className="text-xs text-muted-foreground">{t('issues.attachmentAudience')}</p>
+            {error && <ErrorNotice message={error} />}
+          </DialogBody>
+          <DialogFooter className="items-center sm:justify-between">
+            <p className="hidden text-xs text-muted-foreground sm:block">
+              {t(issue ? 'issues.editHint' : 'issues.createHint')}
+            </p>
+            <div className="flex w-full justify-end gap-2 sm:w-auto">
+              <Button
+                size="sm"
+                type="button"
+                variant="ghost"
+                disabled={busy}
+                onClick={() => onOpenChange(false)}
+              >
+                {t('common.cancel')}
+              </Button>
+              <Button
+                size="sm"
+                type="submit"
+                disabled={busy || uploading || !title.trim()}
+              >
+                {t(
+                  uploading
+                    ? 'tasks.attachUploading'
+                    : busy
+                    ? 'common.saving'
+                    : issue
+                      ? 'common.save'
+                      : 'issues.createIssue',
+                )}
+              </Button>
+            </div>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

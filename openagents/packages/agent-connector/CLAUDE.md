@@ -1,0 +1,182 @@
+# Agent Connector (@openagents-org/agent-launcher)
+
+Core engine and CLI for the OpenAgents ecosystem. Handles agent discovery, installation, configuration, daemon-based execution, and workspace integration. Published to npm as `@openagents-org/agent-launcher`.
+
+## Architecture
+
+```
+src/
+  index.js           AgentConnector class — main API surface (registry, agent CRUD, install, env, workspace, daemon)
+  cli.js             CLI entry point (`agn` command): search, install, create, env, up/down, status, start/stop, logs, connect
+  daemon.js          Long-running background process: spawns/monitors agent subprocesses, auto-restart with backoff, file-based IPC
+  config.js          YAML config manager for ~/.openagents/daemon.yaml (agents, networks)
+  registry.js        Agent catalog: fetches from remote API or bundled registry.json, 24h cache
+  installer.js       Agent runtime installer: npm/curl/binary, tracks in installed_agents.json
+  agent-login.js     `agn login <agent>`: runs the agent CLI's own sign-in, found where OpenAgents installed it (not on the user's PATH), on device auth when headless (codex)
+  postinstall-stub.js Recognizes the placeholder an npm package leaves as its CLI when its postinstall was skipped (ignore-scripts) — the installer repairs it, the opencode adapter reports it
+  native-build.js    The per-platform optional dependency that holds codex / claude-code / opencode-ai's native binary, and whether npm left it out — the installer installs it on its own before any placeholder repair
+  env.js             Environment manager: ~/.openagents/env/<type>.env, resolve_env rules for generic→provider mapping
+  workspace-client.js HTTP client for workspace REST API: register, join, poll messages, send events, files, browser, todos, timers
+  mcp-server.js      JSON-RPC 2.0 over stdio: exposes workspace tools to agents via MCP protocol
+  identity.js        Agent identity storage (~/.openagents/identity.json)
+  paths.js           Cross-platform binary resolution (nvm, fnm, volta, homebrew, pip, cargo, etc.)
+  tui.js             Interactive terminal dashboard (blessed library)
+
+  adapters/
+    base.js           BaseAdapter — polling loop, heartbeat, channel dispatch, task queuing, session management
+    claude.js         ClaudeAdapter — spawns `claude` CLI with stream-json, per-channel sessions
+    openclaw.js       OpenClawAdapter — TCP/HTTP gateway to OpenClaw daemon, skill auto-install
+    codex.js          CodexAdapter — OpenAI Codex CLI bridge
+    opencode.js       OpenCodeAdapter — opencode-ai CLI bridge
+    nanoclaw.js       NanoClawAdapter — direct OpenAI-compatible API calls (no CLI binary)
+    cursor.js         CursorAdapter — extends LlmDirectAdapter for Cursor CLI
+    hermes.js         HermesAdapter — Nous Research Hermes bridge
+    gemini.js         GeminiAdapter — Google Gemini CLI bridge (legacy — superseded by antigravity)
+    gemini-stream.js  Gemini's own failure wording and resume-retry rule on top of run-failure.js — unit-tested
+    antigravity.js    AntigravityAdapter — Google Antigravity CLI (`agy -p`) bridge, stream-json NDJSON
+    antigravity-stream.js  Pure helpers for AntigravityAdapter (argv builder, event reducer, failure classification, binary candidates) — unit-tested
+    copilot.js        CopilotAdapter — official GitHub Copilot CLI (`copilot`) bridge, JSONL stream
+    copilot-stream-parser.js  Pure JSONL framing + event classification for Copilot CLI
+    cline.js          ClineAdapter — Cline CLI bridge (`cline --json`, one run per message)
+    cline-stream.js   Pure helpers for ClineAdapter (NDJSON parser, event mapping, redaction, error/auth/version classify, arg builder, session correlation) — unit-tested
+    deepseek.js       DeepSeekAdapter — DeepSeek Harness (`dsh --profile headless`) bridge, one process per message
+    deepseek-runtime.js  Pure helpers for DeepSeekAdapter (prerelease-aware version gate, argv, private cordis patch, task-file paths, stderr classification, session GC) — unit-tested
+    commandcode.js    CommandCodeAdapter — Command Code CLI (`command-code -p --output-format json`) bridge, prompt piped over stdin, one run per message
+    commandcode-stream.js  Pure helpers for CommandCodeAdapter (argv builder, NDJSON frame interpreter, exit-code classification, version gate, redaction) — unit-tested
+    openworker.js     OpenWorkerAdapter — OpenWorker (andrewyng/openworker). No headless CLI: spawns one shared `openworker-server` per agent and drives a WebSocket session per channel
+    openworker-runtime.js  Pure helpers for OpenWorkerAdapter (provider/model routing, server argv, secret-profile refs, session addressing, event interpretation, in-line prompt answers, failure classification) — unit-tested
+    codebuddy.js      CodeBuddyAdapter — Tencent CodeBuddy Code CLI (`codebuddy -p --output-format stream-json`) bridge, prompt piped over stdin, workspace tools over --mcp-config. Same engine the WorkBuddy desktop app runs
+    codebuddy-stream.js  Pure helpers for CodeBuddyAdapter (argv builder, stream-json frame interpreter, result-frame classification — the CLI exits 0 on failure — region/auth env, version gate, redaction) — unit-tested
+    mimo-code.js      MiMoCodeAdapter — Xiaomi MiMo Code CLI (`mimo run --format json`, an OpenCode fork; extends OpenCodeAdapter). Provider, key, workspace MCP server and briefing go in per run through MIMOCODE_CONFIG_CONTENT, pinned to one provider; Stop kills the whole process tree
+    mimo-code-runtime.js  Pure helpers for MiMoCodeAdapter (key/base URL/model routing, the per-run config, run argv, process-tree walk, stderr error-line reading) — unit-tested
+    qoder.js          QoderAdapter — Qoder CLI (`qodercli -p -o stream-json`) bridge, prompt piped over stdin, workspace tools over --mcp-config --strict-mcp-config, token or browser sign-in, Stop kills the whole process tree
+    qoder-cn.js       QoderCnAdapter — the China edition (`qoderclicn`), same adapter with the CN edition table
+    qoder-runtime.js  Pure helpers for the Qoder adapters (edition table, argv builder, child env, stream-json frame interpreter, run classification, process-tree walk, version gate, redaction) — unit-tested
+    qwen-code.js      QwenCodeAdapter — Alibaba Qwen Code CLI (`qwen --output-format stream-json`) bridge, prompt piped over stdin, workspace tools over --mcp-config, auto-memory turned off through a system-defaults settings layer
+    qwen-code-stream.js  Pure helpers for QwenCodeAdapter (argv builder, stream-json frame interpreter, run classification, key/base URL/model resolution as one set, settings layer, version gate, redaction) — unit-tested
+    kiro.js           KiroAdapter — Kiro CLI (`kiro-cli acp`) driven over the Agent Client Protocol: one ACP server per message, session/new|load per channel, workspace tools in session/new's mcpServers, approvals answered by the adapter (plan mode refuses writes), KIRO_AGENT selects the Kiro agent profile with the agent's own prompt and MCP servers
+    kiro-runtime.js   Pure helpers for KiroAdapter (version gate, argv, session/update interpretation, permission policy, stale-session/profile-not-found recognition) — unit-tested
+    acp-client.js     Generic ACP client: JSON-RPC 2.0 over a child's stdio (request/response matching, agent→client requests, notifications, timeouts) — reusable by any CLI that serves ACP
+    llm-direct.js     LlmDirectAdapter — base for adapters that call LLM APIs directly (SSE streaming)
+    index.js          Adapter registry mapping type names to classes
+    utils.js          Shared adapter utilities, including the redaction every adapter uses for quoted CLI text (redactSecrets, secretValues)
+    run-failure.js    Shared failure reporting for every adapter: what a failed run means (isFailedRun), which kind of failure the CLI's output describes, and the redacted "guidance + Details:" message the channel gets. Per-adapter wording is passed in — unit-tested
+    workspace-prompt.js  System prompt generation for workspace-connected agents
+
+registry.json        Bundled catalog of agents with metadata, install commands, env config, readiness checks.
+                     GENERATED from the repo-root `registry/` directory by `scripts/sync-registry.js` —
+                     edit `registry/<name>.json`, then `npm run sync:registry`. Never edit this file directly.
+```
+
+## How the daemon works
+
+1. `daemon.js` reads `~/.openagents/daemon.yaml` for agent configs
+2. For each enabled agent, spawns its adapter (resolved via `adapters/index.js`)
+3. Adapter connects to workspace via `workspace-client.js`, polls for messages
+4. Messages dispatched per-channel with task queuing (one task per channel at a time)
+5. Adapter spawns agent CLI subprocess (or calls API directly) to handle each message
+6. Agent calls MCP tools via `mcp-server.js` (stdio JSON-RPC) for workspace operations
+7. Results posted back to workspace
+8. Daemon monitors health, restarts on failure with exponential backoff
+9. Commands received via `~/.openagents/daemon.cmd` file (reload, start:name, stop:name)
+10. Status written to `~/.openagents/daemon.status.json`
+
+## Commands
+
+```bash
+npm test                    # Run tests (node --test)
+npm run lint                # ESLint
+npm run sync:registry       # Regenerate registry.json (and the workspace copy) from registry/
+npm run check:registry      # Verify they match registry/ without writing (what CI enforces)
+
+# CLI (after npm install -g or via npx)
+agn search [query]          # Browse agent catalog
+agn install <type>          # Install agent runtime
+agn login <type|agent>      # Sign the agent's own CLI in to its account (codex login, claude auth login, ...)
+agn create <name> --type <type>  # Create agent instance
+agn env <type> --set K=V    # Set environment variables
+agn up / agn down           # Start/stop daemon
+agn status                  # Show daemon and agent status
+agn start/stop <name>       # Control individual agents
+agn logs                    # View daemon logs
+agn connect <agent> <token> # Connect agent to workspace
+```
+
+## Adding an agent
+
+The catalog entry goes in `registry/<name>.json` at the repo root, plus its name
+in `registry/index.json` and its icon in `registry/icons/`. Then run
+`npm run sync:registry` — that generates this package's `registry.json` and the
+workspace backend's copy, and fills in any icon directory still missing one.
+Editing `registry.json` directly is overwritten by the next sync, and
+`test/registry-sync.test.js` fails on the difference in the meantime.
+
+Adding that entry and an adapter is **not** the whole job.
+Every new agent also has to be DETECTABLE when the user installed its CLI
+themselves, before the launcher ever existed on that machine.
+
+Detection has one source of truth: `getKnownBinDirs()` in `paths.js`. The
+launcher decides "is this installed?" through `installer.getInstallInfo()`,
+which resolves the binary through that list. An adapter that carries its own
+private candidate list will happily RUN a CLI the marketplace reports as "not
+installed" — that drift is the shape of every bug in this area so far (#648,
+and the same report again on launcher 0.9.27).
+
+So, for each new agent:
+
+1. Find out where its CLI really lands, from its own installer — read the
+   install script, don't guess. Note the env var it reads for a custom install
+   dir (`OPENCODE_INSTALL_DIR`, `AMP_HOME`, `GOOSE_BIN_DIR`, `HERMES_HOME`, …).
+2. If that location isn't already covered, add it in `_addAgentInstallerPaths()`
+   — and prefer a rule that covers the NEXT agent too (uv tool venvs and pipx
+   venvs are enumerated, not listed by name).
+3. Add its real routes to `WHERE` in `test/agent-detection-matrix.test.js`, each
+   tagged with its route family. `covers every registry entry` fails when an
+   agent has no case at all; `covers the route the registry itself recommends`
+   fails when the install command in `registry.json` points somewhere the matrix
+   does not prove is detected.
+
+A route the user can take but the machine we test on cannot (a Windows-only
+directory) is written as `null` and skipped — never dropped.
+
+## Tests
+
+Tests are in `test/` using Node.js built-in test runner. Existing test files:
+`cli.test.js`, `config.test.js`, `daemon.test.js`, `env.test.js`, `index.test.js`, `installer.test.js`, `paths.test.js`, `registry.test.js`, `stop-control.test.js`, `workspace-client.test.js`
+
+An npm install that exits 0 without a runnable CLI: `postinstall-stub.test.js`.
+The installer repairs that by running the skipped script for that one package (`npm rebuild <pkg> --ignore-scripts=false`); `OPENAGENTS_NO_SCRIPT_REPAIR=1` turns the repair off, so the install fails with the "Allow install scripts" message instead.
+An npm install that exits 0 without the per-platform package holding the native build (npm drops a failed optional download silently; `omit=optional` skips them all): `native-build.test.js`. The installer installs that one package with `--include=optional --no-save` (from the same `installRegistry()` mirror as the main install), then re-runs the wrapper's script where it copies the binary (claude-code, opencode-ai). A wrapper whose bin is already the real binary is left alone without the package: opencode-ai's postinstall fetches the build into a temp dir itself and deletes it after copying.
+
+Failure reporting: `run-failure.test.js` (the shared rules),
+`adapter-failure-reporting.test.js` (what each adapter's channel is actually
+told when a run fails) and `redact-secrets.test.js` (what is stripped from
+anything quoted there).
+
+CLI or exception text posted to a channel goes through `this._redact()` (or
+`secrets: this._knownSecrets()` for the classifier), never out as it came: it
+masks the agent's own keys and workspace token by value, then anything shaped
+like a credential. Authored guidance is not passed through it.
+
+Detection specifically: `agent-detection-matrix.test.js` (every agent, every
+install route), `binary-discovery.test.js` (the GUI-launch PATH, install-dir
+env vars, uv/pipx/Homebrew), `resolve-binary-known-dirs.test.js`.
+
+## MCP tool modules (exposed to agents)
+
+- **Core** (always on): `workspace_get_history`, `workspace_get_agents`, `workspace_status`
+- **Files**: `workspace_list_files`, `workspace_read_file`, `workspace_write_file`, `workspace_delete_file`
+- **Browser**: `workspace_browser_open`, `workspace_browser_navigate`, `workspace_browser_click`, `workspace_browser_type`, `workspace_browser_screenshot`, `workspace_browser_snapshot`, `workspace_browser_close`, `workspace_browser_list_tabs`, `workspace_browser_list_contexts`
+- **Tunnel**: `workspace_tunnel_expose`, `workspace_tunnel_close`, `workspace_tunnel_list`
+- **Todos**: `workspace_put_todos`, `workspace_get_todos`
+- **Timers**: `workspace_create_timer`, `workspace_list_timers`, `workspace_cancel_timer`
+- **Routines**: `workspace_create_routine`, `workspace_list_routines`, `workspace_update_routine`, `workspace_cancel_routine`
+
+## Key design patterns
+
+- **Adapter pattern**: Each agent type plugs in via a class extending BaseAdapter
+- **File-based IPC**: Daemon communicates with CLI/launcher via daemon.cmd, daemon.status.json, daemon.pid
+- **Event cursor**: Each adapter tracks last-seen event ID to avoid reprocessing
+- **Resolve env**: Generic LLM_* vars mapped to provider-specific vars (OPENAI_API_KEY vs ANTHROPIC_API_KEY) based on base URL
+- **Isolated runtimes**: Each agent type gets own npm prefix at ~/.openagents/runtimes/<type>/
+- **Adaptive polling**: 2s active → 5s warm plateau (5 min) → ramp to 15s cold

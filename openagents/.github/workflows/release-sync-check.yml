@@ -1,0 +1,38 @@
+name: Release sync check
+
+# `release` is the self-hosted release track: every self-hosted release is a
+# fast-forward of develop (see selfhost-release.yml). This fails whenever
+# `release` carries commits that never landed on develop, which would block the
+# next self-hosted release. (Hosted production, openagents-release, carries its
+# own hosted-layer commits on purpose and is not checked here.)
+
+on:
+  push:
+    branches: [develop, release]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: release is a fast-forward ancestor of develop
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - run: |
+          set -euo pipefail
+          git fetch --quiet origin develop release
+          DEV=$(git rev-parse origin/develop)
+          REL=$(git rev-parse origin/release)
+          if git merge-base --is-ancestor "$REL" "$DEV"; then
+            BEHIND=$(git rev-list --count "$REL..$DEV")
+            echo "OK: release ($REL) is on develop; develop is $BEHIND commit(s) ahead."
+            exit 0
+          fi
+          echo "::error::release has commits that are not on develop. The next self-hosted release (fast-forward) is blocked until this is reconciled."
+          git log --format='  %h %an %s' "$DEV..$REL"
+          exit 1

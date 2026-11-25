@@ -1,0 +1,402 @@
+import React from "react"
+import { describe, it, expect, beforeEach, vi } from "vitest"
+import { act, render, screen, waitFor, within } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
+
+import Install from "./index"
+import { useInstallStore } from "../../store/install"
+import { useAgentsStore } from "../../store/agents"
+import { useUiStore } from "../../store/ui"
+import type { CatalogEntry } from "../../types"
+
+vi.mock("../../lib/analytics", () => ({ capture: vi.fn() }))
+
+type Api = Record<string, ReturnType<typeof vi.fn>>
+
+const CATALOG: CatalogEntry[] = [
+  {
+    name: "codex",
+    label: "OpenAI Codex CLI",
+    description: "OpenAI's coding agent in your terminal.",
+    tags: ["coding", "openai", "cli"],
+    featured: true,
+    installed: true,
+    // All three platform keys, as the real registry writes them: the channel
+    // selector only appears for agents that resolve to an npm package, and
+    // which key it reads depends on the OS the test happens to run on.
+    install: {
+      binary: "codex",
+      requires: ["nodejs"],
+      macos: "npm install -g @openai/codex",
+      linux: "npm install -g @openai/codex",
+      windows: "npm install -g @openai/codex",
+    },
+  },
+  {
+    name: "claude",
+    label: "Claude Code CLI",
+    description: "Anthropic's official terminal agent.",
+    tags: ["coding", "cli"],
+    installed: true,
+    install: { binary: "claude", requires: ["nodejs"] },
+    check_ready: { login_command: "claude login" },
+  },
+  {
+    name: "openclaw",
+    label: "OpenClaw",
+    description: "Open-source orchestration layer.",
+    tags: ["coding", "open-source"],
+    installed: false,
+    install: { binary: "openclaw", requires: ["nodejs"] },
+  },
+]
+
+function installApi(overrides: Partial<Api> = {}): Api {
+  const api: Api = {
+    getNodeStatus: vi.fn().mockResolvedValue({
+      connected: false,
+      workspaceSlug: null,
+      workspaceName: null,
+      workspaces: [],
+      revoked: [],
+    }),
+    getCatalog: vi.fn().mockResolvedValue(CATALOG),
+    getInstalledAgents: vi
+      .fn()
+      .mockResolvedValue([{ name: "codex", version: "0.146.0" }]),
+    // claude has a newer version published than the one on disk.
+    checkAgentUpdates: vi
+      .fn()
+      .mockResolvedValue([{ name: "claude", current: "2.3.1", latest: "2.4.0" }]),
+    listAgents: vi.fn().mockResolvedValue([]),
+    getAgentUpdateTarget: vi.fn().mockResolvedValue({ kind: "managed" }),
+    getEnvFields: vi.fn().mockResolvedValue([]),
+    getAgentEnv: vi.fn().mockResolvedValue({}),
+    saveAgentEnv: vi.fn().mockResolvedValue(undefined),
+    getAgentChangelog: vi
+      .fn()
+      .mockResolvedValue({ versions: [{ version: "0.146.0" }], latest: "0.146.0" }),
+    healthCheck: vi.fn().mockResolvedValue({ ready: true, version: "0.146.0" }),
+    getSetting: vi.fn().mockResolvedValue(null),
+    setSetting: vi.fn().mockResolvedValue(undefined),
+    installAgentTypeStreaming: vi.fn().mockResolvedValue({ success: true }),
+    refreshLogin: vi.fn().mockResolvedValue({ logged_in: false, ready: false }),
+    openTerminal: vi.fn().mockResolvedValue(undefined),
+    onCliLoginEvent: vi.fn(() => () => {}),
+    startCliLogin: vi.fn().mockResolvedValue({ mode: "in-app" }),
+    submitCliLoginCode: vi.fn().mockResolvedValue(undefined),
+    cancelCliLogin: vi.fn().mockResolvedValue(undefined),
+    testLLM: vi.fn().mockResolvedValue({ success: true, model: "gpt-5" }),
+    addAgent: vi.fn().mockResolvedValue(undefined),
+    openExternal: vi.fn(),
+    ...overrides,
+  }
+  ;(window as unknown as { api: Api }).api = api
+  return api
+}
+
+const showToast = vi.fn()
+
+beforeEach(() => {
+  useInstallStore.setState({ jobs: {}, installed: [], updates: [] })
+  useAgentsStore.setState({ agents: [] })
+  // Both outlive the page, so a deep-link left over from one case would decide
+  // where the next one opens.
+  useUiStore.setState({ installFocusAgent: null, installListSignal: 0, installListFilter: "all", pendingCreate: null, pendingCreateType: null })
+  localStorage.clear()
+  showToast.mockClear()
+  installApi()
+})
+
+describe("marketplace", () => {
+  it("offers an update for an outdated system install", async () => {
+    installApi({
+      getCatalog: vi.fn().mockResolvedValue([
+        { ...CATALOG[0], managed: false, location: "global" },
+      ]),
+      getInstalledAgents: vi.fn().mockResolvedValue([]),
+      checkAgentUpdates: vi.fn().mockResolvedValue([
+        { name: "codex", current: "0.150.0", latest: "0.160.0" },
+      ]),
+      healthCheck: vi.fn().mockResolvedValue({
+        installed: true,
+        binary: "C:\\npm\\codex.cmd",
+        version: "0.150.0",
+      }),
+      getAgentUpdateTarget: vi.fn().mockResolvedValue({
+        kind: "original",
+        prefix: "C:\\npm",
+        elevation: "none",
+        command: "npm install -g --prefix C:\\npm @openai/codex@latest",
+      }),
+    })
+    useUiStore.setState({ installFocusAgent: "codex" })
+    render(<Install showToast={showToast} />)
+    expect(await screen.findByRole("button", { name: /Update to v0\.160\.0/ })).toBeInTheDocument()
+    // Updated where the user installed it — not shadowed by a second copy.
+    expect(await screen.findByText(/applied at its original install path/)).toBeInTheDocument()
+    expect(screen.queryByText(/To remove the original install/)).not.toBeInTheDocument()
+  })
+  it("hands over the command when only an administrator can update the install", async () => {
+    installApi({
+      getCatalog: vi.fn().mockResolvedValue([
+        { ...CATALOG[0], managed: false, location: "global" },
+      ]),
+      getInstalledAgents: vi.fn().mockResolvedValue([]),
+      checkAgentUpdates: vi.fn().mockResolvedValue([
+        { name: "codex", current: "0.150.0", latest: "0.160.0" },
+      ]),
+      getAgentUpdateTarget: vi.fn().mockResolvedValue({
+        kind: "original",
+        prefix: "/usr/lib",
+        elevation: "manual",
+        command: "sudo npm install -g --prefix /usr/lib @openai/codex@latest",
+      }),
+    })
+    useUiStore.setState({ installFocusAgent: "codex" })
+    render(<Install showToast={showToast} />)
+    expect(
+      await screen.findByText("sudo npm install -g --prefix /usr/lib @openai/codex@latest"),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /Update to v0\.160\.0/ })).not.toBeInTheDocument()
+  })
+  it("shows catalog counts and one card per agent", async () => {
+    render(<Install showToast={showToast} />)
+
+    expect(await screen.findByTestId("agent-card-codex")).toBeInTheDocument()
+    expect(screen.getByTestId("agent-card-openclaw")).toBeInTheDocument()
+
+    // 3 available / 1 installed record / 1 pending update.
+    await waitFor(() => expect(screen.getByText("3")).toBeInTheDocument())
+    await waitFor(() => {
+      const badge = within(screen.getByTestId("agent-card-claude")).getByText(
+        "Update available",
+      )
+      expect(badge).toBeInTheDocument()
+    })
+  })
+
+  it("spotlights an agent the user does not have, with its icon", async () => {
+    render(<Install showToast={showToast} />)
+
+    // codex is the only `featured` entry but it is already installed, so the
+    // banner drops to the next preference: something not on the machine.
+    const hero = (
+      await screen.findByRole("heading", { name: "OpenClaw" })
+    ).closest("[aria-roledescription=carousel]") as HTMLElement
+    expect(
+      within(hero).getByRole("img", { name: "openclaw" }),
+    ).toBeInTheDocument()
+    expect(
+      within(hero).getByRole("button", { name: /Install now/ }),
+    ).toBeInTheDocument()
+  })
+
+  it("prefers the translated blurb over the core's own description", async () => {
+    render(<Install showToast={showToast} />)
+
+    // The catalog says "Anthropic's official terminal agent."; the agentMeta
+    // overlay is what should reach the card.
+    const card = await screen.findByTestId("agent-card-claude")
+    expect(
+      within(card).getByText("Anthropic's official CLI agent for Claude."),
+    ).toBeInTheDocument()
+  })
+
+  it("offers install for a missing agent and manage for an installed one", async () => {
+    render(<Install showToast={showToast} />)
+
+    expect(await screen.findByTestId("install-btn-openclaw")).toBeInTheDocument()
+    const installedCard = screen.getByTestId("agent-card-codex")
+    expect(within(installedCard).getByRole("button", { name: "Manage" })).toBeInTheDocument()
+  })
+
+  it("filters the catalog by search", async () => {
+    render(<Install showToast={showToast} />)
+    await screen.findByTestId("agent-card-codex")
+
+    await userEvent.type(screen.getByPlaceholderText(/Search agents/), "openclaw")
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("agent-card-codex")).not.toBeInTheDocument(),
+    )
+    expect(screen.getByTestId("agent-card-openclaw")).toBeInTheDocument()
+  })
+
+  it("jumps straight to the agent when exactly one update is pending", async () => {
+    // The feedback that prompted this: the counter said "1 update" but not
+    // WHICH, so finding it meant scrolling the whole catalog.
+    render(<Install showToast={showToast} />)
+    await screen.findByTestId("agent-card-codex")
+
+    await userEvent.click(await screen.findByTestId("stats-filter-updatable"))
+
+    // Landed on claude's detail page, not a one-row filtered list.
+    expect(
+      await screen.findByRole("heading", { name: "Claude Code CLI" }),
+    ).toBeInTheDocument()
+    expect(screen.queryByTestId("agent-card-codex")).not.toBeInTheDocument()
+  })
+
+  it("filters down to the installed agents and back", async () => {
+    render(<Install showToast={showToast} />)
+    await screen.findByTestId("agent-card-codex")
+
+    const installedCounter = await screen.findByTestId("stats-filter-installed")
+    await userEvent.click(installedCounter)
+
+    // Only the agent with an installed record survives.
+    await waitFor(() =>
+      expect(screen.queryByTestId("agent-card-openclaw")).not.toBeInTheDocument(),
+    )
+    expect(screen.getByTestId("agent-card-codex")).toBeInTheDocument()
+    expect(installedCounter).toHaveAttribute("aria-pressed", "true")
+
+    // Clicking the active counter again clears it.
+    await userEvent.click(installedCounter)
+    expect(await screen.findByTestId("agent-card-openclaw")).toBeInTheDocument()
+    expect(installedCounter).toHaveAttribute("aria-pressed", "false")
+  })
+
+  it("does not offer a filter for a counter that counts nothing", async () => {
+    installApi({ checkAgentUpdates: vi.fn().mockResolvedValue([]) })
+    render(<Install showToast={showToast} />)
+    await screen.findByTestId("agent-card-codex")
+
+    expect(await screen.findByTestId("stats-filter-updatable")).toBeDisabled()
+  })
+
+  it("switches to the list view and keeps the same rows", async () => {
+    render(<Install showToast={showToast} />)
+    await screen.findByTestId("agent-card-codex")
+
+    await userEvent.click(screen.getByRole("radio", { name: /List view/ }))
+
+    // The table renders a header row the grid does not have.
+    expect(await screen.findByRole("columnheader", { name: "Runtime" })).toBeInTheDocument()
+    expect(screen.getByTestId("agent-card-openclaw")).toBeInTheDocument()
+  })
+
+  it("opens the detail page with its action rail from Manage", async () => {
+    render(<Install showToast={showToast} />)
+
+    const card = await screen.findByTestId("agent-card-codex")
+    await userEvent.click(within(card).getByRole("button", { name: "Manage" }))
+
+    expect(
+      await screen.findByRole("heading", { name: "OpenAI Codex CLI" }),
+    ).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /Uninstall/ })).toBeInTheDocument()
+    // Right rail facts come from the registry entry, not from a probe.
+    expect(screen.getByText("nodejs")).toBeInTheDocument()
+  })
+})
+
+describe("deep links", () => {
+  it("opens the requested agent and consumes the request", async () => {
+    useUiStore.setState({ installFocusAgent: "codex" })
+    render(<Install showToast={showToast} />)
+
+    expect(
+      await screen.findByRole("heading", { name: "OpenAI Codex CLI" }),
+    ).toBeInTheDocument()
+    // Cleared, so a later visit through the sidebar lands on the list.
+    expect(useUiStore.getState().installFocusAgent).toBeNull()
+  })
+
+  // The reported bug. `installListSignal` is a counter in a store that outlives
+  // this page, so after the user has clicked the sidebar's Install item even
+  // once it is non-zero forever. Both effects run on mount, and the list one
+  // runs second — so every notification deep-link from the dashboard landed on
+  // the marketplace list instead of on the agent it named.
+  it("still opens the agent when the list signal is already non-zero", async () => {
+    useUiStore.setState({ installFocusAgent: "codex", installListSignal: 3 })
+    render(<Install showToast={showToast} />)
+
+    expect(
+      await screen.findByRole("heading", { name: "OpenAI Codex CLI" }),
+    ).toBeInTheDocument()
+  })
+
+  // Opened from the setup form's "Versions & uninstall": the form stayed open
+  // on Connect Agents, and Back has to return to it, not to the list.
+  it("goes back to the setup form it was opened from", async () => {
+    useUiStore.getState().setInstallFocusAgent("codex", "dashboard")
+    useUiStore.setState({ currentTab: "install" })
+    render(<Install showToast={showToast} />)
+
+    await userEvent.click(await screen.findByRole("button", { name: "Back to setup" }))
+
+    expect(useUiStore.getState().currentTab).toBe("dashboard")
+  })
+
+  // Uninstalled while that form waited: the form closes, so Back is the list's.
+  it("goes back to the list once the type is uninstalled from that page", async () => {
+    useUiStore.getState().setInstallFocusAgent("codex", "dashboard")
+    useUiStore.setState({ currentTab: "install" })
+    render(<Install showToast={showToast} />)
+    await screen.findByRole("button", { name: "Back to setup" })
+
+    act(() => {
+      useInstallStore.getState().startJob({ agent: "codex", verb: "uninstall" })
+      useInstallStore.getState().updateJob("codex", { phase: "done" })
+    })
+
+    expect(await screen.findByRole("button", { name: "Back to Agent Marketplace" })).toBeInTheDocument()
+  })
+
+  it("returns to the list when the signal is bumped while open", async () => {
+    useUiStore.setState({ installFocusAgent: "codex", installListSignal: 3 })
+    render(<Install showToast={showToast} />)
+    await screen.findByRole("heading", { name: "OpenAI Codex CLI" })
+
+    // What clicking the sidebar's Install item does.
+    await act(async () => useUiStore.getState().goToInstallList())
+
+    expect(await screen.findByTestId("agent-card-openclaw")).toBeInTheDocument()
+  })
+})
+
+describe("adding an agent", () => {
+  // Agents are created in one place — Connect Agents' setup form — so the
+  // marketplace hands the type over rather than running a setup of its own.
+  // A card goes straight to the form: the detail page in between left people
+  // looking for where to configure the agent.
+  it("opens the setup form on this type from its card", async () => {
+    useUiStore.setState({ currentTab: "install" })
+    render(<Install showToast={showToast} />)
+
+    await userEvent.click(await screen.findByTestId("agent-card-codex"))
+
+    expect(useUiStore.getState()).toMatchObject({
+      currentTab: "dashboard",
+      pendingCreate: "agent",
+      pendingCreateType: "codex",
+      pendingCreateFrom: "install",
+    })
+    expect(screen.queryByTestId("detail-add-agent")).not.toBeInTheDocument()
+  })
+
+  it("opens the setup form on this type from its page", async () => {
+    useUiStore.setState({ installFocusAgent: "codex" })
+    render(<Install showToast={showToast} />)
+
+    await userEvent.click(await screen.findByTestId("detail-add-agent"))
+
+    expect(useUiStore.getState()).toMatchObject({
+      currentTab: "dashboard",
+      pendingCreate: "agent",
+      pendingCreateType: "codex",
+    })
+  })
+
+  it("opens the list filtered as requested", async () => {
+    render(<Install showToast={showToast} />)
+    await screen.findByTestId("agent-card-openclaw")
+
+    await act(async () => useUiStore.getState().goToInstallList("installed"))
+
+    expect(screen.queryByTestId("agent-card-openclaw")).not.toBeInTheDocument()
+    expect(screen.getByTestId("agent-card-codex")).toBeInTheDocument()
+  })
+})

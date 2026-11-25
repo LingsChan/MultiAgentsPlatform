@@ -1,0 +1,91 @@
+import React from "react"
+import { useTranslation } from "react-i18next"
+
+import { cn } from "@renderer/lib/utils"
+import type { StatusFilter } from "../use-marketplace"
+
+export interface MarketplaceCounts {
+  available: number
+  installed: number
+  updatable: number
+}
+
+const KEYS: Array<keyof MarketplaceCounts> = ["available", "installed", "updatable"]
+
+/** Which filter each counter turns on. "available" is the reset. */
+const FILTER: Record<keyof MarketplaceCounts, StatusFilter> = {
+  available: "all",
+  installed: "installed",
+  updatable: "updatable",
+}
+
+/**
+ * Catalog counters for the page header, each one a filter.
+ *
+ * They started as plain text, which left "1 待更新" as a fact with nowhere to
+ * go: the one agent it referred to was somewhere in a list of a dozen, and the
+ * only way to find it was to scroll and read badges. Clicking a counter now
+ * narrows the catalog to exactly what it counts (and clicking the active one
+ * again clears it) — with the single-update case jumping straight to that
+ * agent, since a filter showing one row helps nobody.
+ *
+ * Zero counts still render — "0 待更新" is the answer to "is anything out of
+ * date?" — but a zero is not clickable; there is nothing to show. Without
+ * `onSelect` (Connect Agents) they are plain counters.
+ */
+export function MarketplaceStats({
+  counts,
+  active = "all",
+  onSelect,
+}: {
+  counts: MarketplaceCounts
+  active?: StatusFilter
+  onSelect?: (filter: StatusFilter) => void
+}): React.JSX.Element {
+  const { t } = useTranslation()
+
+  return (
+    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+      {KEYS.map((key, i) => {
+        const filter = FILTER[key]
+        const isActive = active === filter && filter !== "all"
+        // "available" is always actionable — it is how you get back to the full
+        // list — but a zero counter has nothing to filter to.
+        const actionable = !!onSelect && (filter === "all" || counts[key] > 0)
+
+        return (
+          <React.Fragment key={key}>
+            {i > 0 && <span className="opacity-40">/</span>}
+            <button
+              type="button"
+              data-testid={`stats-filter-${key}`}
+              disabled={!actionable}
+              aria-pressed={isActive}
+              title={t(`install.stats.filterHint.${key}`)}
+              onClick={() => onSelect?.(isActive ? "all" : filter)}
+              className={cn(
+                "rounded-sm px-1 py-0.5 transition-colors",
+                actionable
+                  ? "cursor-pointer hover:bg-muted"
+                  : // Read-only counters (no onSelect) are not dimmed: nothing
+                    // is unavailable, they just are not filters there.
+                    cn("cursor-default", onSelect && "opacity-70"),
+                isActive && "bg-muted text-foreground",
+              )}
+            >
+              {/* Numbers in the text colour; a pending update, the one count
+                  that asks for something, gets a dot in front. */}
+              {key === "updatable" && counts[key] > 0 && (
+                <span className="mr-1 inline-block size-1.5 rounded-full bg-warning align-middle" />
+              )}
+              <span className="font-semibold text-foreground">
+                {counts[key]}
+              </span>{" "}
+              {t(`install.stats.${key}`)}
+            </button>
+          </React.Fragment>
+        )
+      })}
+    </div>
+  )
+}

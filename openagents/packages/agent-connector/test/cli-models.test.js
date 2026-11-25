@@ -1,0 +1,353 @@
+'use strict';
+
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const { EventEmitter } = require('events');
+const {
+  listCliModels, supportsCliModels, cliModelsWithKey, parseCodexModels, parseClaudeModels, parseQoderModels, parsePiModels,
+} = require('../src/cli-models');
+
+/** What `codex debug models` prints, cut down to the fields that are read. */
+const CODEX_CATALOG = JSON.stringify({
+  models: [
+    { slug: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol', visibility: 'list', priority: 5 },
+    { slug: 'gpt-reserve', display_name: 'GPT-Reserve', visibility: 'hide', priority: 4 },
+    { slug: 'gpt-6-astra', display_name: 'GPT-6-Astra', visibility: 'list', priority: 2 },
+    { slug: 'codex-auto-review', display_name: 'Codex Auto Review', visibility: 'hide', priority: 43 },
+    { slug: 'gpt-5.5', visibility: 'list', priority: 13 },
+    { slug: 'gpt-6-astra', display_name: 'Duplicate', visibility: 'list', priority: 99 },
+  ],
+});
+
+/** The stream-json a Claude Code run prints when sent one `initialize` request. */
+function claudeOutput(models) {
+  return [
+    JSON.stringify({ type: 'system', subtype: 'hook_started' }),
+    'not json at all',
+    JSON.stringify({
+      type: 'control_response',
+      response: { subtype: 'success', request_id: 'list-models', response: { models, commands: [] } },
+    }),
+  ].join('\n');
+}
+
+const CLAUDE_PICKER = [
+  { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context · Best for everyday, complex tasks' },
+  { value: 'opus[1m]', displayName: 'Opus (1M context)', description: 'Opus 5 with 1M context · Best for everyday, complex tasks' },
+  { value: 'sonnet', displayName: 'Sonnet', description: 'Sonnet 5 · Efficient for routine tasks' },
+  { value: 'haiku', displayName: 'Haiku', description: 'Fastest for quick answers' },
+  { value: 'sonnet', displayName: 'Sonnet again', description: 'Duplicate · ignored' },
+  { value: 'custom-model' },
+];
+
+/** A spawn stand-in: records each call and lets `script` play the child's part. */
+function fakeSpawn(script) {
+  const calls = [];
+  const spawnImpl = (binary, args, options) => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const call = { binary, args, options, input: null, killed: false };
+    child.stdin = options.stdio[0] === 'pipe'
+      ? { on() {}, end(text) { call.input = text; } }
+      : null;
+    child.kill = () => { call.killed = true; setImmediate(() => child.emit('close', null)); };
+    calls.push(call);
+    setImmediate(() => script(child));
+    return child;
+  };
+  return { calls, spawnImpl };
+}
+
+/** Print `stdout` and exit, as a CLI that answered does. */
+const answers = (stdout) => (child) => {
+  child.stdout.emit('data', Buffer.from(stdout));
+  child.emit('close', 0);
+};
+
+function connector({ binary = '/usr/local/bin/cli', typeEnv = {} } = {}) {
+  return {
+    registry: {},
+    installer: { which: () => binary },
+    getAgentEnv: () => typeEnv,
+    resolveAgentEnv: () => ({}),
+  };
+}
+
+describe('parseCodexModels', () => {
+  it('keeps what the CLI picker lists, in its order, and drops internal entries', () => {
+    assert.deepEqual(parseCodexModels(CODEX_CATALOG), [
+      { id: 'gpt-6-astra', label: 'GPT-6-Astra' },
+      { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol' },
+      { id: 'gpt-5.5', label: 'gpt-5.5' },
+    ]);
+  });
+
+  it('reads nothing from output that is not the catalog', () => {
+    assert.deepEqual(parseCodexModels('error: unrecognized subcommand'), []);
+    assert.deepEqual(parseCodexModels('{"models":"none"}'), []);
+    // A catalog without the visibility field cannot tell internal models apart.
+    assert.deepEqual(parseCodexModels('{"models":[{"slug":"gpt-5.5"}]}'), []);
+  });
+});
+
+describe('model id and label bounds', () => {
+  it('drops ids that are not plain model names and caps long labels', () => {
+    const long = 'L'.repeat(200);
+    const catalog = JSON.stringify({
+      models: [
+        { slug: 'gpt-5.5', display_name: `  ${long}  `, visibility: 'list', priority: 1 },
+        { slug: 'bad id; rm -rf /', visibility: 'list', priority: 2 },
+        { slug: 'x'.repeat(129), visibility: 'list', priority: 3 },
+        { slug: 'line\nbreak', visibility: 'list', priority: 4 },
+        { slug: 'org/model:tag@v1', display_name: 'Ok', visibility: 'list', priority: 5 },
+      ],
+    });
+    const codex = parseCodexModels(catalog);
+    assert.deepEqual(codex.map((m) => m.id), ['gpt-5.5', 'org/model:tag@v1']);
+    assert.equal(codex[0].label, 'L'.repeat(80));
+
+    const claude = parseClaudeModels(claudeOutput([
+      { value: 'opus[1m]', displayName: long },
+      { value: '$(whoami)', displayName: 'Bad' },
+      { value: 'a=b', displayName: 'Bad' },
+    ]));
+    assert.deepEqual(claude.map((m) => m.id), ['opus[1m]']);
+    assert.equal(claude[0].label.length, 80);
+  });
+
+  it('still caps the list at 100 models', () => {
+    const models = Array.from({ length: 150 }, (_, i) => ({ slug: `m-${i}`, visibility: 'list', priority: i }));
+    assert.equal(parseCodexModels(JSON.stringify({ models })).length, 100);
+  });
+});
+
+describe('parseClaudeModels', () => {
+  it('reads the picker from the initialize reply, as the values --model takes', () => {
+    assert.deepEqual(parseClaudeModels(claudeOutput(CLAUDE_PICKER)), [
+      { id: 'opus[1m]', label: 'Opus 5 with 1M context' },
+      { id: 'sonnet', label: 'Sonnet 5' },
+      { id: 'haiku', label: 'Haiku' },
+      { id: 'custom-model', label: 'custom-model' },
+    ]);
+  });
+
+  it('takes the display name of a newer CLI, which carries the version itself', () => {
+    // Claude Code 2.1.289: the alias moved out of displayName, and only the
+    // "default" entry still leads its description with a model.
+    const picker = [
+      { value: 'default', resolvedModel: 'claude-opus-5-5', displayName: 'Default (recommended)', description: 'Opus 5.5 · Best for everyday, complex tasks' },
+      { value: 'opus', resolvedModel: 'claude-opus-5-5', displayName: 'Opus 5.5', description: 'For complex work and everyday tasks' },
+      { value: 'sonnet', resolvedModel: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5', description: 'Most efficient for simpler tasks' },
+      { value: 'claude-opus-4-8', resolvedModel: 'claude-opus-4-8', displayName: 'Opus 4.8', description: 'Best for everyday, complex tasks' },
+    ];
+    assert.deepEqual(parseClaudeModels(claudeOutput(picker)), [
+      { id: 'opus', label: 'Opus 5.5' },
+      { id: 'sonnet', label: 'Sonnet 5.5' },
+      { id: 'claude-opus-4-8', label: 'Opus 4.8' },
+    ]);
+  });
+
+  it('reads nothing when the CLI never replied', () => {
+    assert.deepEqual(parseClaudeModels(''), []);
+    assert.deepEqual(parseClaudeModels('{"type":"result","is_error":true}'), []);
+    assert.deepEqual(
+      parseClaudeModels('{"type":"control_response","response":{"subtype":"error","error":"nope"}}'),
+      [],
+    );
+  });
+});
+
+describe('parseQoderModels', () => {
+  // `qodercli --list-models`: a header, Qoder's own tiers by display name, and
+  // a bring-your-own-key model as "Name (key)".
+  const LISTING = ['MODEL', 'Auto', 'Lite', 'Performance', 'My Qwen (bailian/qwen3.8-flash)', 'Lite', ''].join('\n');
+
+  it('keeps the tiers by name and a custom model by its key', () => {
+    assert.deepEqual(parseQoderModels(LISTING), [
+      { id: 'Auto', label: 'Auto' },
+      { id: 'Lite', label: 'Lite' },
+      { id: 'Performance', label: 'Performance' },
+      { id: 'bailian/qwen3.8-flash', label: 'My Qwen' },
+    ]);
+  });
+
+  it('lists nothing from an error message', () => {
+    assert.deepEqual(parseQoderModels('Not logged in. Run `qodercli login` to authenticate.'), []);
+  });
+});
+
+const PI_LISTING = [
+  'Update notice: a newer Pi is available',
+  'provider  model               context  max-out  thinking  images',
+  'openai    gpt-6.1-sol         272K     128K     yes       yes',
+  'openai    gpt-6.1-terra       272K     128K     yes       yes',
+  'custom    gpt-6.1-sol         200K     16K      no        yes',
+  'openai    gpt-6.1-sol         272K     128K     yes       yes',
+].join('\n');
+
+describe('parsePiModels', () => {
+  it('reads the Pi table with provider-qualified ids, preserving distinct providers', () => {
+    assert.deepEqual(parsePiModels('\x1b[32m' + PI_LISTING + '\x1b[0m'), [
+      { id: 'openai/gpt-6.1-sol', label: 'gpt-6.1-sol (openai)' },
+      { id: 'openai/gpt-6.1-terra', label: 'gpt-6.1-terra (openai)' },
+      { id: 'custom/gpt-6.1-sol', label: 'gpt-6.1-sol (custom)' },
+    ]);
+  });
+
+  it('only offers the explicitly configured provider, case-insensitively', () => {
+    assert.deepEqual(parsePiModels(PI_LISTING, { PI_PROVIDER: ' CUSTOM ' }), [
+      { id: 'custom/gpt-6.1-sol', label: 'gpt-6.1-sol (custom)' },
+    ]);
+  });
+
+  it('ignores diagnostics and invalid rows instead of treating them as models', () => {
+    assert.deepEqual(parsePiModels('No models available. Sign in with /login.'), []);
+    assert.deepEqual(parsePiModels('openai gpt-6.1-sol 272K 128K yes yes'), []);
+    assert.deepEqual(parsePiModels(PI_LISTING + '\nopenai bad;command 272K 128K yes yes\nWarning: models could not be refreshed'), [
+      { id: 'openai/gpt-6.1-sol', label: 'gpt-6.1-sol (openai)' },
+      { id: 'openai/gpt-6.1-terra', label: 'gpt-6.1-terra (openai)' },
+      { id: 'custom/gpt-6.1-sol', label: 'gpt-6.1-sol (custom)' },
+    ]);
+  });
+
+  it('caps Pi output at the heartbeat model limit', () => {
+    const text = 'provider model context max-out thinking images\n' +
+      Array.from({ length: 150 }, (_, i) => 'openai m-' + i + ' 200K 16K no yes').join('\n');
+    assert.equal(parsePiModels(text).length, 100);
+  });
+});
+
+describe('listCliModels', () => {
+  it('knows which CLIs can be asked', () => {
+    assert.equal(supportsCliModels('codex'), true);
+    assert.equal(supportsCliModels('claude'), true);
+    assert.equal(supportsCliModels('gemini'), false);
+    assert.equal(supportsCliModels('constructor'), false);
+  });
+
+  it('asks Pi for its models without a prompt and on the device sign-in', async () => {
+    assert.equal(supportsCliModels('pi'), true);
+    assert.equal(cliModelsWithKey('pi'), false);
+    const { calls, spawnImpl } = fakeSpawn(answers(PI_LISTING));
+    const res = await listCliModels(connector({ typeEnv: { LLM_API_KEY: 'type-key' } }), 'pi', {
+      spawnImpl, agentEnv: { OPENAGENTS_AUTH_MODE: 'cli_login', PI_PROVIDER: 'openai' },
+    });
+    assert.deepEqual(calls[0].args, ['--no-approve', '--no-extensions', '--no-skills', '--list-models']);
+    assert.equal(calls[0].options.stdio[0], 'ignore');
+    assert.equal(calls[0].options.env.LLM_API_KEY, undefined);
+    assert.equal(calls[0].options.env.PI_SKIP_VERSION_CHECK, '1');
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.models.map(m => m.id), ['openai/gpt-6.1-sol', 'openai/gpt-6.1-terra']);
+  });
+
+  it('asks the Codex CLI for its catalog', async () => {
+    const { calls, spawnImpl } = fakeSpawn(answers(CODEX_CATALOG));
+    const res = await listCliModels(connector({ binary: '/opt/codex' }), 'codex', { spawnImpl });
+    assert.equal(calls[0].binary, '/opt/codex');
+    assert.deepEqual(calls[0].args, ['debug', 'models']);
+    assert.equal(calls[0].options.stdio[0], 'ignore');
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.models.map((m) => m.id), ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.5']);
+  });
+
+  it('sends Claude Code an initialize request and no prompt', async () => {
+    const { calls, spawnImpl } = fakeSpawn(answers(claudeOutput(CLAUDE_PICKER)));
+    const res = await listCliModels(connector(), 'claude', { spawnImpl });
+    assert.deepEqual(calls[0].args, ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']);
+    assert.deepEqual(JSON.parse(calls[0].input), {
+      type: 'control_request', request_id: 'list-models', request: { subtype: 'initialize' },
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.models[0].id, 'opus[1m]');
+  });
+
+  it('asks Qoder with its token, and keeps a first start from editing rc files', async () => {
+    assert.equal(cliModelsWithKey('qoder'), true);
+    assert.equal(cliModelsWithKey('qoder-cn'), true);
+    assert.equal(cliModelsWithKey('codex'), false);
+    const { calls, spawnImpl } = fakeSpawn(answers('MODEL\nAuto\nLite\n'));
+    const res = await listCliModels(
+      connector({ typeEnv: { QODER_PERSONAL_ACCESS_TOKEN: 'pat-123456789' } }),
+      'qoder',
+      { spawnImpl },
+    );
+    assert.deepEqual(calls[0].args, ['--list-models']);
+    assert.equal(calls[0].options.env.QODER_PERSONAL_ACCESS_TOKEN, 'pat-123456789');
+    assert.equal(calls[0].options.env.QODER_NO_RC, '1');
+    assert.deepEqual(res.models.map((m) => m.id), ['Auto', 'Lite']);
+  });
+
+  it('asks on the sign-in, without the key saved for the type', async () => {
+    const { calls, spawnImpl } = fakeSpawn(answers(CODEX_CATALOG));
+    await listCliModels(
+      connector({ typeEnv: { LLM_API_KEY: 'sk-type-level-key', CODEX_API_KEY: 'sk-native-key' } }),
+      'codex',
+      { spawnImpl, agentEnv: { OPENAGENTS_AUTH_MODE: 'cli_login' } },
+    );
+    assert.equal(calls[0].options.env.LLM_API_KEY, undefined);
+    assert.equal(calls[0].options.env.CODEX_API_KEY, undefined);
+  });
+
+  it('says so when the CLI is missing or cannot be asked, without running anything', async () => {
+    const { calls, spawnImpl } = fakeSpawn(answers(CODEX_CATALOG));
+    assert.deepEqual(
+      await listCliModels(connector({ binary: null }), 'codex', { spawnImpl }),
+      { type: 'codex', ok: false, models: [], error: 'Not installed' },
+    );
+    const other = await listCliModels(connector(), 'gemini', { spawnImpl });
+    assert.equal(other.ok, false);
+    assert.equal(calls.length, 0);
+  });
+
+  it('reports a CLI that listed nothing', async () => {
+    const { spawnImpl } = fakeSpawn(answers('error: unrecognized subcommand'));
+    const res = await listCliModels(connector(), 'codex', { spawnImpl });
+    assert.deepEqual(res, { type: 'codex', ok: false, models: [], error: 'The CLI listed no models.' });
+  });
+
+  it('reports a CLI that could not be started', async () => {
+    const res = await listCliModels(connector(), 'codex', {
+      spawnImpl: () => { throw new Error('spawn EINVAL'); },
+    });
+    assert.deepEqual(res, { type: 'codex', ok: false, models: [], error: 'spawn EINVAL' });
+  });
+
+  it('stops a CLI that hangs', async () => {
+    const { calls, spawnImpl } = fakeSpawn(() => {});
+    const res = await listCliModels(connector(), 'codex', { spawnImpl, timeoutMs: 20 });
+    assert.equal(calls[0].killed, true);
+    assert.deepEqual(res, { type: 'codex', ok: false, models: [], error: 'the CLI did not answer in time' });
+  });
+
+  it('gives up on time even when the killed CLI never closes its pipes', async () => {
+    // Windows: killing the cmd.exe shim leaves its node child holding stdout,
+    // so 'close' never fires.
+    let killed = false;
+    let destroyed = 0;
+    const spawnImpl = (binary, args, options) => {
+      const child = new EventEmitter();
+      const stream = () => Object.assign(new EventEmitter(), { destroy() { destroyed += 1; } });
+      child.stdout = stream();
+      child.stderr = stream();
+      child.stdin = options.stdio[0] === 'pipe' ? Object.assign(stream(), { end() {} }) : null;
+      child.kill = () => { killed = true; };
+      child.unref = () => {};
+      return child;
+    };
+    const res = await listCliModels(connector(), 'codex', { spawnImpl, timeoutMs: 20 });
+    assert.equal(killed, true);
+    assert.ok(destroyed >= 2);
+    assert.deepEqual(res, { type: 'codex', ok: false, models: [], error: 'the CLI did not answer in time' });
+  });
+
+  it('keeps the answer of a CLI that replied and then hung', async () => {
+    const { calls, spawnImpl } = fakeSpawn((child) => {
+      child.stdout.emit('data', Buffer.from(claudeOutput(CLAUDE_PICKER)));
+    });
+    const res = await listCliModels(connector(), 'claude', { spawnImpl, timeoutMs: 20 });
+    assert.equal(calls[0].killed, true);
+    assert.equal(res.ok, true);
+    assert.equal(res.models.length, 4);
+  });
+});
