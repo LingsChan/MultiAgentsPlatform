@@ -108,6 +108,20 @@ describe('Daemon', () => {
     assert.equal(result.OPENAI_API_KEY, 'sk-test');
   });
 
+  it('isolates foreground agents from the launching Codex desktop runtime', () => {
+    const daemon = new Daemon(new Config(tmpDir), new EnvManager(tmpDir), new Registry(tmpDir));
+    const previous = process.env.CODEX_WINDOWS_REGISTERED_CORE;
+    try {
+      process.env.CODEX_WINDOWS_REGISTERED_CORE = '1';
+      const env = daemon._buildAgentEnv({ name: 'review', type: 'codex' });
+      assert.equal(env.CODEX_WINDOWS_REGISTERED_CORE, undefined);
+      assert.equal(process.env.CODEX_WINDOWS_REGISTERED_CORE, '1');
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_WINDOWS_REGISTERED_CORE;
+      else process.env.CODEX_WINDOWS_REGISTERED_CORE = previous;
+    }
+  });
+
   it('_buildAgentEnv lets per-agent env override type defaults', () => {
     const config = new Config(tmpDir);
     const env = new EnvManager(tmpDir);

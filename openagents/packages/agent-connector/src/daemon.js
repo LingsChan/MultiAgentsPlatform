@@ -2409,7 +2409,7 @@ async _runNodeCommand(n, cmd) {
     const type = agentCfg.type || 'openclaw';
     const merged = this.envManager.getForAgent(type, this.registry, agentCfg.env);
     // A signed-in agent drops every key, the launcher's own environment's too.
-    const env = stripForCliLogin(type, { ...process.env, ...merged }, this.registry, agentCfg.env);
+    const env = stripForCliLogin(type, { ...hostFreeEnv(process.env), ...merged }, this.registry, agentCfg.env);
     return type === 'openclaw'
       ? require('./adapters/openclaw').instanceEnv(agentCfg.name, env, this.config.configDir)
       : env;

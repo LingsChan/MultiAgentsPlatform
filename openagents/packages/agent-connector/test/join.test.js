@@ -62,6 +62,7 @@ describe('hostFreeEnv', () => {
     const out = hostFreeEnv({
       ...CLAUDE_HOST, CLAUDE_CODE_MESSAGING_TOKEN: 'x', CLAUDE_CODE_USE_VERTEX: '1',
       CODEX_SESSION_ID: 't', CODEX_HOME: '/c', PATH: '/usr/bin', AI_AGENT: 'claude-code',
+      CODEX_APP_TOOLS_PIPE_PATH: 'desktop-tools', CODEX_WINDOWS_REGISTERED_CORE: '1',
     });
     assert.deepEqual(out, { CLAUDE_CODE_USE_VERTEX: '1', CODEX_HOME: '/c', PATH: '/usr/bin' });
   });
