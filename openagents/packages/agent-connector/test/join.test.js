@@ -58,6 +58,11 @@ describe('detectHostAgent', () => {
 });
 
 describe('hostFreeEnv', () => {
+  it('follows platform casing rules while preserving unrelated keys', () => {
+    const env = { codex_windows_registered_core: '1', Codex_App_Tools_Pipe_Path: 'pipe', Path: '/bin' };
+    assert.deepEqual(hostFreeEnv(env), process.platform === 'win32' ? { Path: '/bin' } : env);
+  });
+
   it('drops the host session variables and keeps sign-in ones', () => {
     const out = hostFreeEnv({
       ...CLAUDE_HOST, CLAUDE_CODE_MESSAGING_TOKEN: 'x', CLAUDE_CODE_USE_VERTEX: '1',

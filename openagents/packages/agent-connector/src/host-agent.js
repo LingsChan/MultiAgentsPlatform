@@ -59,8 +59,9 @@ const KEPT_CLAUDE_CODE_KEYS = new Set(['CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_U
 function hostFreeEnv(env = process.env) {
   const out = {};
   for (const [key, value] of Object.entries(env)) {
-    if (value === undefined || HOST_SESSION_KEYS.has(key)) continue;
-    if (key.startsWith('CLAUDE_CODE_') && !KEPT_CLAUDE_CODE_KEYS.has(key)) continue;
+    const name = process.platform === 'win32' ? key.toUpperCase() : key;
+    if (value === undefined || HOST_SESSION_KEYS.has(name)) continue;
+    if (name.startsWith('CLAUDE_CODE_') && !KEPT_CLAUDE_CODE_KEYS.has(name)) continue;
     out[key] = value;
   }
   return out;
